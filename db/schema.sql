@@ -1,0 +1,121 @@
+-- jakevolume — PostgreSQL schema
+-- Run once; idempotent (IF NOT EXISTS / ON CONFLICT).
+
+-- ── Full option chain snapshots (one row per contract per day) ─────────────
+CREATE TABLE IF NOT EXISTS option_chain_snapshots (
+    id               BIGSERIAL    PRIMARY KEY,
+    symbol           VARCHAR(10)  NOT NULL,
+    snap_date        DATE         NOT NULL,
+    snap_time        TIMESTAMPTZ  NOT NULL,
+    expiry_date      DATE         NOT NULL,
+    strike           NUMERIC(12,4) NOT NULL,
+    option_type      VARCHAR(4)   NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    open_interest    BIGINT       NOT NULL DEFAULT 0,
+    volume           BIGINT       NOT NULL DEFAULT 0,
+    bid              NUMERIC(12,4),
+    ask              NUMERIC(12,4),
+    mark             NUMERIC(12,4),
+    underlying_price NUMERIC(12,4),
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ocs_symbol_date
+    ON option_chain_snapshots (symbol, snap_date);
+
+-- ── Daily OI levels (3 S + 3 R per symbol, computed at 08:00 CST) ──────────
+CREATE TABLE IF NOT EXISTS oi_levels (
+    id            BIGSERIAL    PRIMARY KEY,
+    symbol        VARCHAR(10)  NOT NULL,
+    level_date    DATE         NOT NULL,
+    level_type    VARCHAR(10)  NOT NULL CHECK (level_type IN ('SUPPORT','RESISTANCE')),
+    rank          SMALLINT     NOT NULL CHECK (rank BETWEEN 1 AND 10),
+    strike        NUMERIC(12,4) NOT NULL,
+    open_interest BIGINT       NOT NULL,
+    option_type   VARCHAR(4)   NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    computed_at   TIMESTAMPTZ  NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, level_date, level_type, rank)
+);
+
+CREATE INDEX IF NOT EXISTS idx_oil_symbol_date
+    ON oi_levels (symbol, level_date);
+
+-- ── Intraday 1-minute price bars ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS price_bars (
+    id         BIGSERIAL    PRIMARY KEY,
+    symbol     VARCHAR(10)  NOT NULL,
+    bar_time   TIMESTAMPTZ  NOT NULL,
+    open       NUMERIC(12,4) NOT NULL,
+    high       NUMERIC(12,4) NOT NULL,
+    low        NUMERIC(12,4) NOT NULL,
+    close      NUMERIC(12,4) NOT NULL,
+    volume     BIGINT       NOT NULL,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, bar_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pb_symbol_time
+    ON price_bars (symbol, bar_time DESC);
+
+-- ── Fired signals ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS signals (
+    id                 BIGSERIAL    PRIMARY KEY,
+    symbol             VARCHAR(10)  NOT NULL,
+    signal_time        TIMESTAMPTZ  NOT NULL,
+    signal_type        VARCHAR(10)  NOT NULL CHECK (signal_type IN ('BULLISH','BEARISH')),
+    bias               VARCHAR(30)  NOT NULL,
+    level_type         VARCHAR(10)  NOT NULL,
+    level_price        NUMERIC(12,4) NOT NULL,
+    trigger_price      NUMERIC(12,4) NOT NULL,
+    avg_volume_20      NUMERIC(18,2),
+    spike_volume       BIGINT,
+    consecutive_spikes SMALLINT,
+    option_type        VARCHAR(4),
+    opt_mark           NUMERIC(12,4),
+    opt_bid            NUMERIC(12,4),
+    opt_ask            NUMERIC(12,4),
+    opt_vol_delta      BIGINT,
+    sheets_logged      BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Add columns without dropping existing data
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS option_type    VARCHAR(4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_mark       NUMERIC(12,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_bid        NUMERIC(12,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_ask        NUMERIC(12,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_vol_delta  BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS price_to_enter NUMERIC(12,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS price_to_exit  NUMERIC(12,4);
+
+CREATE INDEX IF NOT EXISTS idx_sig_symbol_time
+    ON signals (symbol, signal_time DESC);
+
+-- ── Volume cluster positioning monitor ───────────────────────────────────────
+-- Tracks unusual option volume accumulation patterns without firing signals.
+-- pattern_type SAME_DAY_MOVER    : single 1-min bar ≥ CLUSTER_VOL_0DTE on 0DTE
+-- pattern_type NEXT_EXPIRY_POSITIONING : rolling N-bar total ≥ CLUSTER_VOL_NEXT on next expiry
+CREATE TABLE IF NOT EXISTS volume_clusters (
+    id                      BIGSERIAL     PRIMARY KEY,
+    symbol                  VARCHAR(10)   NOT NULL,
+    detected_at             TIMESTAMPTZ   NOT NULL,
+    updated_at              TIMESTAMPTZ   NOT NULL,
+    pattern_type            VARCHAR(30)   NOT NULL
+        CHECK (pattern_type IN ('SAME_DAY_MOVER','NEXT_EXPIRY_POSITIONING')),
+    option_type             VARCHAR(4)    NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    strike                  NUMERIC(12,4) NOT NULL,
+    expiry                  DATE          NOT NULL,
+    underlying_price        NUMERIC(12,4) NOT NULL,
+    cluster_volume          BIGINT        NOT NULL,
+    bar_count               SMALLINT      NOT NULL DEFAULT 1,
+    avg_vol_per_bar         NUMERIC(18,2),
+    status                  VARCHAR(10)   NOT NULL
+        CHECK (status IN ('FORMING','CONFIRMED','FADED')),
+    nearest_sr_level        VARCHAR(10),
+    nearest_sr_strike       NUMERIC(12,4),
+    distance_from_price_pct NUMERIC(8,4),
+    created_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vc_symbol_status
+    ON volume_clusters (symbol, status, updated_at DESC);
