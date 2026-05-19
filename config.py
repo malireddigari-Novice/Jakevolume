@@ -33,9 +33,9 @@ TOP_N_LEVELS   = int(os.getenv('TOP_N_LEVELS', '2'))          # 2 S + 2 R
 
 # ── Signal detection ──────────────────────────────────────────────────────────
 # Price is "near a level" when within this fraction of the strike
-LEVEL_PROXIMITY_PCT          = float(os.getenv('LEVEL_PROXIMITY_PCT', '0.002'))  # 0.2 %
+LEVEL_PROXIMITY_PCT          = float(os.getenv('LEVEL_PROXIMITY_PCT', '0.005'))  # 0.5 %
 # A bar counts as a "spike" when its volume exceeds this multiple of the rolling avg
-VOLUME_SPIKE_MULTIPLIER      = float(os.getenv('VOLUME_SPIKE_MULTIPLIER', '1.5'))
+VOLUME_SPIKE_MULTIPLIER      = float(os.getenv('VOLUME_SPIKE_MULTIPLIER', '2.0'))
 # Number of prior bars used to compute the rolling volume baseline
 VOLUME_LOOKBACK_BARS         = int(os.getenv('VOLUME_LOOKBACK_BARS', '20'))
 # Consecutive spike bars required to fire a signal

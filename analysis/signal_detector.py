@@ -3,11 +3,13 @@ Stateful intraday signal detector.
 
 Trigger logic (per S/R level, per 1-minute bar)
 ------------------------------------------------
-A counter increments when the underlying's close is within LEVEL_PROXIMITY_PCT
-of the level AND at least one of:
-  - equity spike  : bar volume >= VOLUME_SPIKE_MULTIPLIER × 20-bar avg
-  - option cluster: option contracts traded at that strike in the last
-                    minute >= OPT_VOL_MIN_CLUSTER
+Counter increments when ALL of the following hold:
+  1. Spot is within LEVEL_PROXIMITY_PCT (0.5%) of the level.
+  2. At least one volume condition is met:
+       - equity spike     : bar volume >= VOLUME_SPIKE_MULTIPLIER (2.0×) × 20-bar avg
+       - primary cluster  : option delta at THIS strike >= OPT_VOL_MIN_CLUSTER contracts/min
+       - adjacent cluster : any OTHER S/R level for the same symbol also shows
+                            option delta >= OPT_VOL_MIN_CLUSTER (correlated institutional flow)
 
 When the counter reaches CONSECUTIVE_SPIKES_REQUIRED the signal fires,
 subject to SIGNAL_COOLDOWN_MINUTES cooldown on the same level.
@@ -16,9 +18,6 @@ Signal semantics
 -----------------
   SUPPORT  level → BULLISH  / "Call-side bias"
   RESISTANCE     → BEARISH  / "Put-side bias"
-
-The fired signal includes the option's live bid/ask/mark so an actionable
-price alert can be issued immediately.
 """
 import logging
 from collections import defaultdict
@@ -72,6 +71,24 @@ class SignalDetector:
         avg_vol  = sum(b['volume'] for b in lookback) / len(lookback)
         eq_spike = avg_vol > 0 and current['volume'] >= config.VOLUME_SPIKE_MULTIPLIER * avg_vol
 
+        # ── Pre-compute opt_vol_delta for ALL levels in one pass ──────────────
+        # This lets the adjacent-cluster check see deltas for every level
+        # without ordering issues from the per-level loop below.
+        vol_deltas: dict[tuple[float, str], int] = {}   # (strike, opt_type) -> delta
+        opt_data_map: dict[tuple[float, str], dict] = {}
+        if option_quotes:
+            for lv in levels:
+                s  = float(lv['strike'])
+                ot = str(lv.get('option_type', ''))
+                data    = option_quotes.get((s, ot), {})
+                cur_vol = int(data.get('volume', 0) or 0)
+                opt_key: _OptKey = (symbol, s, ot)
+                prev_vol = self._prev_opt_vol.get(opt_key, cur_vol)
+                delta    = max(0, cur_vol - prev_vol)
+                self._prev_opt_vol[opt_key] = cur_vol
+                vol_deltas[(s, ot)]   = delta
+                opt_data_map[(s, ot)] = data
+
         new_signals: list[dict] = []
 
         for level in levels:
@@ -82,23 +99,22 @@ class SignalDetector:
 
             near = self._near_level(close_price, strike)
 
-            # ── Option volume cluster ─────────────────────────────────────────
-            opt_data: dict = {}
-            opt_vol_delta  = 0
+            opt_vol_delta = vol_deltas.get((strike, option_type), 0)
+            opt_data      = opt_data_map.get((strike, option_type), {})
 
-            if near and option_quotes:
-                opt_data = option_quotes.get((strike, option_type), {})
-                opt_vol  = int(opt_data.get('volume', 0) or 0)
-                opt_key: _OptKey = (symbol, strike, option_type)
-                # First tick: seed previous volume without triggering a cluster
-                prev_vol = self._prev_opt_vol.get(opt_key, opt_vol)
-                opt_vol_delta = max(0, opt_vol - prev_vol)
-                self._prev_opt_vol[opt_key] = opt_vol
-
+            # Primary cluster: unusual volume on this specific strike
             opt_cluster = opt_vol_delta >= config.OPT_VOL_MIN_CLUSTER
 
+            # Adjacent cluster: any OTHER level for this symbol also surging
+            # Signals correlated institutional flow across multiple strikes
+            adj_cluster = any(
+                delta >= config.OPT_VOL_MIN_CLUSTER
+                for (s, ot), delta in vol_deltas.items()
+                if not (s == strike and ot == option_type)
+            )
+
             # ── Counter update ────────────────────────────────────────────────
-            if near and (eq_spike or opt_cluster):
+            if near and (eq_spike or opt_cluster or adj_cluster):
                 self._counters[key] += 1
             else:
                 self._counters[key] = 0
@@ -115,6 +131,7 @@ class SignalDetector:
                     key=key,
                     opt_data=opt_data,
                     opt_vol_delta=opt_vol_delta,
+                    adj_cluster=adj_cluster,
                     expiry=expiry,
                 )
                 if signal:
@@ -127,6 +144,7 @@ class SignalDetector:
 
     @staticmethod
     def _near_level(price: float, level_price: float) -> bool:
+        """Return True when price is within LEVEL_PROXIMITY_PCT of the strike."""
         if level_price == 0:
             return False
         return abs(price - level_price) / level_price <= config.LEVEL_PROXIMITY_PCT
@@ -141,8 +159,15 @@ class SignalDetector:
         key: _LevelKey,
         opt_data: dict,
         opt_vol_delta: int,
+        adj_cluster: bool = False,
         expiry: Optional[date] = None,
     ) -> Optional[dict]:
+        """
+        Build and return a signal dict if the cooldown has expired; None otherwise.
+
+        Also updates _last_signal so subsequent calls in the same cooldown window
+        are suppressed without re-reading the database.
+        """
         now          = datetime.now(CST)
         level_type   = level['level_type']
         strike       = float(level['strike'])
@@ -188,17 +213,19 @@ class SignalDetector:
             'opt_bid':            opt_bid,
             'opt_ask':            opt_ask,
             'opt_vol_delta':      opt_vol_delta,
+            'adj_cluster':        adj_cluster,
             'price_to_enter':     price_to_enter,
             'price_to_exit':      price_to_exit,
         }
 
+        adj_tag = "  adj_cluster=YES" if adj_cluster else ""
         logger.info(
             "SIGNAL >> %s %s (%s)  %s@%.4f  "
-            "eq_vol=%s vs avg=%.0f  opt_%s delta=%d  mark=%s  streak=%d",
+            "eq_vol=%s vs avg=%.0f  opt_%s delta=%d  mark=%s  streak=%d%s",
             symbol, signal_type, bias, level_type, strike,
             f"{current_bar['volume']:,}", avg_vol,
             option_type, opt_vol_delta,
             f"${opt_mark:.2f}" if opt_mark else "n/a",
-            consecutive,
+            consecutive, adj_tag,
         )
         return signal

@@ -39,6 +39,7 @@ from output.sheets_logger import SheetsLogger
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
 def _setup_logging() -> None:
+    """Configure root logger to write INFO+ to stdout and a rotating log file."""
     fmt = '%(asctime)s %(levelname)-8s %(name)-30s %(message)s'
     logging.basicConfig(
         level=logging.INFO,
@@ -59,6 +60,11 @@ logger = logging.getLogger('jakevolume.main')
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
 
 def morning_snapshot(wb: WebullClient, sheets: SheetsLogger) -> None:
+    """
+    Run the daily 08:00 CST setup: pull option chains, compute OI S/R levels,
+    persist to Postgres, and enqueue all rows for Google Sheets.  Failures for
+    individual symbols are logged but do not abort the remaining symbols.
+    """
     now   = now_cst()
     today = today_cst()
     logger.info("═══ MORNING SNAPSHOT START (%s) ═══", now.strftime('%Y-%m-%d %H:%M CST'))
@@ -162,6 +168,11 @@ def intraday_check(
     monitor: PositioningMonitor,
     sheets: SheetsLogger,
 ) -> None:
+    """
+    Scan all symbols once per 60-second poll: pull bars, run the signal detector,
+    fire desktop notifications, and update the positioning monitor.  Failures for
+    individual symbols are logged without interrupting the remaining symbols.
+    """
     today = today_cst()
 
     for symbol in config.SYMBOLS:
@@ -232,6 +243,10 @@ def _notify_signal(sig: dict) -> None:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def main() -> None:
+    """
+    Entry point: initialise all subsystems, start Live feeds, then run the
+    blocking 60-second poll loop until the process is terminated.
+    """
     parser = argparse.ArgumentParser(description='Jakevolume 0DTE alerting system')
     parser.add_argument('--login', action='store_true',
                         help='Validate credentials and exit (no live feed started)')

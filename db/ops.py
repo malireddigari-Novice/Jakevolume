@@ -21,6 +21,7 @@ _pool: Optional[pg_pool.SimpleConnectionPool] = None
 # ── Pool lifecycle ────────────────────────────────────────────────────────────
 
 def init_pool() -> None:
+    """Create the module-level psycopg2 connection pool from config credentials."""
     global _pool
     _pool = pg_pool.SimpleConnectionPool(
         minconn=1,
@@ -68,6 +69,7 @@ def save_option_chain(
     contracts: list,
     underlying_price: float,
 ) -> None:
+    """Bulk-insert all contracts from one option chain snapshot; ignores duplicates."""
     rows = [
         (
             symbol,
@@ -110,6 +112,7 @@ def save_oi_levels(
     computed_at: datetime,
     levels: list,
 ) -> None:
+    """Upsert computed S/R levels, refreshing strike and OI if already present for the day."""
     rows = [
         (
             symbol,
@@ -144,6 +147,7 @@ def save_oi_levels(
 
 
 def get_today_levels(symbol: str, level_date: date) -> list:
+    """Return all S/R levels for a symbol on the given date, ordered by type then rank."""
     sql = """
         SELECT level_type, rank, strike, open_interest, option_type
         FROM   oi_levels
@@ -162,6 +166,7 @@ def get_today_levels(symbol: str, level_date: date) -> list:
 # ── Price bars ────────────────────────────────────────────────────────────────
 
 def save_bars(symbol: str, bars: list) -> None:
+    """Bulk-insert 1-min OHLCV bars; silently skips bars already stored for the same timestamp."""
     if not bars:
         return
     rows = [
@@ -204,6 +209,7 @@ def get_recent_bars(symbol: str, limit: int = 40) -> list:
 # ── Signals ───────────────────────────────────────────────────────────────────
 
 def save_signal(signal: dict) -> int:
+    """Insert a fired signal and return its new row id for downstream logging."""
     sql = """
         INSERT INTO signals
             (symbol, signal_time, signal_type, bias, level_type, level_price,
@@ -230,6 +236,7 @@ def save_signal(signal: dict) -> int:
 
 
 def mark_signal_logged(signal_id: int) -> None:
+    """Set sheets_logged=TRUE on a signal after it has been written to Google Sheets."""
     conn = _get()
     try:
         with conn.cursor() as cur:
@@ -296,6 +303,7 @@ def update_cluster(cluster_id: int, data: dict) -> None:
 
 
 def fade_cluster(cluster_id: int, now: datetime) -> None:
+    """Mark an active cluster as FADED once below-threshold bars exceed CLUSTER_FADE."""
     conn = _get()
     try:
         with conn.cursor() as cur:
@@ -330,6 +338,7 @@ def get_active_clusters(symbol: str) -> list:
 def get_last_signal_time(
     symbol: str, level_type: str, level_price: float
 ) -> Optional[datetime]:
+    """Return the most recent signal timestamp for a given symbol and level, or None."""
     sql = """
         SELECT signal_time
         FROM   signals
