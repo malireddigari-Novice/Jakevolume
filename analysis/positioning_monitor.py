@@ -83,9 +83,9 @@ class PositioningMonitor:
         Parameters
         ----------
         opt_quotes      : {(strike, opt_type, expiry): bar_data}  from
-                          WebullClient.get_atm_option_quotes_all_expiries()
+                          DatabentoClient.get_atm_option_quotes_all_expiries()
         expiry_pair     : (today_exp_or_None, next_exp_or_None) from
-                          WebullClient.get_expiry_pair()
+                          DatabentoClient.get_expiry_pair()
         levels          : today's OI levels from db.get_today_levels()
         underlying_price: current equity close price
         """

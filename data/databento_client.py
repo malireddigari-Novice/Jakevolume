@@ -93,7 +93,7 @@ def _parse_osi(raw: str) -> Optional[tuple]:
     return (underlying, strike, opt_type, expiry)
 
 
-class WebullClient:
+class DatabentoClient:
 
     def __init__(self) -> None:
         """
@@ -342,7 +342,8 @@ class WebullClient:
             except Exception as exc:
                 msg = str(exc).lower()
                 is_rate_limit = '429' in msg or 'rate limit' in msg or 'too many' in msg
-                if is_rate_limit and attempt < max_retries - 1:
+                is_transient  = '504' in msg or '503' in msg or '502' in msg or 'timeout' in msg or 'gateway' in msg
+                if (is_rate_limit or is_transient) and attempt < max_retries - 1:
                     wait = (2 ** attempt) + random.random()
                     logger.warning(
                         "Databento rate limit (attempt %d/%d), retrying in %.1fs",

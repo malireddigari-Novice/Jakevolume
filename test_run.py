@@ -23,27 +23,27 @@ SYMBOL = 'AAPL'
 
 # ── 1. Client init ────────────────────────────────────────────────────────────
 log.info("[1/9] Data client init")
-from data.webull_client import WebullClient
-wb = WebullClient()
-wb.login()
+from data.databento_client import DatabentoClient
+dbc = DatabentoClient()
+dbc.login()
 log.info("Client ready  (Historical path — no Live feed needed)")
 
 # ── 2. Previous-day close (Databento Historical ohlcv-1d) ─────────────────────
 log.info("[2/9] Previous-day close")
-prev_close = wb.get_prev_close(SYMBOL)
+prev_close = dbc.get_prev_close(SYMBOL)
 log.info("%s  prev_close=%.4f", SYMBOL, prev_close)
 assert prev_close > 0, "prev_close returned zero"
 
 # ── 3. Quote (Live buffer will be empty outside market hours — that's OK) ──────
 log.info("[3/9] Quote (live buffer; falls back to prev_close if closed)")
-quote    = wb.get_quote(SYMBOL)
+quote    = dbc.get_quote(SYMBOL)
 pm_price = quote['price'] or prev_close
 log.info("%s  price=%.4f  (source: %s)",
          SYMBOL, pm_price, "live" if quote['price'] else "prev_close fallback")
 
 # ── 4. Option chain (Historical fallback on cold start / outside hours) ────────
 log.info("[4/9] Option chain")
-chain  = wb.get_option_chain(SYMBOL)
+chain  = dbc.get_option_chain(SYMBOL)
 expiry = chain['expiry']
 log.info("%s  expiry=%s  calls=%d  puts=%d",
          SYMBOL, expiry, len(chain['calls']), len(chain['puts']))
@@ -150,21 +150,26 @@ sheets = SheetsLogger()
 sheets.connect()
 
 sheets.log_daily_levels(SYMBOL, levels, prev_close, now)
-log.info("  Daily_Levels      OK")
+log.info("  Daily_Levels      queued")
 
 sheets.log_oi_snapshot(
     symbol=SYMBOL, expiry=expiry,
     top_calls=snap['top_calls'], top_puts=snap['top_puts'],
     underlying_price=prev_close, snap_time=now,
 )
-log.info("  OI_Snapshot       OK")
+log.info("  OI_Snapshot       queued")
 
 sheets.log_morning_sentiment(sentiment, now)
-log.info("  Morning_Sentiment OK")
+log.info("  Morning_Sentiment queued")
 
 sheets.log_signal(sig)
-log.info("  Signals           OK  [enter=%s  exit=%s]",
+log.info("  Signals           queued  [enter=%s  exit=%s]",
          sig.get('price_to_enter'), sig.get('price_to_exit'))
+
+# Wait for the background write worker to flush all queued rows to Sheets.
+log.info("  Waiting for Sheets write queue to flush...")
+sheets._write_queue.join()
+log.info("  All 4 Sheets writes confirmed")
 
 log.info("")
 log.info("=" * 60)

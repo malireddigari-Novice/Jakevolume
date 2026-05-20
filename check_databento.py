@@ -4,7 +4,7 @@ load_dotenv()
 
 import os
 import databento as db
-from data.webull_client import WebullClient
+from data.databento_client import DatabentoClient
 
 key = os.environ.get('DATABENTO_API_KEY', '')
 print(f"API key present: {bool(key)}  (ends ...{key[-4:]})")
@@ -19,8 +19,8 @@ print(f"    OPRA.PILLAR available: {opra['start'][:10]}  ->  {opra['end'][:10]}"
 
 # ── 2. AAPL prev_close (actual data pull) ─────────────────────────────────────
 print("\n[2] AAPL prev_close (Historical ohlcv-1d)...")
-wb = WebullClient()
-close = wb.get_prev_close("AAPL")
+dbc = DatabentoClient()
+close = dbc.get_prev_close("AAPL")
 print(f"    AAPL prev_close = ${close:.2f}  OK")
 
 # ── 3. Live feed connectivity ─────────────────────────────────────────────────

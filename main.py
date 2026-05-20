@@ -34,7 +34,7 @@ from data.market_utils import (
     is_market_open, is_snapshot_window,
 )
 from data.schwab_client import SchwabClient
-from data.webull_client import WebullClient
+from data.databento_client import DatabentoClient
 from output.sheets_logger import SheetsLogger
 
 
@@ -61,7 +61,7 @@ logger = logging.getLogger('jakevolume.main')
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
 
-def morning_snapshot(wb: WebullClient, sheets: SheetsLogger) -> None:
+def morning_snapshot(dbc: DatabentoClient, sheets: SheetsLogger) -> None:
     """
     Run the daily 08:00 CST setup: pull option chains, compute OI S/R levels,
     persist to Postgres, and enqueue all rows for Google Sheets.  Failures for
@@ -76,17 +76,17 @@ def morning_snapshot(wb: WebullClient, sheets: SheetsLogger) -> None:
     for symbol in config.SYMBOLS:
         try:
             # Explicit previous-day close — used as the ATM anchor for OI levels
-            prev_close = wb.get_prev_close(symbol)
+            prev_close = dbc.get_prev_close(symbol)
 
             # Pre-market quote from Live buffer; falls back to prev_close if
             # no Live bar has arrived yet (normal before first 1-min bar).
-            quote    = wb.get_quote(symbol)
+            quote    = dbc.get_quote(symbol)
             pm_price = quote['price'] or prev_close
 
             logger.info("%s: prev_close=%.4f  pm_price=%.4f", symbol, prev_close, pm_price)
 
             # 0DTE option chain
-            chain  = wb.get_option_chain(symbol)
+            chain  = dbc.get_option_chain(symbol)
             expiry = chain['expiry']
 
             # OI levels anchored to prev_close (not pre-market price)
@@ -165,7 +165,7 @@ def _print_mag7_briefing(sentiments: list[dict], now) -> None:
 # ── Intraday check (every minute during market hours) ────────────────────────
 
 def intraday_check(
-    wb: WebullClient,
+    dbc: DatabentoClient,
     detector: SignalDetector,
     monitor: PositioningMonitor,
     sheets: SheetsLogger,
@@ -184,7 +184,7 @@ def intraday_check(
     for symbol in config.SYMBOLS:
         try:
             # Pull latest 1-min equity bars
-            bars = wb.get_bars(symbol)
+            bars = dbc.get_bars(symbol)
             if not bars:
                 logger.warning("%s: no bars returned", symbol)
                 continue
@@ -202,8 +202,8 @@ def intraday_check(
             option_quotes: dict = {}
             expiry = None
             try:
-                expiry = wb.get_nearest_expiry(symbol)
-                option_quotes = wb.get_option_quotes_for_levels(symbol, expiry, levels)
+                expiry = dbc.get_nearest_expiry(symbol)
+                option_quotes = dbc.get_option_quotes_for_levels(symbol, expiry, levels)
             except Exception:
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
@@ -245,8 +245,8 @@ def intraday_check(
 
             # Volume cluster positioning monitor (Postgres only, no signals)
             try:
-                expiry_pair = wb.get_expiry_pair(symbol)
-                atm_quotes  = wb.get_atm_option_quotes_all_expiries(symbol, underlying_price)
+                expiry_pair = dbc.get_expiry_pair(symbol)
+                atm_quotes  = dbc.get_atm_option_quotes_all_expiries(symbol, underlying_price)
                 monitor.update(symbol, atm_quotes, expiry_pair, levels, underlying_price)
             except Exception:
                 logger.warning("%s: positioning monitor update failed", symbol, exc_info=True)
@@ -298,14 +298,14 @@ def main() -> None:
     db.init_pool()
     db.init_schema()
 
-    wb = WebullClient()
-    wb.login(interactive=True)
+    dbc = DatabentoClient()
+    dbc.login(interactive=True)
 
     if args.login:
         logger.info("--login flag: session cached. Exiting.")
         return
 
-    wb.start_live_feed()   # open Databento Live sessions (daemon threads)
+    dbc.start_live_feed()   # open Databento Live sessions (daemon threads)
 
     sheets = SheetsLogger()
     sheets.connect()
@@ -345,12 +345,12 @@ def main() -> None:
         try:
             # Morning snapshot — once per trading day
             if is_snapshot_window(now) and snap_done != now.date():
-                morning_snapshot(wb, sheets)
+                morning_snapshot(dbc, sheets)
                 snap_done = now.date()
 
             # Intraday signal scan — every minute during market hours
             if is_market_open(now):
-                intraday_check(wb, detector, monitor, sheets, schwab=schwab)
+                intraday_check(dbc, detector, monitor, sheets, schwab=schwab)
 
         except Exception:
             logger.exception("Unhandled error in main loop")

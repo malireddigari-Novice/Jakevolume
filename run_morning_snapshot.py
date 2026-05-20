@@ -21,15 +21,15 @@ import db.ops as db
 from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.sentiment import compute_sentiment
 from data.market_utils import now_cst, today_cst
-from data.webull_client import WebullClient
+from data.databento_client import DatabentoClient
 from output.sheets_logger import SheetsLogger
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 db.init_pool()
 db.init_schema()
 
-wb = WebullClient()
-wb.login()
+dbc = DatabentoClient()
+dbc.login()
 
 sheets = SheetsLogger()
 sheets.connect()
@@ -43,11 +43,11 @@ results = []
 for symbol in config.SYMBOLS:
     try:
         log.info("Processing %s ...", symbol)
-        prev_close = wb.get_prev_close(symbol)
-        quote      = wb.get_quote(symbol)
+        prev_close = dbc.get_prev_close(symbol)
+        quote      = dbc.get_quote(symbol)
         pm_price   = quote['price'] or prev_close
 
-        chain      = wb.get_option_chain(symbol)
+        chain      = dbc.get_option_chain(symbol)
         expiry     = chain['expiry']
         levels     = compute_oi_levels(chain, prev_close)
         snap       = get_top_oi_snapshot(chain, prev_close)

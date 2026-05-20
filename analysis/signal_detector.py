@@ -55,10 +55,10 @@ class SignalDetector:
 
         Parameters
         ----------
-        bars          : 1-min bars sorted oldest-first (from WebullClient.get_bars)
+        bars          : 1-min bars sorted oldest-first (from DatabentoClient.get_bars)
         levels        : rows from db.get_today_levels()
         option_quotes : {(strike, option_type): normalised_contract}
-                        from WebullClient.get_option_quotes_for_levels()
+                        from DatabentoClient.get_option_quotes_for_levels()
         """
         need = config.VOLUME_LOOKBACK_BARS + 1
         if len(bars) < need:
