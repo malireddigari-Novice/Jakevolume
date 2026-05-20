@@ -1,4 +1,5 @@
 databento>=0.78.0
+schwab-py>=1.4.0
 psycopg2-binary>=2.9.9
 gspread>=6.0.0
 google-auth>=2.27.0

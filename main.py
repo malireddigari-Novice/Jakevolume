@@ -21,6 +21,7 @@ import logging
 import sys
 import time
 from datetime import date
+from typing import Optional
 
 import config
 import db.ops as db
@@ -32,6 +33,7 @@ from data.market_utils import (
     now_cst, today_cst,
     is_market_open, is_snapshot_window,
 )
+from data.schwab_client import SchwabClient
 from data.webull_client import WebullClient
 from output.sheets_logger import SheetsLogger
 
@@ -167,11 +169,15 @@ def intraday_check(
     detector: SignalDetector,
     monitor: PositioningMonitor,
     sheets: SheetsLogger,
+    schwab: Optional[SchwabClient] = None,
 ) -> None:
     """
     Scan all symbols once per 60-second poll: pull bars, run the signal detector,
     fire desktop notifications, and update the positioning monitor.  Failures for
     individual symbols are logged without interrupting the remaining symbols.
+
+    If a SchwabClient is provided its real-time bid/ask prices are merged into
+    the option quotes so price_to_enter and price_to_exit are always populated.
     """
     today = today_cst()
 
@@ -200,6 +206,33 @@ def intraday_check(
                 option_quotes = wb.get_option_quotes_for_levels(symbol, expiry, levels)
             except Exception:
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
+
+            # Overlay real-time bid/ask from Schwab so price_to_enter/exit are populated.
+            # Databento ohlcv-1m provides volume (for cluster detection) but not bid/ask;
+            # Schwab fills that gap with live prices from the user's brokerage account.
+            if schwab and expiry:
+                try:
+                    schwab_quotes = schwab.get_option_quotes_for_levels(
+                        symbol, expiry, levels
+                    )
+                    for key, sq in schwab_quotes.items():
+                        if key in option_quotes:
+                            option_quotes[key]['bid']  = sq['bid']
+                            option_quotes[key]['ask']  = sq['ask']
+                            # Keep Databento mark if Schwab has none
+                            option_quotes[key]['mark'] = (
+                                sq['mark'] or option_quotes[key].get('mark')
+                            )
+                        else:
+                            option_quotes[key] = sq
+                    logger.debug(
+                        "%s: Schwab bid/ask merged for %d strikes",
+                        symbol, len(schwab_quotes),
+                    )
+                except Exception:
+                    logger.warning(
+                        "%s: Schwab bid/ask overlay failed", symbol, exc_info=True
+                    )
 
             # Detect volume clusters — equity spike OR option volume cluster at S/R level
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry)
@@ -277,6 +310,26 @@ def main() -> None:
     sheets = SheetsLogger()
     sheets.connect()
 
+    # Schwab client: provides real-time bid/ask for price_to_enter / price_to_exit.
+    # Skipped gracefully if credentials are not configured.
+    schwab: Optional[SchwabClient] = None
+    if config.SCHWAB_API_KEY and config.SCHWAB_APP_SECRET:
+        try:
+            schwab = SchwabClient()
+            schwab.login()
+            logger.info("Schwab client ready — real-time option bid/ask enabled")
+        except Exception:
+            logger.warning(
+                "Schwab login failed — price_to_enter/exit will be None in signals",
+                exc_info=True,
+            )
+            schwab = None
+    else:
+        logger.warning(
+            "SCHWAB_API_KEY / SCHWAB_APP_SECRET not set — "
+            "price_to_enter/exit will be None. Add credentials to .env."
+        )
+
     detector   = SignalDetector()
     monitor    = PositioningMonitor()
     snap_done: date | None = None   # guard: run snapshot only once per day
@@ -297,7 +350,7 @@ def main() -> None:
 
             # Intraday signal scan — every minute during market hours
             if is_market_open(now):
-                intraday_check(wb, detector, monitor, sheets)
+                intraday_check(wb, detector, monitor, sheets, schwab=schwab)
 
         except Exception:
             logger.exception("Unhandled error in main loop")

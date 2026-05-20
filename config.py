@@ -50,11 +50,13 @@ BAR_INTERVAL         = 'm1'   # 1-minute bars (webull interval code)
 BARS_TO_FETCH        = int(os.getenv('BARS_TO_FETCH', '40'))   # fetch buffer
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', '60'))
 
-# ── Webull credentials ────────────────────────────────────────────────────────
-WEBULL_USERNAME    = os.getenv('WEBULL_USERNAME', '')
-WEBULL_PASSWORD    = os.getenv('WEBULL_PASSWORD', '')
-WEBULL_TRADE_PIN   = os.getenv('WEBULL_TRADE_PIN', '')
-WEBULL_DEVICE_NAME = os.getenv('WEBULL_DEVICE_NAME', 'jakevolume_trader')
+# ── Charles Schwab / TD Ameritrade ───────────────────────────────────────────
+# Register a developer app at developer.schwab.com to obtain these values.
+# Set SCHWAB_CALLBACK_URL to https://127.0.0.1 in your app registration.
+SCHWAB_API_KEY      = os.getenv('SCHWAB_API_KEY', '')
+SCHWAB_APP_SECRET   = os.getenv('SCHWAB_APP_SECRET', '')
+SCHWAB_CALLBACK_URL = os.getenv('SCHWAB_CALLBACK_URL', 'https://127.0.0.1')
+SCHWAB_TOKEN_FILE   = os.getenv('SCHWAB_TOKEN_FILE', 'schwab_token.json')
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 DB_HOST     = os.getenv('DB_HOST', 'localhost')
