@@ -56,7 +56,8 @@ _HDR_DAILY_LEVELS = [
 ]
 
 _HDR_SIGNALS = [
-    'Datetime_CST', 'Contract', 'Option_Price_To_Enter', 'Option_Price_To_Exit',
+    'Datetime_CST', 'Contract', 'Ticker_Price_At_Entry',
+    'Option_Price_To_Enter', 'Option_Price_To_Exit',
 ]
 
 _HDR_MORNING_SENTIMENT = [
@@ -176,6 +177,7 @@ class SheetsLogger:
         row = [
             signal['signal_time'].strftime('%Y-%m-%d %H:%M:%S'),
             contract,
+            signal.get('trigger_price', ''),
             signal.get('price_to_enter', ''),
             signal.get('price_to_exit', ''),
         ]
