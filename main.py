@@ -61,11 +61,18 @@ logger = logging.getLogger('jakevolume.main')
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
 
-def morning_snapshot(dbc: DatabentoClient, sheets: SheetsLogger) -> None:
+def morning_snapshot(
+    dbc: DatabentoClient,
+    sheets: SheetsLogger,
+    schwab: Optional[SchwabClient] = None,
+) -> None:
     """
     Run the daily 08:00 CST setup: pull option chains, compute OI S/R levels,
     persist to Postgres, and enqueue all rows for Google Sheets.  Failures for
     individual symbols are logged but do not abort the remaining symbols.
+
+    Tries Schwab as the primary option chain source (real-time, no timeouts);
+    falls back to Databento Historical if Schwab is unavailable or fails.
     """
     now   = now_cst()
     today = today_cst()
@@ -85,8 +92,16 @@ def morning_snapshot(dbc: DatabentoClient, sheets: SheetsLogger) -> None:
 
             logger.info("%s: prev_close=%.4f  pm_price=%.4f", symbol, prev_close, pm_price)
 
-            # 0DTE option chain
-            chain  = dbc.get_option_chain(symbol)
+            # Option chain — try Schwab first (real-time, no gateway timeouts),
+            # fall back to Databento Historical if Schwab fails or is not configured.
+            chain = None
+            if schwab:
+                try:
+                    chain = schwab.get_option_chain_normalized(symbol)
+                except Exception:
+                    logger.warning("%s: Schwab chain failed, falling back to Databento", symbol)
+            if chain is None:
+                chain = dbc.get_option_chain(symbol)
             expiry = chain['expiry']
 
             # OI levels anchored to prev_close (not pre-market price)
@@ -345,7 +360,7 @@ def main() -> None:
         try:
             # Morning snapshot — once per trading day
             if is_snapshot_window(now) and snap_done != now.date():
-                morning_snapshot(dbc, sheets)
+                morning_snapshot(dbc, sheets, schwab=schwab)
                 snap_done = now.date()
 
             # Intraday signal scan — every minute during market hours
