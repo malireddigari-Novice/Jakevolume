@@ -22,7 +22,6 @@ from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.sentiment import compute_sentiment
 from data.market_utils import now_cst, today_cst
 from data.databento_client import DatabentoClient
-from data.schwab_client import SchwabClient
 from output.sheets_logger import SheetsLogger
 
 # ── Init ──────────────────────────────────────────────────────────────────────
@@ -31,14 +30,6 @@ db.init_schema()
 
 dbc = DatabentoClient()
 dbc.login()
-
-schwab_client: SchwabClient | None = None
-try:
-    schwab_client = SchwabClient()
-    schwab_client.login()
-    log.info("Schwab client ready — using as primary chain source")
-except Exception:
-    log.warning("Schwab unavailable — falling back to Databento for all chains")
 
 sheets = SheetsLogger()
 sheets.connect()
@@ -56,14 +47,7 @@ for symbol in config.SYMBOLS:
         quote      = dbc.get_quote(symbol)
         pm_price   = quote['price'] or prev_close
 
-        chain = None
-        if schwab_client:
-            try:
-                chain = schwab_client.get_option_chain_normalized(symbol)
-            except Exception:
-                log.warning("%s: Schwab chain failed, falling back to Databento", symbol)
-        if chain is None:
-            chain = dbc.get_option_chain(symbol)
+        chain      = dbc.get_option_chain(symbol)
         expiry     = chain['expiry']
         levels     = compute_oi_levels(chain, prev_close)
         snap       = get_top_oi_snapshot(chain, prev_close)

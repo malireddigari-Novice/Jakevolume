@@ -61,18 +61,13 @@ logger = logging.getLogger('jakevolume.main')
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
 
-def morning_snapshot(
-    dbc: DatabentoClient,
-    sheets: SheetsLogger,
-    schwab: Optional[SchwabClient] = None,
-) -> None:
+def morning_snapshot(dbc: DatabentoClient, sheets: SheetsLogger) -> None:
     """
-    Run the daily 08:00 CST setup: pull option chains, compute OI S/R levels,
-    persist to Postgres, and enqueue all rows for Google Sheets.  Failures for
-    individual symbols are logged but do not abort the remaining symbols.
+    Run the daily 08:00 CST setup using Databento Historical for option chains.
 
-    Tries Schwab as the primary option chain source (real-time, no timeouts);
-    falls back to Databento Historical if Schwab is unavailable or fails.
+    Databento Historical provides yesterday's fully-settled OI data — the
+    correct anchor for computing S/R levels before the market opens.
+    Schwab is not used here; it is used during the intraday session instead.
     """
     now   = now_cst()
     today = today_cst()
@@ -92,16 +87,8 @@ def morning_snapshot(
 
             logger.info("%s: prev_close=%.4f  pm_price=%.4f", symbol, prev_close, pm_price)
 
-            # Option chain — try Schwab first (real-time, no gateway timeouts),
-            # fall back to Databento Historical if Schwab fails or is not configured.
-            chain = None
-            if schwab:
-                try:
-                    chain = schwab.get_option_chain_normalized(symbol)
-                except Exception:
-                    logger.warning("%s: Schwab chain failed, falling back to Databento", symbol)
-            if chain is None:
-                chain = dbc.get_option_chain(symbol)
+            # Databento Historical option chain — settled OI from prior session
+            chain  = dbc.get_option_chain(symbol)
             expiry = chain['expiry']
 
             # OI levels anchored to prev_close (not pre-market price)
@@ -213,41 +200,27 @@ def intraday_check(
                 logger.debug("%s: no OI levels for %s, skipping signal check", symbol, today)
                 continue
 
-            # Pull live option quotes for the specific S/R strikes
+            # Pull live option quotes — Schwab is primary during market hours
+            # (real-time bid/ask + volume + mark).  Falls back to Databento
+            # Live _opt_buf if Schwab is not configured or fails.
             option_quotes: dict = {}
             expiry = None
             try:
                 expiry = dbc.get_nearest_expiry(symbol)
-                option_quotes = dbc.get_option_quotes_for_levels(symbol, expiry, levels)
-            except Exception:
-                logger.warning("%s: option quote fetch failed, proceeding without", symbol)
-
-            # Overlay real-time bid/ask from Schwab so price_to_enter/exit are populated.
-            # Databento ohlcv-1m provides volume (for cluster detection) but not bid/ask;
-            # Schwab fills that gap with live prices from the user's brokerage account.
-            if schwab and expiry:
-                try:
-                    schwab_quotes = schwab.get_option_quotes_for_levels(
+                if schwab:
+                    option_quotes = schwab.get_option_quotes_for_levels(
                         symbol, expiry, levels
                     )
-                    for key, sq in schwab_quotes.items():
-                        if key in option_quotes:
-                            option_quotes[key]['bid']  = sq['bid']
-                            option_quotes[key]['ask']  = sq['ask']
-                            # Keep Databento mark if Schwab has none
-                            option_quotes[key]['mark'] = (
-                                sq['mark'] or option_quotes[key].get('mark')
-                            )
-                        else:
-                            option_quotes[key] = sq
                     logger.debug(
-                        "%s: Schwab bid/ask merged for %d strikes",
-                        symbol, len(schwab_quotes),
+                        "%s: Schwab quotes for %d strikes (expiry %s)",
+                        symbol, len(option_quotes), expiry,
                     )
-                except Exception:
-                    logger.warning(
-                        "%s: Schwab bid/ask overlay failed", symbol, exc_info=True
+                else:
+                    option_quotes = dbc.get_option_quotes_for_levels(
+                        symbol, expiry, levels
                     )
+            except Exception:
+                logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
             # Detect volume clusters — equity spike OR option volume cluster at S/R level
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry)
@@ -360,7 +333,7 @@ def main() -> None:
         try:
             # Morning snapshot — once per trading day
             if is_snapshot_window(now) and snap_done != now.date():
-                morning_snapshot(dbc, sheets, schwab=schwab)
+                morning_snapshot(dbc, sheets)
                 snap_done = now.date()
 
             # Intraday signal scan — every minute during market hours
