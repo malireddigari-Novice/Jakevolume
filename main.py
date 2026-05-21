@@ -185,8 +185,12 @@ def intraday_check(
 
     for symbol in config.SYMBOLS:
         try:
-            # Pull latest 1-min equity bars
-            bars = dbc.get_bars(symbol)
+            # 1-min equity bars — Schwab primary, Databento Live fallback
+            if schwab:
+                bars = schwab.get_bars(symbol)
+            else:
+                bars = dbc.get_bars(symbol)
+
             if not bars:
                 logger.warning("%s: no bars returned", symbol)
                 continue
@@ -200,14 +204,12 @@ def intraday_check(
                 logger.debug("%s: no OI levels for %s, skipping signal check", symbol, today)
                 continue
 
-            # Pull live option quotes — Schwab is primary during market hours
-            # (real-time bid/ask + volume + mark).  Falls back to Databento
-            # Live _opt_buf if Schwab is not configured or fails.
+            # Option quotes — Schwab primary (real-time bid/ask + volume + mark)
             option_quotes: dict = {}
             expiry = None
             try:
-                expiry = dbc.get_nearest_expiry(symbol)
-                if schwab:
+                expiry = schwab.get_nearest_expiry(symbol) if schwab else dbc.get_nearest_expiry(symbol)
+                if schwab and expiry:
                     option_quotes = schwab.get_option_quotes_for_levels(
                         symbol, expiry, levels
                     )
@@ -215,7 +217,7 @@ def intraday_check(
                         "%s: Schwab quotes for %d strikes (expiry %s)",
                         symbol, len(option_quotes), expiry,
                     )
-                else:
+                elif expiry:
                     option_quotes = dbc.get_option_quotes_for_levels(
                         symbol, expiry, levels
                     )

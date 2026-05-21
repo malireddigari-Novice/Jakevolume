@@ -24,13 +24,15 @@ _get_option_chain() retries on HTTP 429 with exponential back-off.
 import logging
 import random
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
+import pytz
 import schwab
 import schwab.client
 
 import config
+from data.market_utils import CST
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,9 @@ class SchwabClient:
     def __init__(self) -> None:
         """Initialise the client; call login() before any data methods."""
         self._client: Optional[schwab.client.Client] = None
+        # Expiry cache: {symbol: expiry_date}; cleared at start of each trading day
+        self._expiry_cache:      dict[str, date] = {}
+        self._expiry_cache_date: Optional[date]  = None
 
     # ── Authentication ────────────────────────────────────────────────────────
 
@@ -178,6 +183,76 @@ class SchwabClient:
                 symbol, result['expiry'], len(result['calls']), len(result['puts']),
             )
         return result
+
+    def get_bars(self, symbol: str, count: int = None) -> list[dict]:
+        """
+        Return the latest `count` 1-minute OHLCV bars for an equity, oldest-first.
+
+        Fetches today's regular-session price history from Schwab and returns
+        the same format as DatabentoClient.get_bars() so the SignalDetector
+        and volume-spike logic work without modification.
+        """
+        count = count or config.BARS_TO_FETCH
+        if not self._client:
+            return []
+        try:
+            resp = self._client.get_price_history(
+                symbol,
+                period_type=schwab.client.Client.PriceHistory.PeriodType.DAY,
+                period=schwab.client.Client.PriceHistory.Period.ONE_DAY,
+                frequency_type=schwab.client.Client.PriceHistory.FrequencyType.MINUTE,
+                frequency=schwab.client.Client.PriceHistory.Frequency.EVERY_MINUTE,
+                need_extended_hours_data=False,
+            )
+            resp.raise_for_status()
+            candles = resp.json().get('candles', [])
+            bars = []
+            for c in candles:
+                bar_time = datetime.fromtimestamp(
+                    c['datetime'] / 1000, tz=pytz.UTC
+                ).astimezone(CST)
+                bars.append({
+                    'bar_time': bar_time,
+                    'open':     float(c['open']),
+                    'high':     float(c['high']),
+                    'low':      float(c['low']),
+                    'close':    float(c['close']),
+                    'volume':   int(c['volume']),
+                })
+            bars.sort(key=lambda b: b['bar_time'])
+            logger.debug("Schwab: %s — %d bars returned", symbol, len(bars))
+            return bars[-count:]
+        except Exception as exc:
+            logger.warning("Schwab: get_bars failed for %s: %s", symbol, exc)
+            return []
+
+    def get_nearest_expiry(self, symbol: str) -> Optional[date]:
+        """
+        Return the nearest available option expiry for a symbol.
+
+        Cached per trading day — only one API call per symbol per day regardless
+        of how many times the intraday loop calls this.
+        """
+        today = date.today()
+        if self._expiry_cache_date != today:
+            self._expiry_cache.clear()
+            self._expiry_cache_date = today
+
+        if symbol in self._expiry_cache:
+            return self._expiry_cache[symbol]
+
+        if not self._client:
+            return None
+        raw = self._get_option_chain(symbol)   # fetches next 7 days
+        if not raw:
+            return None
+        result = _normalize_chain(raw)
+        if not result:
+            return None
+        exp = result['expiry']
+        self._expiry_cache[symbol] = exp
+        logger.debug("Schwab: %s nearest expiry = %s (cached)", symbol, exp)
+        return exp
 
     def _get_option_chain(
         self,
