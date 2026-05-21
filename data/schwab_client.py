@@ -24,7 +24,7 @@ _get_option_chain() retries on HTTP 429 with exponential back-off.
 import logging
 import random
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 import schwab
@@ -69,14 +69,10 @@ class SchwabClient:
 
         except FileNotFoundError:
             logger.info(
-                "Schwab: no token file found at %s — starting interactive OAuth flow.",
+                "Schwab: no token file found at %s — starting manual OAuth flow.",
                 config.SCHWAB_TOKEN_FILE,
             )
-            logger.info(
-                "Schwab: a browser window will open.  Log in with your Schwab account "
-                "and approve access.  The token will be saved automatically."
-            )
-            self._client = schwab.auth.easy_client(
+            self._client = schwab.auth.client_from_manual_flow(
                 api_key=config.SCHWAB_API_KEY,
                 app_secret=config.SCHWAB_APP_SECRET,
                 callback_url=config.SCHWAB_CALLBACK_URL,
@@ -156,24 +152,58 @@ class SchwabClient:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def get_option_chain_normalized(self, symbol: str) -> Optional[dict]:
+        """
+        Return the nearest-expiry option chain in DatabentoClient format.
+
+        Queries Schwab for the next 7 days of expiries and picks the nearest one
+        that has both calls and puts.  Returns a dict with keys:
+          expiry : date
+          calls  : list of contract dicts
+          puts   : list of contract dicts
+          all    : combined list with 'option_type' key added
+        Each contract has: strike, expiry, open_interest, volume, bid, ask, mark.
+        Returns None on any error so the caller can fall back to Databento.
+        """
+        if not self._client:
+            return None
+        raw = self._get_option_chain(symbol)
+        if raw is None:
+            return None
+        result = _normalize_chain(raw)
+        if result:
+            result['symbol'] = symbol
+            logger.info(
+                "Schwab: %s chain expiry=%s calls=%d puts=%d",
+                symbol, result['expiry'], len(result['calls']), len(result['puts']),
+            )
+        return result
+
     def _get_option_chain(
         self,
         symbol: str,
-        expiry: date,
+        expiry: Optional[date] = None,
         max_retries: int = 4,
     ) -> Optional[dict]:
         """
         Call the Schwab option chain endpoint with exponential back-off on 429.
 
-        Returns the parsed JSON dict on success, None on unrecoverable error.
+        If expiry is given, restricts to that single date.  Otherwise fetches
+        the next 7 days so the caller can pick the nearest available expiry.
+        Returns the raw JSON dict on success, None on unrecoverable error.
         """
         for attempt in range(max_retries):
             try:
+                if expiry:
+                    from_date, to_date = expiry, expiry
+                else:
+                    from_date = date.today()
+                    to_date   = from_date + timedelta(days=7)
                 resp = self._client.get_option_chain(
                     symbol,
                     contract_type=schwab.client.Client.Options.ContractType.ALL,
-                    from_date=expiry,
-                    to_date=expiry,
+                    from_date=from_date,
+                    to_date=to_date,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -206,6 +236,51 @@ class SchwabClient:
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _normalize_chain(data: dict) -> Optional[dict]:
+    """
+    Convert a raw Schwab chain response to DatabentoClient-compatible format.
+
+    Picks the nearest expiry that has both calls and puts.
+    """
+    calls_by_exp: dict[date, list] = {}
+    puts_by_exp:  dict[date, list] = {}
+
+    for opt_type, exp_map, bucket in [
+        ('CALL', data.get('callExpDateMap', {}), calls_by_exp),
+        ('PUT',  data.get('putExpDateMap',  {}), puts_by_exp),
+    ]:
+        for date_dte, strikes_map in exp_map.items():
+            exp_date = date.fromisoformat(date_dte.split(':')[0])
+            bucket.setdefault(exp_date, [])
+            for strike_str, contracts in strikes_map.items():
+                if not contracts:
+                    continue
+                c = contracts[0]
+                bucket[exp_date].append({
+                    'strike':        float(strike_str),
+                    'expiry':        exp_date,
+                    'open_interest': int(c.get('openInterest', 0) or 0),
+                    'volume':        int(c.get('totalVolume', 0) or 0),
+                    'bid':           c.get('bid'),
+                    'ask':           c.get('ask'),
+                    'mark':          c.get('mark'),
+                })
+
+    shared = sorted(set(calls_by_exp) & set(puts_by_exp))
+    if not shared:
+        return None
+    nearest = shared[0]
+    calls = calls_by_exp[nearest]
+    puts  = puts_by_exp[nearest]
+    return {
+        'expiry': nearest,
+        'calls':  calls,
+        'puts':   puts,
+        'all':    [{'option_type': 'CALL', **c} for c in calls] +
+                  [{'option_type': 'PUT',  **p} for p in puts],
+    }
+
 
 def _parse_chain(data: dict, include_oi: bool = False) -> dict:
     """
