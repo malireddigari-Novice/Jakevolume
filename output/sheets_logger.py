@@ -51,13 +51,17 @@ _SCOPES = [
 
 _HDR_DAILY_LEVELS = [
     'Date', 'Symbol', 'Computed_At_CST', 'Underlying_Price',
-    'S1_Strike', 'S1_OI', 'S2_Strike', 'S2_OI',
-    'R1_Strike', 'R1_OI', 'R2_Strike', 'R2_OI',
+    'S1_Strike', 'S1_OI', 'S2_Strike', 'S2_OI', 'S3_Strike', 'S3_OI',
+    'R1_Strike', 'R1_OI', 'R2_Strike', 'R2_OI', 'R3_Strike', 'R3_OI',
 ]
 
 _HDR_SIGNALS = [
     'Datetime_CST', 'Contract', 'Ticker_Price_At_Entry',
     'Option_Price_To_Enter', 'Option_Price_To_Exit',
+    'Cluster_Strength', 'Flow_Shape', 'Prox_Score',
+    'ATM_1m', 'ATM_3m', 'ITM_1m', 'ITM_3m',
+    'Spread_Pct', 'Strong', 'Room_Score',
+    'PC_Ratio', 'PC_Conviction',
 ]
 
 _HDR_MORNING_SENTIMENT = [
@@ -76,11 +80,22 @@ _HDR_OI_SNAPSHOT = [
     'Underlying_Price',
 ]
 
+_HDR_LEVELS_COMPARISON = [
+    'Date', 'Symbol', 'Prev_Close', 'Expiry',
+    # Daily Levels — ATM-anchored (what signal detector uses)
+    'DL_S1_Strike', 'DL_S1_OI', 'DL_S2_Strike', 'DL_S2_OI', 'DL_S3_Strike', 'DL_S3_OI',
+    'DL_R1_Strike', 'DL_R1_OI', 'DL_R2_Strike', 'DL_R2_OI', 'DL_R3_Strike', 'DL_R3_OI',
+    # OI Snapshot — highest raw OI near ATM (reference view)
+    'OI_P1_Strike', 'OI_P1_OI', 'OI_P2_Strike', 'OI_P2_OI',
+    'OI_C1_Strike', 'OI_C1_OI', 'OI_C2_Strike', 'OI_C2_OI',
+]
+
 _HEADERS = {
-    config.SHEET_NAMES['daily_levels']:      _HDR_DAILY_LEVELS,
-    config.SHEET_NAMES['signals']:           _HDR_SIGNALS,
-    config.SHEET_NAMES['oi_snapshot']:       _HDR_OI_SNAPSHOT,
-    config.SHEET_NAMES['morning_sentiment']: _HDR_MORNING_SENTIMENT,
+    config.SHEET_NAMES['daily_levels']:       _HDR_DAILY_LEVELS,
+    config.SHEET_NAMES['signals']:            _HDR_SIGNALS,
+    config.SHEET_NAMES['oi_snapshot']:        _HDR_OI_SNAPSHOT,
+    config.SHEET_NAMES['morning_sentiment']:  _HDR_MORNING_SENTIMENT,
+    config.SHEET_NAMES['levels_comparison']:  _HDR_LEVELS_COMPARISON,
 }
 
 
@@ -161,7 +176,7 @@ class SheetsLogger:
             symbol,
             computed_at.strftime('%Y-%m-%d %H:%M:%S'),
             round(underlying_price, 4),
-        ] + _level_cols(supports, 2) + _level_cols(resistances, 2)
+        ] + _level_cols(supports, 3) + _level_cols(resistances, 3)
 
         self._enqueue('daily_levels', row)
         logger.info("Sheets: queued daily levels for %s", symbol)
@@ -174,12 +189,25 @@ class SheetsLogger:
         strike   = signal.get('level_price', '')
         contract = f"{signal['symbol']} {strike}{opt_char} {expiry_s}".strip()
 
+        spread = signal.get('spread_pct')
         row = [
             signal['signal_time'].strftime('%Y-%m-%d %H:%M:%S'),
             contract,
             signal.get('trigger_price', ''),
             signal.get('price_to_enter', ''),
             signal.get('price_to_exit', ''),
+            round(signal.get('cluster_strength', 0), 3),
+            signal.get('flow_shape', ''),
+            signal.get('prox_score', ''),
+            signal.get('atm_vol_1m', ''),
+            signal.get('atm_vol_3m', ''),
+            signal.get('itm_vol_1m', ''),
+            signal.get('itm_vol_3m', ''),
+            round(spread * 100, 1) if spread is not None else '',
+            'YES' if signal.get('strong_cluster') else 'NO',
+            round(signal['room_score'], 2) if signal.get('room_score') is not None else '',
+            round(signal['pc_ratio'], 3) if signal.get('pc_ratio') is not None else '',
+            signal.get('pc_conviction', ''),
         ]
         self._enqueue('signals', row)
         logger.info(
@@ -230,6 +258,35 @@ class SheetsLogger:
 
         self._enqueue('oi_snapshot', row)
         logger.info("Sheets: queued OI snapshot for %s (expiry %s)", symbol, expiry)
+
+    def log_comparison_row(
+        self,
+        symbol: str,
+        expiry: date,
+        underlying_price: float,
+        levels: list[dict],
+        snap: dict,
+        computed_at: datetime,
+    ) -> None:
+        """
+        Enqueue a Levels_Comparison row combining Daily Levels (proximity-ranked)
+        and OI Snapshot (raw OI ranked) side by side for easy comparison.
+        """
+        supports    = _ranked(levels, 'SUPPORT')
+        resistances = _ranked(levels, 'RESISTANCE')
+        top_puts    = snap.get('top_puts',  [])
+        top_calls   = snap.get('top_calls', [])
+
+        row = [
+            computed_at.strftime('%Y-%m-%d'),
+            symbol,
+            round(underlying_price, 4),
+            str(expiry),
+        ] + _level_cols(supports, 3) + _level_cols(resistances, 3) \
+          + _oi_cols(top_puts, 2)    + _oi_cols(top_calls, 2)
+
+        self._enqueue('levels_comparison', row)
+        logger.info("Sheets: queued levels comparison for %s", symbol)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

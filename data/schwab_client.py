@@ -124,19 +124,82 @@ class SchwabClient:
         # Parse the full chain into a flat lookup table
         all_quotes = _parse_chain(raw)
 
-        # Return only the strikes that appear in the S/R levels list
+        # Return BOTH the level's own option type AND the confirming type for every
+        # S/R strike so the signal detector can check the correct side:
+        #   RESISTANCE strike → confirm with PUT volume (rejection)
+        #   SUPPORT    strike → confirm with CALL volume (bounce)
         result: dict = {}
         for level in levels:
-            strike      = float(level['strike'])
-            option_type = str(level.get('option_type', ''))
-            key = (strike, option_type)
-            if key in all_quotes:
-                result[key] = all_quotes[key]
-            else:
-                logger.debug(
-                    "Schwab: no quote for %s %s@%.2f (expiry %s)",
-                    symbol, option_type, strike, expiry,
-                )
+            strike = float(level['strike'])
+            for opt_type in ('CALL', 'PUT'):
+                key = (strike, opt_type)
+                if key in all_quotes:
+                    result[key] = all_quotes[key]
+                else:
+                    logger.debug(
+                        "Schwab: no quote for %s %s@%.2f (expiry %s)",
+                        symbol, opt_type, strike, expiry,
+                    )
+        return result
+
+    def get_watched_contracts(
+        self,
+        symbol: str,
+        expiry: date,
+        spot: float,
+        n: int = 2,
+    ) -> dict:
+        """
+        Return the n nearest call and put strikes to spot, each tagged with
+        whether it is the primary (highest OI) or secondary watched contract.
+
+        At support  → watch CALLS: 2 nearest strikes to spot, highest OI = primary
+        At resistance → watch PUTS: 2 nearest strikes to spot, highest OI = primary
+
+        Both strikes are returned so the signal detector can run ATM + ITM
+        cluster checks.  The 'primary' flag marks the highest-OI strike.
+
+        Returns {(strike, opt_type): {bid, ask, mark, volume, open_interest, primary}}
+        Empty dict on any error.
+        """
+        if not self._client:
+            return {}
+        raw = self._get_option_chain(symbol, expiry)
+        if raw is None:
+            return {}
+
+        all_quotes = _parse_chain(raw, include_oi=True)
+
+        result: dict = {}
+        for opt_type in ('CALL', 'PUT'):
+            # All available strikes for this side
+            strikes = sorted(
+                {s for (s, ot) in all_quotes if ot == opt_type},
+                key=lambda s: abs(s - spot),
+            )
+            nearest_n = strikes[:n]
+            if not nearest_n:
+                continue
+
+            # Primary = highest OI among the n nearest
+            primary_strike = max(
+                nearest_n,
+                key=lambda s: all_quotes.get((s, opt_type), {}).get('open_interest', 0),
+            )
+
+            for strike in nearest_n:
+                data = dict(all_quotes.get((strike, opt_type), {}))
+                data['primary'] = (strike == primary_strike)
+                result[(strike, opt_type)] = data
+
+        logger.debug(
+            "%s: watched contracts near %.2f → calls=%s puts=%s",
+            symbol, spot,
+            [(s, d.get('open_interest'), d.get('primary'))
+             for (s, ot), d in result.items() if ot == 'CALL'],
+            [(s, d.get('open_interest'), d.get('primary'))
+             for (s, ot), d in result.items() if ot == 'PUT'],
+        )
         return result
 
     def get_option_chain_full(
@@ -253,6 +316,30 @@ class SchwabClient:
         self._expiry_cache[symbol] = exp
         logger.debug("Schwab: %s nearest expiry = %s (cached)", symbol, exp)
         return exp
+
+    def get_prev_close(self, symbol: str) -> float:
+        """Return the previous regular-session closing price from Schwab."""
+        if not self._client:
+            raise RuntimeError("SchwabClient not logged in")
+        resp = self._client.get_quote(symbol)
+        resp.raise_for_status()
+        data = resp.json()
+        return float(data[symbol]['quote']['closePrice'])
+
+    def get_quote(self, symbol: str) -> dict:
+        """Return current/pre-market price as {'price': float}, matching DatabentoClient interface."""
+        if not self._client:
+            raise RuntimeError("SchwabClient not logged in")
+        resp = self._client.get_quote(symbol)
+        resp.raise_for_status()
+        data = resp.json()
+        q = data[symbol]['quote']
+        price = q.get('lastPrice') or q.get('closePrice')
+        return {'price': float(price)}
+
+    def get_option_chain(self, symbol: str) -> Optional[dict]:
+        """Alias for get_option_chain_normalized() — DatabentoClient interface compatibility."""
+        return self.get_option_chain_normalized(symbol)
 
     def _get_option_chain(
         self,

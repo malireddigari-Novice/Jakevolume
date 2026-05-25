@@ -39,9 +39,22 @@ def is_market_open(dt: datetime = None) -> bool:
     return _MARKET_OPEN <= t < _MARKET_CLOSE
 
 
+def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:
+    """
+    True if `dt` is within `window_sec` seconds of 14:55 CST (EOD liquidation trigger).
+    Fires once per day from the 60-second loop, 5 minutes before market close.
+    """
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    eod_dt = dt.replace(hour=14, minute=55, second=0, microsecond=0)
+    return abs((dt - eod_dt).total_seconds()) <= window_sec
+
+
 def is_snapshot_window(dt: datetime = None, window_sec: int = 59) -> bool:
     """
-    True if `dt` is within `window_sec` seconds of today's 08:00 CST snapshot.
+    True if `dt` is within `window_sec` seconds of today's 08:10 CST snapshot.
     Designed to fire exactly once per day when called from a 60-second loop.
     """
     if dt is None:

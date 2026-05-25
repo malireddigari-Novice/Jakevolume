@@ -213,15 +213,25 @@ def save_signal(signal: dict) -> int:
     sql = """
         INSERT INTO signals
             (symbol, signal_time, signal_type, bias, level_type, level_price,
-             trigger_price, avg_volume_20, spike_volume, consecutive_spikes,
-             option_type, opt_mark, opt_bid, opt_ask, opt_vol_delta,
-             price_to_enter, price_to_exit)
+             trigger_price, option_type, opt_mark, opt_bid, opt_ask,
+             price_to_enter, price_to_exit,
+             prox_score, cluster_strength, strong_cluster, flow_shape,
+             atm_vol_1m, atm_spike_ratio, atm_vol_3m,
+             itm_vol_1m, itm_spike_ratio, itm_vol_3m,
+             spread_pct, low_dist, room_score, room_pct,
+             pc_ratio, pc_conviction,
+             opt_vol_delta, avg_volume_20, spike_volume, consecutive_spikes)
         VALUES
             (%(symbol)s, %(signal_time)s, %(signal_type)s, %(bias)s,
              %(level_type)s, %(level_price)s, %(trigger_price)s,
-             %(avg_volume_20)s, %(spike_volume)s, %(consecutive_spikes)s,
-             %(option_type)s, %(opt_mark)s, %(opt_bid)s, %(opt_ask)s, %(opt_vol_delta)s,
-             %(price_to_enter)s, %(price_to_exit)s)
+             %(option_type)s, %(opt_mark)s, %(opt_bid)s, %(opt_ask)s,
+             %(price_to_enter)s, %(price_to_exit)s,
+             %(prox_score)s, %(cluster_strength)s, %(strong_cluster)s, %(flow_shape)s,
+             %(atm_vol_1m)s, %(atm_spike_ratio)s, %(atm_vol_3m)s,
+             %(itm_vol_1m)s, %(itm_spike_ratio)s, %(itm_vol_3m)s,
+             %(spread_pct)s, %(low_dist)s, %(room_score)s, %(room_pct)s,
+             %(pc_ratio)s, %(pc_conviction)s,
+             %(opt_vol_delta)s, %(avg_volume_20)s, %(spike_volume)s, %(consecutive_spikes)s)
         RETURNING id
     """
     conn = _get()
@@ -231,6 +241,48 @@ def save_signal(signal: dict) -> int:
             sig_id = cur.fetchone()[0]
         conn.commit()
         return sig_id
+    finally:
+        _put(conn)
+
+
+def save_morning_sentiment(
+    symbol: str,
+    snap_date: date,
+    pc_ratio: float,
+    bias: str,
+    computed_at: datetime,
+) -> None:
+    """Upsert daily P/C ratio and bias for one symbol."""
+    sql = """
+        INSERT INTO morning_sentiment (symbol, snap_date, pc_ratio, bias, computed_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (symbol, snap_date) DO UPDATE SET
+            pc_ratio    = EXCLUDED.pc_ratio,
+            bias        = EXCLUDED.bias,
+            computed_at = EXCLUDED.computed_at
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, snap_date, pc_ratio, bias, computed_at))
+        conn.commit()
+        logger.debug("Saved morning sentiment for %s: pc=%.3f %s", symbol, pc_ratio, bias)
+    finally:
+        _put(conn)
+
+
+def get_today_pc_ratio(symbol: str, snap_date: date) -> Optional[float]:
+    """Return today's P/C ratio for a symbol, or None if not yet computed."""
+    sql = """
+        SELECT pc_ratio FROM morning_sentiment
+        WHERE symbol = %s AND snap_date = %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, snap_date))
+            row = cur.fetchone()
+        return float(row[0]) if row else None
     finally:
         _put(conn)
 
@@ -331,6 +383,109 @@ def get_active_clusters(symbol: str) -> list:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (symbol,))
             return cur.fetchall()
+    finally:
+        _put(conn)
+
+
+def get_open_trades(symbol: str = None) -> list:
+    """
+    Return all trades that still have unfilled exits (for exit monitoring).
+    Filters by symbol when provided.
+    """
+    sql = """
+        SELECT id, signal_id, symbol, occ_symbol, signal_type,
+               qty, limit_price, paper,
+               exit1_underlying, exit2_underlying,
+               exit1_qty, exit2_qty,
+               exit1_filled, exit2_filled
+        FROM   trades
+        WHERE  status = 'placed'
+          AND  (exit1_filled = FALSE OR exit2_filled = FALSE)
+    """
+    params = []
+    if symbol:
+        sql += " AND symbol = %s"
+        params.append(symbol)
+    conn = _get()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    finally:
+        _put(conn)
+
+
+def mark_exit1_filled(trade_id: int, filled_at: datetime) -> None:
+    """Record that the first half of the position was sold."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET exit1_filled=TRUE, exit1_filled_at=%s WHERE id=%s",
+                (filled_at, trade_id),
+            )
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def mark_exit2_filled(trade_id: int, filled_at: datetime) -> None:
+    """Record that the second half of the position was sold; mark trade closed."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trades
+                   SET exit2_filled=TRUE, exit2_filled_at=%s, status='closed'
+                   WHERE id=%s""",
+                (filled_at, trade_id),
+            )
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def mark_trade_eod_closed(trade_id: int, closed_at: datetime) -> None:
+    """Mark a trade as EOD-liquidated."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET status='eod_closed' WHERE id=%s",
+                (trade_id,),
+            )
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_trade(trade: dict) -> int:
+    """Insert an Alpaca order record tied to the originating signal. Returns trade id."""
+    sql = """
+        INSERT INTO trades
+            (signal_id, symbol, occ_symbol, alpaca_order_id,
+             qty, limit_price, buying_power_used, paper, status,
+             signal_type, exit1_underlying, exit2_underlying,
+             exit1_qty, exit2_qty)
+        VALUES
+            (%(signal_id)s, %(symbol)s, %(occ_symbol)s, %(alpaca_order_id)s,
+             %(qty)s, %(limit_price)s, %(buying_power_used)s, %(paper)s, %(status)s,
+             %(signal_type)s, %(exit1_underlying)s, %(exit2_underlying)s,
+             %(exit1_qty)s, %(exit2_qty)s)
+        RETURNING id
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, trade)
+            trade_id = cur.fetchone()[0]
+        conn.commit()
+        logger.info(
+            "Trade saved: id=%d  %s  qty=%d  limit=%.4f  paper=%s",
+            trade_id, trade['occ_symbol'], trade['qty'],
+            trade['limit_price'], trade['paper'],
+        )
+        return trade_id
     finally:
         _put(conn)
 

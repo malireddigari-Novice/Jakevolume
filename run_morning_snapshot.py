@@ -21,15 +21,16 @@ import db.ops as db
 from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.sentiment import compute_sentiment
 from data.market_utils import now_cst, today_cst
-from data.databento_client import DatabentoClient
+from data.schwab_client import SchwabClient
 from output.sheets_logger import SheetsLogger
+from output.discord_notifier import send_morning_briefing as discord_briefing
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 db.init_pool()
 db.init_schema()
 
-dbc = DatabentoClient()
-dbc.login()
+schwab = SchwabClient()
+schwab.login()
 
 sheets = SheetsLogger()
 sheets.connect()
@@ -43,11 +44,11 @@ results = []
 for symbol in config.SYMBOLS:
     try:
         log.info("Processing %s ...", symbol)
-        prev_close = dbc.get_prev_close(symbol)
-        quote      = dbc.get_quote(symbol)
+        prev_close = schwab.get_prev_close(symbol)
+        quote      = schwab.get_quote(symbol)
         pm_price   = quote['price'] or prev_close
 
-        chain      = dbc.get_option_chain(symbol)
+        chain      = schwab.get_option_chain(symbol)
         expiry     = chain['expiry']
         levels     = compute_oi_levels(chain, prev_close)
         snap       = get_top_oi_snapshot(chain, prev_close)
@@ -60,6 +61,7 @@ for symbol in config.SYMBOLS:
             underlying_price=prev_close,
         )
         db.save_oi_levels(symbol, today, now, levels)
+        db.save_morning_sentiment(symbol, today, sentiment['pc_ratio'], sentiment['bias'], now)
 
         # ── Google Sheets ──
         sheets.log_daily_levels(symbol, levels, prev_close, now)
@@ -69,15 +71,20 @@ for symbol in config.SYMBOLS:
             underlying_price=prev_close, snap_time=now,
         )
         sheets.log_morning_sentiment(sentiment, now)
+        sheets.log_comparison_row(
+            symbol=symbol, expiry=expiry,
+            underlying_price=prev_close, levels=levels,
+            snap=snap, computed_at=now,
+        )
 
         supports    = [lv for lv in levels if lv['level_type'] == 'SUPPORT']
         resistances = [lv for lv in levels if lv['level_type'] == 'RESISTANCE']
 
         results.append({
-            'symbol':    symbol,
-            'prev_close': prev_close,
-            'pm_price':   pm_price,
-            'expiry':     expiry,
+            'symbol':      symbol,
+            'prev_close':  prev_close,
+            'pm_price':    pm_price,
+            'expiry':      expiry,
             'supports':    supports,
             'resistances': resistances,
             'sentiment':   sentiment,
@@ -95,7 +102,7 @@ print(title.center(W, "="))
 print("=" * W)
 
 hdr = (f"  {'SYM':<6}  {'Prev':>8}  {'PM':>8}  {'Chg%':>6}  {'Bias':<8}"
-       f"  {'P/C':>5}  {'S1':>7}  {'S2':>7}  {'R1':>7}  {'R2':>7}  Expiry")
+       f"  {'P/C':>5}  {'S1':>7}  {'S2':>7}  {'S3':>7}  {'R1':>7}  {'R2':>7}  {'R3':>7}  Expiry")
 print(hdr)
 print("  " + "-" * (W - 2))
 
@@ -107,8 +114,10 @@ for r in results:
 
     s1 = f"{sup[0]['strike']:.1f}" if len(sup) > 0 else "  -  "
     s2 = f"{sup[1]['strike']:.1f}" if len(sup) > 1 else "  -  "
+    s3 = f"{sup[2]['strike']:.1f}" if len(sup) > 2 else "  -  "
     r1 = f"{res[0]['strike']:.1f}" if len(res) > 0 else "  -  "
     r2 = f"{res[1]['strike']:.1f}" if len(res) > 1 else "  -  "
+    r3 = f"{res[2]['strike']:.1f}" if len(res) > 2 else "  -  "
 
     print(
         f"  {r['symbol']:<6}  "
@@ -117,7 +126,7 @@ for r in results:
         f"{sign}{s['pm_change_pct']:>5.2f}%  "
         f"{s['bias']:<8}  "
         f"{s['pc_ratio']:>5.3f}  "
-        f"{s1:>7}  {s2:>7}  {r1:>7}  {r2:>7}  "
+        f"{s1:>7}  {s2:>7}  {s3:>7}  {r1:>7}  {r2:>7}  {r3:>7}  "
         f"{r['expiry']}"
     )
 
@@ -125,3 +134,5 @@ print("=" * W)
 print(f"  Sheets written for all {len(results)}/{len(config.SYMBOLS)} symbols.")
 print("=" * W)
 print()
+
+discord_briefing(results, now)

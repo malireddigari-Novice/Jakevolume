@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS signals (
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- Add columns without dropping existing data
+-- Idempotent column additions (safe to re-run on every startup)
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS option_type    VARCHAR(4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_mark       NUMERIC(12,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_bid        NUMERIC(12,4);
@@ -88,8 +88,38 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS opt_vol_delta  BIGINT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS price_to_enter NUMERIC(12,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS price_to_exit  NUMERIC(12,4);
 
+-- Steps 2-9 cluster detection fields
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS prox_score      NUMERIC(6,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_strength NUMERIC(6,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS strong_cluster  BOOLEAN;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS flow_shape      VARCHAR(15);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_vol_1m      BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_spike_ratio NUMERIC(8,2);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_vol_3m      BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS itm_vol_1m      BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS itm_spike_ratio NUMERIC(8,2);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS itm_vol_3m      BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS spread_pct      NUMERIC(8,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS low_dist        NUMERIC(8,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS room_score      NUMERIC(6,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS room_pct        NUMERIC(8,6);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_ratio        NUMERIC(8,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_conviction   VARCHAR(15);
+
 CREATE INDEX IF NOT EXISTS idx_sig_symbol_time
     ON signals (symbol, signal_time DESC);
+
+-- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
+CREATE TABLE IF NOT EXISTS morning_sentiment (
+    id          BIGSERIAL    PRIMARY KEY,
+    symbol      VARCHAR(10)  NOT NULL,
+    snap_date   DATE         NOT NULL,
+    pc_ratio    NUMERIC(8,4) NOT NULL,
+    bias        VARCHAR(20)  NOT NULL,
+    computed_at TIMESTAMPTZ  NOT NULL,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, snap_date)
+);
 
 -- ── Volume cluster positioning monitor ───────────────────────────────────────
 -- Tracks unusual option volume accumulation patterns without firing signals.
@@ -119,3 +149,33 @@ CREATE TABLE IF NOT EXISTS volume_clusters (
 
 CREATE INDEX IF NOT EXISTS idx_vc_symbol_status
     ON volume_clusters (symbol, status, updated_at DESC);
+
+-- ── Alpaca trade executions ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS trades (
+    id                 BIGSERIAL     PRIMARY KEY,
+    signal_id          BIGINT        REFERENCES signals(id),
+    symbol             VARCHAR(10)   NOT NULL,
+    occ_symbol         VARCHAR(30)   NOT NULL,
+    alpaca_order_id    VARCHAR(50),
+    side               VARCHAR(10)   NOT NULL DEFAULT 'buy',
+    qty                INT           NOT NULL,
+    limit_price        NUMERIC(12,4) NOT NULL,
+    buying_power_used  NUMERIC(14,2),
+    paper              BOOLEAN       NOT NULL DEFAULT TRUE,
+    status             VARCHAR(20)   NOT NULL DEFAULT 'placed',
+    created_at         TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_signal
+    ON trades (signal_id);
+
+-- Exit tracking columns (idempotent)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS signal_type       VARCHAR(10);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_underlying  NUMERIC(12,4);  -- R1 (BULLISH) or S1 (BEARISH)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_underlying  NUMERIC(12,4);  -- R2 (BULLISH) or S2 (BEARISH)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_qty         INT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_qty         INT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_filled      BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_filled      BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_filled_at   TIMESTAMPTZ;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_filled_at   TIMESTAMPTZ;
