@@ -312,7 +312,7 @@ def _notify_signal(sig: dict) -> None:
     try:
         discord_signal(sig)
     except Exception:
-        pass
+        logger.warning("Discord signal send failed", exc_info=True)
 
     try:
         from plyer import notification
@@ -427,7 +427,7 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
         try:
             discord_trade(order, sig, qty, spend)
         except Exception:
-            pass
+            logger.warning("Discord trade alert failed", exc_info=True)
 
 
 def check_exits(
@@ -467,7 +467,7 @@ def check_exits(
                     try:
                         discord_exit(order, dict(trade), label, underlying_price)
                     except Exception:
-                        pass
+                        logger.warning("Discord exit alert failed", exc_info=True)
 
         # ── Exit 2 — only after exit1 is confirmed ──────────────────────────
         elif trade['exit1_filled'] and not trade['exit2_filled'] and trade.get('exit2_underlying'):
@@ -488,7 +488,7 @@ def check_exits(
                     try:
                         discord_exit(order, dict(trade), label, underlying_price)
                     except Exception:
-                        pass
+                        logger.warning("Discord exit alert failed", exc_info=True)
 
 
 def eod_liquidate(alpaca: AlpacaClient, now: datetime) -> None:
