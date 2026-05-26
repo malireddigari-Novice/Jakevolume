@@ -466,10 +466,12 @@ def _parse_chain(data: dict, include_oi: bool = False) -> dict:
                 c      = contracts[0]
                 strike = float(strike_str)
                 entry  = {
-                    'bid':    c.get('bid'),
-                    'ask':    c.get('ask'),
-                    'mark':   c.get('mark'),
-                    'volume': int(c.get('totalVolume', 0) or 0),
+                    'bid':      c.get('bid'),
+                    'ask':      c.get('ask'),
+                    'mark':     c.get('mark'),
+                    'volume':   int(c.get('totalVolume', 0) or 0),
+                    'day_high': c.get('highPrice') or c.get('high'),
+                    'day_low':  c.get('lowPrice')  or c.get('low'),
                 }
                 if include_oi:
                     entry['open_interest'] = int(c.get('openInterest', 0) or 0)

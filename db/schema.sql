@@ -105,6 +105,7 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS room_score      NUMERIC(6,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS room_pct        NUMERIC(8,6);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_ratio        NUMERIC(8,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_conviction   VARCHAR(15);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS option_hl_flag  VARCHAR(15);
 
 CREATE INDEX IF NOT EXISTS idx_sig_symbol_time
     ON signals (symbol, signal_time DESC);

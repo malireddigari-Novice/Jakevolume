@@ -61,7 +61,7 @@ _HDR_SIGNALS = [
     'Cluster_Strength', 'Flow_Shape', 'Prox_Score',
     'ATM_1m', 'ATM_3m', 'ITM_1m', 'ITM_3m',
     'Spread_Pct', 'Strong', 'Room_Score',
-    'PC_Ratio', 'PC_Conviction',
+    'PC_Ratio', 'PC_Conviction', 'Option_HL',
 ]
 
 _HDR_MORNING_SENTIMENT = [
@@ -208,6 +208,7 @@ class SheetsLogger:
             round(signal['room_score'], 2) if signal.get('room_score') is not None else '',
             round(signal['pc_ratio'], 3) if signal.get('pc_ratio') is not None else '',
             signal.get('pc_conviction', ''),
+            signal.get('option_hl_flag', ''),
         ]
         self._enqueue('signals', row)
         logger.info(

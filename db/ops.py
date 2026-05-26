@@ -219,7 +219,7 @@ def save_signal(signal: dict) -> int:
              atm_vol_1m, atm_spike_ratio, atm_vol_3m,
              itm_vol_1m, itm_spike_ratio, itm_vol_3m,
              spread_pct, low_dist, room_score, room_pct,
-             pc_ratio, pc_conviction,
+             pc_ratio, pc_conviction, option_hl_flag,
              opt_vol_delta, avg_volume_20, spike_volume, consecutive_spikes)
         VALUES
             (%(symbol)s, %(signal_time)s, %(signal_type)s, %(bias)s,
@@ -230,7 +230,7 @@ def save_signal(signal: dict) -> int:
              %(atm_vol_1m)s, %(atm_spike_ratio)s, %(atm_vol_3m)s,
              %(itm_vol_1m)s, %(itm_spike_ratio)s, %(itm_vol_3m)s,
              %(spread_pct)s, %(low_dist)s, %(room_score)s, %(room_pct)s,
-             %(pc_ratio)s, %(pc_conviction)s,
+             %(pc_ratio)s, %(pc_conviction)s, %(option_hl_flag)s,
              %(opt_vol_delta)s, %(avg_volume_20)s, %(spike_volume)s, %(consecutive_spikes)s)
         RETURNING id
     """

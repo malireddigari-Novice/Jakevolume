@@ -465,6 +465,25 @@ class SignalDetector:
         price_to_enter = round(opt_ask, 2) if opt_ask else None
         price_to_exit  = round(opt_ask * 2, 2) if opt_ask else None
 
+        # ── Option H/L flag ───────────────────────────────────────────────────
+        # Compare current mark to today's intraday high/low for the ATM contract.
+        # AT_HIGH / NEAR_HIGH / AT_LOW / NEAR_LOW  (None when mid-range or no data)
+        option_hl_flag: Optional[str] = None
+        day_high = atm_data.get('day_high')
+        day_low  = atm_data.get('day_low')
+        mark     = opt_mark or 0
+        if mark > 0:
+            if day_high and day_high > 0:
+                if mark >= day_high * 0.97:
+                    option_hl_flag = 'AT_HIGH'
+                elif mark >= day_high * 0.90:
+                    option_hl_flag = 'NEAR_HIGH'
+            if option_hl_flag is None and day_low and day_low > 0:
+                if mark <= day_low * 1.03:
+                    option_hl_flag = 'AT_LOW'
+                elif mark <= day_low * 1.10:
+                    option_hl_flag = 'NEAR_LOW'
+
         signal = {
             'symbol':           symbol,
             'signal_time':      now,
@@ -497,6 +516,7 @@ class SignalDetector:
             'room_pct':         round(room_pct, 6)   if room_pct != float('inf') else None,
             'pc_ratio':         pc_ratio,
             'pc_conviction':    pc_conviction,
+            'option_hl_flag':   option_hl_flag,
             # Legacy columns kept nullable
             'opt_vol_delta':      atm_delta,
             'avg_volume_20':      None,

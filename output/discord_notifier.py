@@ -94,19 +94,21 @@ def send_signal(sig: dict) -> None:
     atm_3m = sig.get('atm_vol_3m', 0)
     itm_3m = sig.get('itm_vol_3m', 0)
 
+    hl_flag = sig.get('option_hl_flag')
+    hl_emoji = {'AT_HIGH': '🔴', 'NEAR_HIGH': '🟠', 'AT_LOW': '🟢', 'NEAR_LOW': '🔵'}.get(hl_flag, '')
+
     fields = [
-        {"name": "Spot Price",    "value": spot,                                     "inline": True},
-        {"name": "Enter (Ask)",   "value": enter,                                    "inline": True},
-        {"name": "Exit Target",   "value": exit_,                                    "inline": True},
-        {"name": "Flow Shape",    "value": sig.get('flow_shape', 'n/a'),             "inline": True},
-        {"name": "Prox Score",    "value": str(sig.get('prox_score', '')),           "inline": True},
-        {"name": "Strong",        "value": 'YES' if sig.get('strong_cluster') else 'NO', "inline": True},
-        {"name": "ATM Vol",       "value": f"1m={atm_1m}  3m={atm_3m}",             "inline": True},
-        {"name": "ITM Vol",       "value": f"1m={itm_1m}  3m={itm_3m}",             "inline": True},
-        {"name": "Spread",        "value": spread_str,                               "inline": True},
-        {"name": "Target Room",   "value": f"{room_str}  [score {room_score}]",      "inline": True},
-        {"name": "PC Conviction", "value": pc_str,                                   "inline": True},
+        {"name": "Spot Price",    "value": spot,                                "inline": True},
+        {"name": "Enter (Ask)",   "value": enter,                               "inline": True},
+        {"name": "Exit Target",   "value": exit_,                               "inline": True},
+        {"name": "ATM Vol",       "value": f"1m={atm_1m}  3m={atm_3m}",        "inline": True},
+        {"name": "ITM Vol",       "value": f"1m={itm_1m}  3m={itm_3m}",        "inline": True},
+        {"name": "Spread",        "value": spread_str,                          "inline": True},
+        {"name": "Target Room",   "value": f"{room_str}  [score {room_score}]", "inline": True},
+        {"name": "PC Conviction", "value": pc_str,                              "inline": True},
     ]
+    if hl_flag:
+        fields.append({"name": "Option H/L", "value": f"{hl_emoji} {hl_flag}", "inline": True})
 
     sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
