@@ -234,11 +234,14 @@ def intraday_check(
 
     for symbol in config.SYMBOLS:
         try:
-            # 1-min equity bars — Schwab primary, Databento Live fallback
+            # 1-min equity bars — Schwab primary, Databento fallback
             if schwab:
                 bars = schwab.get_bars(symbol)
-            else:
+            elif dbc:
                 bars = dbc.get_bars(symbol)
+            else:
+                logger.warning("%s: no data source available for bars", symbol)
+                continue
 
             if not bars:
                 logger.warning("%s: no bars returned", symbol)
@@ -260,7 +263,10 @@ def intraday_check(
             option_quotes: dict = {}
             expiry = None
             try:
-                expiry = schwab.get_nearest_expiry(symbol) if schwab else dbc.get_nearest_expiry(symbol)
+                if schwab:
+                    expiry = schwab.get_nearest_expiry(symbol)
+                elif dbc:
+                    expiry = dbc.get_nearest_expiry(symbol)
                 if schwab and expiry:
                     option_quotes = schwab.get_watched_contracts(
                         symbol, expiry, underlying_price, n=2
@@ -269,7 +275,7 @@ def intraday_check(
                         "%s: watched contracts near %.2f — %d quotes (expiry %s)",
                         symbol, underlying_price, len(option_quotes), expiry,
                     )
-                elif expiry:
+                elif dbc and expiry:
                     option_quotes = dbc.get_option_quotes_for_levels(
                         symbol, expiry, levels
                     )
@@ -294,12 +300,13 @@ def intraday_check(
                 check_exits(symbol, underlying_price, alpaca, now_cst())
 
             # Volume cluster positioning monitor (Postgres only, no signals)
-            try:
-                expiry_pair = dbc.get_expiry_pair(symbol)
-                atm_quotes  = dbc.get_atm_option_quotes_all_expiries(symbol, underlying_price)
-                monitor.update(symbol, atm_quotes, expiry_pair, levels, underlying_price)
-            except Exception:
-                logger.warning("%s: positioning monitor update failed", symbol, exc_info=True)
+            if dbc:
+                try:
+                    expiry_pair = dbc.get_expiry_pair(symbol)
+                    atm_quotes  = dbc.get_atm_option_quotes_all_expiries(symbol, underlying_price)
+                    monitor.update(symbol, atm_quotes, expiry_pair, levels, underlying_price)
+                except Exception:
+                    logger.warning("%s: positioning monitor update failed", symbol, exc_info=True)
 
         except Exception:
             logger.exception("Intraday check failed for %s", symbol)
@@ -540,17 +547,27 @@ def main() -> None:
     db.init_pool()
     db.init_schema()
 
-    dbc = DatabentoClient()
-    dbc.login(interactive=True)
+    # Databento is optional — Schwab handles all bars and option quotes.
+    # Missing API key or login failure is non-fatal; positioning monitor is skipped.
+    dbc: Optional[DatabentoClient] = None
+    try:
+        dbc = DatabentoClient()
+        dbc.login(interactive=True)
+    except Exception:
+        logger.warning(
+            "Databento unavailable (no API key or login failed) — "
+            "positioning monitor disabled; Schwab handles all intraday data.",
+            exc_info=True,
+        )
 
     if args.login:
         logger.info("--login flag: session cached. Exiting.")
         return
 
     # Databento Live is used only for the positioning monitor.
-    # A missing live license is non-fatal — Schwab handles all intraday signals.
     try:
-        dbc.start_live_feed()
+        if dbc:
+            dbc.start_live_feed()
     except Exception:
         logger.warning(
             "Databento Live feed unavailable (no live license?) — "
