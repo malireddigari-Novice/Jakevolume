@@ -57,6 +57,40 @@ CREATE TABLE IF NOT EXISTS price_bars (
 CREATE INDEX IF NOT EXISTS idx_pb_symbol_time
     ON price_bars (symbol, bar_time DESC);
 
+-- Per-stock extras (idempotent): underlying spot at bar close + cumulative
+-- session volume. price_bars.volume is the per-minute candle volume.
+-- 7 stored fields per bar: open, high (max), low (min), close, volume (per-min),
+-- spot_price, cum_volume (running session total).
+ALTER TABLE price_bars ADD COLUMN IF NOT EXISTS spot_price NUMERIC(12,4);
+ALTER TABLE price_bars ADD COLUMN IF NOT EXISTS cum_volume BIGINT;
+
+-- ── 1-minute OHLCV for each S/R level's option contract ────────────────────
+-- One row per minute per level (6 levels/symbol: S1-S3, R1-R3). Sourced from
+-- Schwab price-history on the OCC option symbol; ON CONFLICT keeps the latest
+-- candle values so the forming minute settles to its final volume.
+CREATE TABLE IF NOT EXISTS option_level_bars (
+    id          BIGSERIAL     PRIMARY KEY,
+    symbol      VARCHAR(10)   NOT NULL,
+    level_date  DATE          NOT NULL,
+    level_type  VARCHAR(10)   NOT NULL CHECK (level_type IN ('SUPPORT','RESISTANCE')),
+    rank        SMALLINT      NOT NULL CHECK (rank BETWEEN 1 AND 10),
+    strike      NUMERIC(12,4) NOT NULL,
+    option_type VARCHAR(4)    NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    expiry      DATE          NOT NULL,
+    occ_symbol  VARCHAR(30)   NOT NULL,
+    bar_time    TIMESTAMPTZ   NOT NULL,
+    open        NUMERIC(12,4) NOT NULL,
+    high        NUMERIC(12,4) NOT NULL,
+    low         NUMERIC(12,4) NOT NULL,
+    close       NUMERIC(12,4) NOT NULL,
+    volume      BIGINT        NOT NULL,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (occ_symbol, bar_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_olb_symbol_date_time
+    ON option_level_bars (symbol, level_date, bar_time DESC);
+
 -- ── Fired signals ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS signals (
     id                 BIGSERIAL    PRIMARY KEY,
@@ -93,6 +127,17 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS prox_score      NUMERIC(6,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_strength NUMERIC(6,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS strong_cluster  BOOLEAN;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS flow_shape      VARCHAR(15);
+-- Spec single-print/cluster classification + confidence tier
+ALTER TABLE signals ALTER COLUMN flow_shape TYPE VARCHAR(25);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS signal_shape    VARCHAR(25);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS confidence      VARCHAR(15);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_active_bars SMALLINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_burst_bars  SMALLINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS upgrade             BOOLEAN NOT NULL DEFAULT FALSE;
+-- Next-day-expiry (Tue/Thu) mode: interchangeable levels + OTM target strike
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS day_mode      VARCHAR(10);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS traded_strike NUMERIC(12,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS target_level  NUMERIC(12,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_vol_1m      BIGINT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_spike_ratio NUMERIC(8,2);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS atm_vol_3m      BIGINT;
@@ -180,3 +225,8 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_filled      BOOLEAN NOT NULL D
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_filled      BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit1_filled_at   TIMESTAMPTZ;
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit2_filled_at   TIMESTAMPTZ;
+-- Stoploss tracking
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS stoploss_price    NUMERIC(12,4);  -- option mark level; moves to entry after exit1
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS strike            NUMERIC(12,4);  -- option strike (for mark lookup)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS option_type       VARCHAR(4);     -- CALL or PUT
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS expiry            DATE;           -- option expiry; NULL = 0DTE (close at EOD)

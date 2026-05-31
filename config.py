@@ -10,7 +10,6 @@ load_dotenv()
 # ── Universe ─────────────────────────────────────────────────────────────────
 SYMBOLS: list[str] = [
     'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA',
-    'MU', 'AMD',
 ]
 
 MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
@@ -19,8 +18,8 @@ MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
 SESSION_TZ = 'America/Chicago'
 
 # ── Market schedule (all times in CST/CDT) ───────────────────────────────────
-SNAPSHOT_HOUR   = 8    # 08:10 CST — pre-market OI snapshot
-SNAPSHOT_MINUTE = 10
+SNAPSHOT_HOUR   = 8    # 08:20 CST — pre-market OI snapshot
+SNAPSHOT_MINUTE = 20
 MARKET_OPEN_HOUR    = 8    # 08:30 CST = 09:30 ET
 MARKET_OPEN_MINUTE  = 30
 MARKET_CLOSE_HOUR   = 15   # 15:00 CST = 16:00 ET
@@ -40,32 +39,72 @@ PROX_BAND_TIGHT = float(os.getenv('PROX_BAND_TIGHT', '0.0025'))  # ≤0.25% → 
 PROX_BAND_MID   = float(os.getenv('PROX_BAND_MID',   '0.0035'))  # ≤0.35% → score 0.70
 PROX_BAND_WIDE  = float(os.getenv('PROX_BAND_WIDE',  '0.0050'))  # ≤0.50% → score 0.50
 
-# Step 3: 1-min option volume spike parameters
-OPT_SPIKE_LOOKBACK      = int(os.getenv('OPT_SPIKE_LOOKBACK',   '10'))   # N bars for baseline
-OPT_MIN_BASELINE_VOL    = int(os.getenv('OPT_MIN_BASELINE_VOL', '10'))   # skip if avg < this
-OPT_MIN_SPIKE_RATIO     = float(os.getenv('OPT_MIN_SPIKE_RATIO', '3.0')) # spike = 3× baseline
-OPT_EXTREME_SPIKE_RATIO = float(os.getenv('OPT_EXTREME_SPIKE_RATIO', '6.0'))  # Step 7 override
+# Step 3: rolling baseline window for spike ratio computation
+OPT_SPIKE_LOOKBACK = int(os.getenv('OPT_SPIKE_LOOKBACK', '10'))   # N prior bars for AvgVol
 
-# Per-symbol minimum 1-min spike volume (contracts/bar); TSLA/NVDA are higher-volume
-OPT_MIN_SPIKE_VOL: dict[str, int] = {
-    'AAPL': 100, 'MSFT': 100, 'AMZN': 100, 'GOOGL': 100, 'META': 100,
-    'TSLA': 250, 'NVDA': 250, 'MU': 100, 'AMD': 100,
-}
-OPT_MIN_SPIKE_VOL_DEFAULT = int(os.getenv('OPT_MIN_SPIKE_VOL_DEFAULT', '100'))
+# Volume gate thresholds (legacy — retained for check_opposite_side / tuning)
+OPT_SINGLE_SPIKE_RATIO  = float(os.getenv('OPT_SINGLE_SPIKE_RATIO', '5.0'))  # AbnormalBurst: 1-bar ratio ≥ 5×
+OPT_CONSEC_SPIKE_RATIO  = float(os.getenv('OPT_CONSEC_SPIKE_RATIO', '3.0'))  # MultiBarCluster: window ratio ≥ 3×
+OPT_EXTREME_SPIKE_RATIO = float(os.getenv('OPT_EXTREME_SPIKE_RATIO', '8.0'))  # ExtremeSingleStrike: ratio ≥ 8×
 
-# Step 4: Per-symbol minimum 3-min cluster volume (contracts/3-bar window)
-OPT_MIN_CLUSTER_VOL: dict[str, int] = {
-    'AAPL': 150, 'MSFT': 150, 'AMZN': 150, 'GOOGL': 150, 'META': 150,
-    'TSLA': 300, 'NVDA': 300, 'MU': 150, 'AMD': 150,
-}
-OPT_MIN_CLUSTER_VOL_DEFAULT = int(os.getenv('OPT_MIN_CLUSTER_VOL_DEFAULT', '150'))
+# Per-symbol-group absolute volume floors (AbnormalBurst and MultiBarCluster)
+OPT_MIN_SPIKE_VOL   = {'TSLA': 250, 'NVDA': 250, 'default': 100}  # CurrentVol floor for AbnormalBurst
+OPT_MIN_CLUSTER_VOL = {'TSLA': 600, 'NVDA': 600, 'default': 300}  # WindowVol floor for MultiBarCluster
 
-# Step 6: ClusterStrength thresholds (0.45×ATM + 0.35×ITM + 0.20×Timing)
-CLUSTER_VALID_THRESHOLD  = float(os.getenv('CLUSTER_VALID_THRESHOLD',  '0.65'))
-CLUSTER_STRONG_THRESHOLD = float(os.getenv('CLUSTER_STRONG_THRESHOLD', '0.80'))
+# ── Single print vs cluster — spec logic ──────────────────────────────────────
+# Baseline lookback: AvgPrior10MinVolume = average of up to N bars before the bar.
+OPT_PRIOR_LOOKBACK = int(os.getenv('OPT_PRIOR_LOOKBACK', '10'))
 
-# Step 8: Contract low filter — block if mark has run > 2.5× intraday low
+# Valid single print: 1-min volume ≥ floor AND ratio ≥ 8× AND contract near lows.
+OPT_SINGLE_PRINT_RATIO   = float(os.getenv('OPT_SINGLE_PRINT_RATIO', '8.0'))
+OPT_MIN_SINGLE_PRINT_VOL = {'TSLA': 750, 'NVDA': 750, 'default': 300}
+
+# Valid volume cluster: rolling 5-bar window.
+#   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0
+#   ActiveBars5  = bars in window with per-bar ratio ≥ 2.0      ≥ 3
+#   BurstBars5   = bars in window with per-bar ratio ≥ 4.0      (informational)
+OPT_CLUSTER_WINDOW       = int(os.getenv('OPT_CLUSTER_WINDOW', '5'))
+OPT_CLUSTER_WINDOW_RATIO = float(os.getenv('OPT_CLUSTER_WINDOW_RATIO', '3.0'))
+OPT_CLUSTER_ACTIVE_RATIO = float(os.getenv('OPT_CLUSTER_ACTIVE_RATIO', '2.0'))
+OPT_CLUSTER_ACTIVE_MIN   = int(os.getenv('OPT_CLUSTER_ACTIVE_MIN', '3'))
+OPT_CLUSTER_BURST_RATIO  = float(os.getenv('OPT_CLUSTER_BURST_RATIO', '4.0'))
+
+# Extreme single prints rank as MEDIUM_HIGH only at S2/S3 or R2/R3 (ranks 2,3).
+SINGLE_PRINT_RANKS = {2, 3}
+
+# Emit non-qualifying (but notable) prints as WATCH_ONLY instead of discarding.
+EMIT_WATCH_ONLY = os.getenv('EMIT_WATCH_ONLY', 'true').lower() == 'true'
+
+# Allow a later, strictly higher-confidence signal (e.g. ATM_ITM_CLUSTER) to
+# supersede an earlier single-print alert in the same direction. The upgrade
+# fires as a fresh alert but is not auto-traded (the original already entered).
+CLUSTER_UPGRADE_ENABLED = os.getenv('CLUSTER_UPGRADE_ENABLED', 'true').lower() == 'true'
+
+# ── Next-day-expiry mode (Tue/Thu — no 0DTE) ──────────────────────────────────
+# When today has no same-day expiry, the nearest expiry is next-day. In that
+# mode S/R levels are interchangeable (a level's role is set by spot position
+# each bar) and the traded strike is the ATM strike at the *target* level
+# (OTM relative to spot). 0DTE days (Mon/Wed/Fri) are unaffected. EOD close
+# behaviour is unchanged.
+NEXT_DAY_MODE_ENABLED = os.getenv('NEXT_DAY_MODE_ENABLED', 'true').lower() == 'true'
+# How many levels toward the target to step for the OTM strike (1 = nearest).
+NEXT_DAY_TARGET_DEPTH = int(os.getenv('NEXT_DAY_TARGET_DEPTH', '1'))
+# Deadband around a level before its role flips, to avoid whipsaw right at the
+# strike. Spot must be more than this fraction beyond the strike to flip role.
+LEVEL_FLIP_DEADBAND_PCT = float(os.getenv('LEVEL_FLIP_DEADBAND_PCT', '0.0015'))
+# Close next-day-expiry positions at EOD too (choice: keep EOD close, no overnight).
+EOD_CLOSE_NEXT_DAY = os.getenv('EOD_CLOSE_NEXT_DAY', 'true').lower() == 'true'
+
+# Step 8: Contract low distance thresholds
+# NearLow  (≤ 1.75×) required for all non-extreme signals
+# TooChased (> 2.50×) hard block regardless
+NEAR_LOW_MAX_DIST     = float(os.getenv('NEAR_LOW_MAX_DIST',     '1.75'))
 CONTRACT_LOW_MAX_DIST = float(os.getenv('CONTRACT_LOW_MAX_DIST', '2.50'))
+
+# ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
+CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
+CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2
+CS_THRESHOLD_RANK3 = float(os.getenv('CS_THRESHOLD_RANK3', '0.65'))  # S3/R3
 
 # Step 9: Spread filter — block if (ask-bid)/mid > 50%
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.50'))
@@ -83,6 +122,13 @@ PC_BEAR_CUTOFF = float(os.getenv('PC_BEAR_CUTOFF', '1.15'))   # above → BEARIS
 VOLUME_SPIKE_MULTIPLIER      = float(os.getenv('VOLUME_SPIKE_MULTIPLIER', '2.0'))
 VOLUME_LOOKBACK_BARS         = int(os.getenv('VOLUME_LOOKBACK_BARS', '20'))
 BARS_TO_FETCH                = int(os.getenv('BARS_TO_FETCH', '40'))
+# Full-session cap for per-minute persistence (a RTH day has <=390 1-min bars).
+SESSION_BARS                 = int(os.getenv('SESSION_BARS', '400'))
+# Collect 1-min OHLCV for the 6 S/R level option contracts each poll (Schwab).
+COLLECT_LEVEL_BARS           = os.getenv('COLLECT_LEVEL_BARS', 'true').lower() == 'true'
+# Retention: keep only this many recent trading days of 1-min bar data
+# (price_bars + option_level_bars). Alerts/signals are never pruned.
+BAR_RETENTION_DAYS           = int(os.getenv('BAR_RETENTION_DAYS', '10'))
 LEVEL_PROXIMITY_PCT          = float(os.getenv('LEVEL_PROXIMITY_PCT', '0.002'))
 
 # ── Data / polling ────────────────────────────────────────────────────────────
@@ -118,7 +164,7 @@ CLUSTER_FADE     = int(os.getenv('CLUSTER_FADE', '3'))
 
 # ── Discord ───────────────────────────────────────────────────────────────────
 # Set DISCORD_WEBHOOK_URL for signal alerts.
-# Set DISCORD_MORNING_WEBHOOK_URL for the 8:10 AM briefing (falls back to DISCORD_WEBHOOK_URL).
+# Set DISCORD_MORNING_WEBHOOK_URL for the 8:20 AM briefing (falls back to DISCORD_WEBHOOK_URL).
 DISCORD_WEBHOOK_URL         = os.getenv('DISCORD_WEBHOOK_URL', '')
 DISCORD_MORNING_WEBHOOK_URL = os.getenv('DISCORD_MORNING_WEBHOOK_URL', '')
 
@@ -136,6 +182,7 @@ ALPACA_PAPER        = os.getenv('ALPACA_PAPER',   'true').lower()  == 'true'
 ALPACA_ENABLED      = os.getenv('ALPACA_ENABLED', 'false').lower() == 'true'
 TRADE_PCT           = float(os.getenv('TRADE_PCT', '0.01'))   # 1 % of portfolio value per trade
 MAX_OPEN_POSITIONS  = int(os.getenv('MAX_OPEN_POSITIONS', '3'))
+FLIP_ENABLED        = os.getenv('FLIP_ENABLED', 'false').lower() == 'true'
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json')
@@ -148,4 +195,5 @@ SHEET_NAMES = {
     'oi_snapshot':       'OI_Snapshot',
     'morning_sentiment': 'Morning_Sentiment',
     'levels_comparison': 'Levels_Comparison',
+    'paper_trades':      'Paper_Trades',
 }

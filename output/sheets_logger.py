@@ -90,12 +90,21 @@ _HDR_LEVELS_COMPARISON = [
     'OI_C1_Strike', 'OI_C1_OI', 'OI_C2_Strike', 'OI_C2_OI',
 ]
 
+_HDR_PAPER_TRADES = [
+    'Date', 'Time_CST', 'Event', 'Mode',
+    'Symbol', 'OCC_Symbol', 'Signal_Type', 'Qty',
+    'Entry_Price', 'Underlying_At_Entry', 'Exit1_Target', 'Exit2_Target',
+    'Underlying_At_Exit', 'Exit_Label',
+    'Capital_Used', 'Order_ID',
+]
+
 _HEADERS = {
     config.SHEET_NAMES['daily_levels']:       _HDR_DAILY_LEVELS,
     config.SHEET_NAMES['signals']:            _HDR_SIGNALS,
     config.SHEET_NAMES['oi_snapshot']:        _HDR_OI_SNAPSHOT,
     config.SHEET_NAMES['morning_sentiment']:  _HDR_MORNING_SENTIMENT,
     config.SHEET_NAMES['levels_comparison']:  _HDR_LEVELS_COMPARISON,
+    config.SHEET_NAMES['paper_trades']:       _HDR_PAPER_TRADES,
 }
 
 
@@ -259,6 +268,75 @@ class SheetsLogger:
 
         self._enqueue('oi_snapshot', row)
         logger.info("Sheets: queued OI snapshot for %s (expiry %s)", symbol, expiry)
+
+    def log_trade_entry(
+        self,
+        order: dict,
+        sig: dict,
+        qty: int,
+        spend: float,
+    ) -> None:
+        """Enqueue a trade entry row to Paper_Trades; returns immediately."""
+        now  = datetime.now(CST)
+        mode = 'PAPER' if config.ALPACA_PAPER else 'LIVE'
+        row = [
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M:%S'),
+            'ENTRY',
+            mode,
+            sig.get('symbol', ''),
+            order.get('symbol', ''),
+            sig.get('signal_type', ''),
+            qty,
+            sig.get('price_to_enter', ''),
+            sig.get('trigger_price', ''),
+            sig.get('exit1_price', ''),
+            sig.get('exit2_price', ''),
+            '',                              # Underlying_At_Exit — not applicable
+            '',                              # Exit_Label — not applicable
+            round(spend, 2),
+            str(order.get('id', ''))[:8],
+        ]
+        self._enqueue('paper_trades', row)
+        logger.info(
+            "Sheets: queued trade entry  %s  %s  qty=%d  spend=$%.2f",
+            sig.get('symbol', ''), mode, qty, spend,
+        )
+
+    def log_trade_exit(
+        self,
+        order: dict,
+        trade: dict,
+        exit_label: str,
+        underlying_price: float,
+    ) -> None:
+        """Enqueue a trade exit row to Paper_Trades; returns immediately."""
+        now  = datetime.now(CST)
+        mode = 'PAPER' if config.ALPACA_PAPER else 'LIVE'
+        qty  = order.get('qty', trade.get('exit1_qty') or trade.get('exit2_qty') or '')
+        row = [
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M:%S'),
+            'EXIT',
+            mode,
+            trade.get('symbol', ''),
+            trade.get('occ_symbol', order.get('symbol', '')),
+            trade.get('signal_type', ''),
+            qty,
+            '',                                                        # Entry_Price
+            '',                                                        # Underlying_At_Entry
+            '',                                                        # Exit1_Target
+            '',                                                        # Exit2_Target
+            round(underlying_price, 2) if underlying_price else '',    # Underlying_At_Exit
+            exit_label,
+            '',                                                        # Capital_Used
+            str(order.get('id', ''))[:8],
+        ]
+        self._enqueue('paper_trades', row)
+        logger.info(
+            "Sheets: queued trade exit  %s  %s  %s  spot=%.2f",
+            trade.get('symbol', ''), mode, exit_label, underlying_price or 0,
+        )
 
     def log_comparison_row(
         self,

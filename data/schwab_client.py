@@ -72,22 +72,23 @@ class SchwabClient:
             )
             logger.info("Schwab: token loaded from %s", config.SCHWAB_TOKEN_FILE)
 
-        except FileNotFoundError:
-            logger.info(
-                "Schwab: no token file found at %s — starting manual OAuth flow.",
-                config.SCHWAB_TOKEN_FILE,
-            )
-            self._client = schwab.auth.client_from_manual_flow(
-                api_key=config.SCHWAB_API_KEY,
-                app_secret=config.SCHWAB_APP_SECRET,
-                callback_url=config.SCHWAB_CALLBACK_URL,
-                token_path=config.SCHWAB_TOKEN_FILE,
-            )
-            logger.info("Schwab: token saved to %s", config.SCHWAB_TOKEN_FILE)
-
         except Exception as exc:
-            logger.error("Schwab: login failed: %s", exc, exc_info=True)
-            raise
+            # Covers FileNotFoundError (first run) AND expired/revoked refresh token
+            logger.info(
+                "Schwab: token load failed (%s) — starting manual OAuth flow.",
+                exc,
+            )
+            try:
+                self._client = schwab.auth.client_from_manual_flow(
+                    api_key=config.SCHWAB_API_KEY,
+                    app_secret=config.SCHWAB_APP_SECRET,
+                    callback_url=config.SCHWAB_CALLBACK_URL,
+                    token_path=config.SCHWAB_TOKEN_FILE,
+                )
+                logger.info("Schwab: token saved to %s", config.SCHWAB_TOKEN_FILE)
+            except Exception as flow_exc:
+                logger.error("Schwab: OAuth flow failed: %s", flow_exc, exc_info=True)
+                raise
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -287,6 +288,49 @@ class SchwabClient:
             return bars[-count:]
         except Exception as exc:
             logger.warning("Schwab: get_bars failed for %s: %s", symbol, exc)
+            return []
+
+    def get_option_bars(self, occ_symbol: str, count: int = None) -> list[dict]:
+        """
+        Return today's 1-minute OHLCV bars for an option contract, oldest-first.
+
+        `occ_symbol` is the OCC ticker (e.g. NVDA260529C00130000). Schwab's
+        price-history endpoint accepts option symbols and returns the same candle
+        shape as the equity feed, so the result matches get_bars().
+        Returns [] on any error so the caller can skip that contract.
+        """
+        count = count or config.BARS_TO_FETCH
+        if not self._client:
+            return []
+        try:
+            resp = self._client.get_price_history(
+                occ_symbol,
+                period_type=schwab.client.Client.PriceHistory.PeriodType.DAY,
+                period=schwab.client.Client.PriceHistory.Period.ONE_DAY,
+                frequency_type=schwab.client.Client.PriceHistory.FrequencyType.MINUTE,
+                frequency=schwab.client.Client.PriceHistory.Frequency.EVERY_MINUTE,
+                need_extended_hours_data=False,
+            )
+            resp.raise_for_status()
+            candles = resp.json().get('candles', [])
+            bars = []
+            for c in candles:
+                bar_time = datetime.fromtimestamp(
+                    c['datetime'] / 1000, tz=pytz.UTC
+                ).astimezone(CST)
+                bars.append({
+                    'bar_time': bar_time,
+                    'open':     float(c['open']),
+                    'high':     float(c['high']),
+                    'low':      float(c['low']),
+                    'close':    float(c['close']),
+                    'volume':   int(c['volume']),
+                })
+            bars.sort(key=lambda b: b['bar_time'])
+            logger.debug("Schwab: %s — %d option bars returned", occ_symbol, len(bars))
+            return bars[-count:]
+        except Exception as exc:
+            logger.warning("Schwab: get_option_bars failed for %s: %s", occ_symbol, exc)
             return []
 
     def get_nearest_expiry(self, symbol: str) -> Optional[date]:

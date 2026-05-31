@@ -165,24 +165,156 @@ def get_today_levels(symbol: str, level_date: date) -> list:
 
 # ── Price bars ────────────────────────────────────────────────────────────────
 
-def save_bars(symbol: str, bars: list) -> None:
-    """Bulk-insert 1-min OHLCV bars; silently skips bars already stored for the same timestamp."""
+def save_bars(symbol: str, bars: list, full_session: bool = True) -> None:
+    """
+    Bulk-upsert 1-min equity bars.
+
+    Each bar carries the 7 stored fields: open, high (max), low (min), close,
+    volume (per-minute candle volume), plus spot_price (underlying spot at the
+    bar) and cum_volume (running session total).
+
+    cum_volume is only meaningful when the full session is passed in. With
+    full_session=False (e.g. a partial rolling buffer) it is stored as NULL
+    rather than a misleading partial total.
+
+    ON CONFLICT updates the row so the forming minute settles to its final
+    values and rows predating the spot_price/cum_volume columns get backfilled.
+    """
     if not bars:
         return
-    rows = [
-        (symbol, b['bar_time'], b['open'], b['high'], b['low'], b['close'], b['volume'])
-        for b in bars
-    ]
+
+    running = 0
+    rows = []
+    for b in bars:
+        running += int(b['volume'])
+        if not full_session:
+            cum = None
+        else:
+            cum = b.get('cum_volume')
+            if cum is None:
+                cum = running
+        spot = b.get('spot_price', b['close'])
+        rows.append((
+            symbol, b['bar_time'], b['open'], b['high'], b['low'], b['close'],
+            b['volume'], spot, cum,
+        ))
+
     sql = """
-        INSERT INTO price_bars (symbol, bar_time, open, high, low, close, volume)
+        INSERT INTO price_bars
+            (symbol, bar_time, open, high, low, close, volume, spot_price, cum_volume)
         VALUES %s
-        ON CONFLICT (symbol, bar_time) DO NOTHING
+        ON CONFLICT (symbol, bar_time) DO UPDATE SET
+            open       = EXCLUDED.open,
+            high       = EXCLUDED.high,
+            low        = EXCLUDED.low,
+            close      = EXCLUDED.close,
+            volume     = EXCLUDED.volume,
+            spot_price = EXCLUDED.spot_price,
+            cum_volume = EXCLUDED.cum_volume
     """
     conn = _get()
     try:
         with conn.cursor() as cur:
             execute_values(cur, sql, rows)
         conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_option_level_bars(rows: list) -> None:
+    """
+    Bulk-upsert 1-min OHLCV bars for S/R level option contracts.
+
+    Each row dict must carry: symbol, level_date, level_type, rank, strike,
+    option_type, expiry, occ_symbol, bar_time, open, high, low, close, volume.
+    ON CONFLICT (occ_symbol, bar_time) updates so the forming minute settles.
+    """
+    if not rows:
+        return
+    values = [
+        (
+            r['symbol'], r['level_date'], r['level_type'], r['rank'], r['strike'],
+            r['option_type'], r['expiry'], r['occ_symbol'], r['bar_time'],
+            r['open'], r['high'], r['low'], r['close'], r['volume'],
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO option_level_bars
+            (symbol, level_date, level_type, rank, strike, option_type, expiry,
+             occ_symbol, bar_time, open, high, low, close, volume)
+        VALUES %s
+        ON CONFLICT (occ_symbol, bar_time) DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def prune_old_bars(keep_days: int = 10) -> dict:
+    """
+    Retain only the most recent `keep_days` trading days of 1-min bar data.
+
+    Deletes older rows from price_bars and option_level_bars. The cutoff is the
+    oldest of the `keep_days` most recent distinct trading dates actually present
+    in price_bars, so market holidays are handled automatically (no calendar
+    math). If fewer than `keep_days` trading days exist yet, nothing is deleted.
+
+    Alerts (signals), trades, and the daily tables (oi_levels, morning_sentiment,
+    option_chain_snapshots, volume_clusters) are never touched.
+
+    Returns {'cutoff': date|None, 'price_bars': int, 'option_level_bars': int}.
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT (bar_time AT TIME ZONE 'America/Chicago')::date AS d
+                FROM   price_bars
+                ORDER  BY d DESC
+                LIMIT  %s
+                """,
+                (keep_days,),
+            )
+            dates = [r[0] for r in cur.fetchall()]
+            if len(dates) < keep_days:
+                logger.info(
+                    "prune_old_bars: only %d trading day(s) stored (< %d) — nothing to prune",
+                    len(dates), keep_days,
+                )
+                return {'cutoff': None, 'price_bars': 0, 'option_level_bars': 0}
+
+            cutoff = min(dates)   # oldest date we keep
+
+            cur.execute(
+                "DELETE FROM price_bars "
+                "WHERE (bar_time AT TIME ZONE 'America/Chicago')::date < %s",
+                (cutoff,),
+            )
+            pb = cur.rowcount
+
+            cur.execute(
+                "DELETE FROM option_level_bars WHERE level_date < %s",
+                (cutoff,),
+            )
+            olb = cur.rowcount
+
+        conn.commit()
+        logger.info(
+            "prune_old_bars: kept %d trading days (>= %s); deleted price_bars=%d, option_level_bars=%d",
+            keep_days, cutoff, pb, olb,
+        )
+        return {'cutoff': cutoff, 'price_bars': pb, 'option_level_bars': olb}
     finally:
         _put(conn)
 
@@ -216,6 +348,8 @@ def save_signal(signal: dict) -> int:
              trigger_price, option_type, opt_mark, opt_bid, opt_ask,
              price_to_enter, price_to_exit,
              prox_score, cluster_strength, strong_cluster, flow_shape,
+             signal_shape, confidence, upgrade, cluster_active_bars, cluster_burst_bars,
+             day_mode, traded_strike, target_level,
              atm_vol_1m, atm_spike_ratio, atm_vol_3m,
              itm_vol_1m, itm_spike_ratio, itm_vol_3m,
              spread_pct, low_dist, room_score, room_pct,
@@ -227,6 +361,8 @@ def save_signal(signal: dict) -> int:
              %(option_type)s, %(opt_mark)s, %(opt_bid)s, %(opt_ask)s,
              %(price_to_enter)s, %(price_to_exit)s,
              %(prox_score)s, %(cluster_strength)s, %(strong_cluster)s, %(flow_shape)s,
+             %(signal_shape)s, %(confidence)s, %(upgrade)s, %(cluster_active_bars)s, %(cluster_burst_bars)s,
+             %(day_mode)s, %(traded_strike)s, %(target_level)s,
              %(atm_vol_1m)s, %(atm_spike_ratio)s, %(atm_vol_3m)s,
              %(itm_vol_1m)s, %(itm_spike_ratio)s, %(itm_vol_3m)s,
              %(spread_pct)s, %(low_dist)s, %(room_score)s, %(room_pct)s,
@@ -397,7 +533,8 @@ def get_open_trades(symbol: str = None) -> list:
                qty, limit_price, paper,
                exit1_underlying, exit2_underlying,
                exit1_qty, exit2_qty,
-               exit1_filled, exit2_filled
+               exit1_filled, exit2_filled,
+               stoploss_price, strike, option_type, expiry
         FROM   trades
         WHERE  status = 'placed'
           AND  (exit1_filled = FALSE OR exit2_filled = FALSE)
@@ -459,6 +596,38 @@ def mark_trade_eod_closed(trade_id: int, closed_at: datetime) -> None:
         _put(conn)
 
 
+def update_stoploss(trade_id: int, new_price: float) -> None:
+    """Move the stoploss to a new option mark level (e.g. breakeven after exit 1)."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET stoploss_price=%s WHERE id=%s",
+                (new_price, trade_id),
+            )
+        conn.commit()
+        logger.info("Trade %d stoploss moved to %.4f", trade_id, new_price)
+    finally:
+        _put(conn)
+
+
+def mark_trade_stopped(trade_id: int, stopped_at: datetime) -> None:
+    """Mark a trade as stopped out; removes it from open-trade monitoring."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trades
+                   SET status='stopped_out', exit2_filled=TRUE, exit2_filled_at=%s
+                   WHERE id=%s""",
+                (stopped_at, trade_id),
+            )
+        conn.commit()
+        logger.info("Trade %d marked stopped_out", trade_id)
+    finally:
+        _put(conn)
+
+
 def save_trade(trade: dict) -> int:
     """Insert an Alpaca order record tied to the originating signal. Returns trade id."""
     sql = """
@@ -466,12 +635,14 @@ def save_trade(trade: dict) -> int:
             (signal_id, symbol, occ_symbol, alpaca_order_id,
              qty, limit_price, buying_power_used, paper, status,
              signal_type, exit1_underlying, exit2_underlying,
-             exit1_qty, exit2_qty)
+             exit1_qty, exit2_qty,
+             stoploss_price, strike, option_type, expiry)
         VALUES
             (%(signal_id)s, %(symbol)s, %(occ_symbol)s, %(alpaca_order_id)s,
              %(qty)s, %(limit_price)s, %(buying_power_used)s, %(paper)s, %(status)s,
              %(signal_type)s, %(exit1_underlying)s, %(exit2_underlying)s,
-             %(exit1_qty)s, %(exit2_qty)s)
+             %(exit1_qty)s, %(exit2_qty)s,
+             %(stoploss_price)s, %(strike)s, %(option_type)s, %(expiry)s)
         RETURNING id
     """
     conn = _get()

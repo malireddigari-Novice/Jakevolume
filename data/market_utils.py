@@ -54,7 +54,7 @@ def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:
 
 def is_snapshot_window(dt: datetime = None, window_sec: int = 59) -> bool:
     """
-    True if `dt` is within `window_sec` seconds of today's 08:10 CST snapshot.
+    True if `dt` is within `window_sec` seconds of today's 08:20 CST snapshot.
     Designed to fire exactly once per day when called from a 60-second loop.
     """
     if dt is None:

@@ -1,5 +1,5 @@
 """
-OI-based support / resistance level computation — Step-1 spec (8:10 AM CST).
+OI-based support / resistance level computation — Step-1 spec (8:20 AM CST).
 
 Algorithm (6 levels per symbol)
 ---------------------------------
@@ -42,7 +42,7 @@ def compute_oi_levels(
     Parameters
     ----------
     chain            : Output of DatabentoClient.get_option_chain() or equivalent.
-    underlying_price : 8:10 AM spot price used as the ATM anchor.
+    underlying_price : 8:20 AM spot price used as the ATM anchor.
 
     Returns
     -------

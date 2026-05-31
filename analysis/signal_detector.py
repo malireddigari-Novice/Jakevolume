@@ -1,28 +1,32 @@
 """
 Stateful intraday signal detector — full 0DTE pipeline.
 
-Steps 2-10 (per S/R level, per 1-minute bar)
-----------------------------------------------
-  Step 2   Tiered proximity score: ≤0.25% → 1.00 | ≤0.35% → 0.70 | ≤0.50% → 0.50 | beyond → skip
-  Step 3   1-min option volume spike: ratio ≥ 3× N-bar baseline AND ≥ MinSpikeVol
-  Step 4   3-min cluster window: rolling 3-bar sum ≥ MinClusterVol
-  Step 5   Timing alignment score (ATM+ITM peak same bar → 1.00 | both active → 0.70)
-  Step 6   ClusterStrength = 0.45×ATM + 0.35×ITM + 0.20×Timing  [informational only]
-  Step 7   Extreme single-strike override: ratio ≥ 6× AND vol ≥ 2×MinCluster → CONCENTRATED
-  Step 8   Contract low filter: mark/intraday_low > 2.50 blocks (unless extreme)
-  Step 9   Spread filter: (ask-bid)/mid > 0.50 blocks signal
-  Step 10  Target room filter: nearest opposing level must be ≥ 0.25% away
-
-Volume logic
-------------
-  Spike path    — ATM OR ITM 1-min spike alone fires the signal
-  Cluster path  — ATM AND ITM both show abnormal 3-min volume together
-  No ATM/ITM validation → no alert (hard gate)
-
 Signal semantics
 -----------------
-  SUPPORT    level → BULLISH  / "Call-side bias"  — confirmed by CALL volume
-  RESISTANCE level → BEARISH  / "Put-side bias"   — confirmed by PUT  volume
+  SUPPORT    level → BULLISH / "Call-side bias"  — confirmed by CALL volume
+  RESISTANCE level → BEARISH / "Put-side bias"   — confirmed by PUT  volume
+
+Single print vs cluster (per confirm-side contract, per 1-min bar)
+------------------------------------------------------------------
+  SinglePrintRatio = Current1MinVol / max(AvgPrior10, 10)
+  ValidSinglePrint : Current1MinVol >= MinSinglePrintVol  AND
+                     SinglePrintRatio >= 8×                AND  low_dist <= 1.75
+  ValidCluster (rolling 5-bar window):
+                     WindowRatio5 = WindowVol5 / (5 * max(AvgPrior10, 10)) >= 3×  AND
+                     ActiveBars5  (per-bar ratio >= 2×) >= 3                       AND  low_dist <= 1.75
+  ATM_valid = single OR cluster ; ITM_valid = single OR cluster (ITM = 1 strike in-the-money)
+
+Classification + confidence
+---------------------------
+  HIGH        / ATM_ITM_CLUSTER       : ATM_valid AND ITM_valid AND cluster valid
+  MEDIUM_HIGH / EXTREME_SINGLE_PRINT  : extreme single (near lows) at S2/S3 or R2/R3
+  MEDIUM      / VOLUME_PRESSURE_CLUSTER or EXTREME_SINGLE_PRINT : single-side cluster, or
+                                        extreme single at rank 1
+  WATCH       / RANDOM_SINGLE_PRINT   : notable print but not near lows / no room / no ITM —
+                                        recorded (EMIT_WATCH_ONLY) but never auto-traded
+
+Surrounding filters (unchanged): proximity band, spread, target room, P/C conviction.
+Contract low: NearLow (<=1.75) qualifies prints; TooChased (>2.50) hard-blocks the ATM.
 """
 import logging
 from collections import defaultdict, deque
@@ -34,8 +38,11 @@ from data.market_utils import CST
 
 logger = logging.getLogger(__name__)
 
-_FiredKey = tuple[str, str]           # (symbol, signal_type) e.g. ('AAPL', 'BULLISH')
+_FiredKey = tuple[str, str]          # (symbol, signal_type)
 _OptKey   = tuple[str, float, str]   # (symbol, strike, opt_type)
+
+# Confidence ordering for the cluster-upgrade path (higher = stronger).
+_CONF_RANK = {'WATCH': 0, 'MEDIUM': 1, 'MEDIUM_HIGH': 2, 'HIGH': 3}
 
 
 # ── Pure helper functions ─────────────────────────────────────────────────────
@@ -66,32 +73,85 @@ def _timing_score(atm_hist: list[int], itm_hist: list[int]) -> float:
     return 1.00 if atm_3.index(atm_max) == itm_3.index(itm_max) else 0.70
 
 
-def _spike_stats(
-    history: list[int],
-    delta: int,
-    min_spike_vol: int,
-) -> tuple[float, bool]:
-    """Baseline = avg of history[:-1] (prior N bars). history[-1] == delta (current)."""
+def _spike_ratio(history: list[int], delta: int) -> float:
+    """1-bar ratio: delta / max(rolling_avg, 10). Returns 0.0 with no prior history."""
     prior = history[:-1] if len(history) > 1 else []
     if not prior:
-        return 0.0, False
-    baseline = sum(prior) / len(prior)
-    if baseline < config.OPT_MIN_BASELINE_VOL:
-        return 0.0, False
-    ratio    = delta / baseline
-    is_spike = ratio >= config.OPT_MIN_SPIKE_RATIO and delta >= min_spike_vol
-    return round(ratio, 2), is_spike
+        return 0.0
+    baseline = max(sum(prior) / len(prior), 10)   # spec: max(AvgVol, 10)
+    return round(delta / baseline, 2)
+
+
+def _window_ratio(history: list[int]) -> tuple[int, float]:
+    """
+    3-bar window sum vs prior rolling windows.
+    Returns (window_vol, window_spike_ratio).
+    Needs at least 4 bars of history; returns (sum, 0.0) otherwise.
+    """
+    if len(history) < 4:
+        return sum(history), 0.0
+    window_vol    = sum(history[-3:])
+    prior_windows = [sum(history[i:i+3]) for i in range(len(history) - 3)]
+    prior_avg     = sum(prior_windows) / len(prior_windows) if prior_windows else 0
+    ratio         = window_vol / max(prior_avg, 30)
+    return window_vol, round(ratio, 2)
+
+
+def _avg_prior(history: list[int], exclude_last: int, lookback: int) -> float:
+    """
+    Average of up to `lookback` bars ending `exclude_last` bars before the end.
+    e.g. exclude_last=1 → the bars just before the current one (single print);
+         exclude_last=5 → the bars before the trailing 5-bar window (cluster).
+    Returns 0.0 when no prior bars are available.
+    """
+    end = len(history) - exclude_last
+    if end <= 0:
+        return 0.0
+    seg = history[max(0, end - lookback):end]
+    return sum(seg) / len(seg) if seg else 0.0
+
+
+def _single_print(history: list[int], delta: int, min_vol: int) -> tuple[bool, float]:
+    """
+    Valid single print (ignoring contract-low filter, applied by the caller):
+      delta >= min_vol  AND  delta / max(AvgPrior10, 10) >= ratio threshold.
+    Returns (valid, ratio).
+    """
+    base  = max(_avg_prior(history, 1, config.OPT_PRIOR_LOOKBACK), 10.0)
+    ratio = round(delta / base, 2)
+    valid = delta >= min_vol and ratio >= config.OPT_SINGLE_PRINT_RATIO
+    return valid, ratio
+
+
+def _cluster5(history: list[int]) -> dict:
+    """
+    Rolling N-bar pressure cluster (N = OPT_CLUSTER_WINDOW, default 5).
+
+    base_unit    = max(AvgPrior10 before the window, 10)
+    window_vol   = sum of the last N bar deltas
+    window_ratio = window_vol / (N * base_unit)
+    active_bars  = bars in window with per-bar ratio >= OPT_CLUSTER_ACTIVE_RATIO
+    burst_bars   = bars in window with per-bar ratio >= OPT_CLUSTER_BURST_RATIO
+    valid_core   = window_ratio >= threshold AND active_bars >= OPT_CLUSTER_ACTIVE_MIN
+                   (contract-low filter applied by the caller)
+    """
+    n = config.OPT_CLUSTER_WINDOW
+    window = history[-n:]
+    if len(window) < n:
+        return {'vol': sum(window), 'ratio': 0.0, 'active': 0, 'burst': 0, 'valid_core': False}
+
+    base_unit    = max(_avg_prior(history, n, config.OPT_PRIOR_LOOKBACK), 10.0)
+    window_vol   = sum(window)
+    window_ratio = round(window_vol / (n * base_unit), 2)
+    active = sum(1 for b in window if b / base_unit >= config.OPT_CLUSTER_ACTIVE_RATIO)
+    burst  = sum(1 for b in window if b / base_unit >= config.OPT_CLUSTER_BURST_RATIO)
+    valid_core = (window_ratio >= config.OPT_CLUSTER_WINDOW_RATIO and
+                  active >= config.OPT_CLUSTER_ACTIVE_MIN)
+    return {'vol': window_vol, 'ratio': window_ratio, 'active': active,
+            'burst': burst, 'valid_core': valid_core}
 
 
 def _pc_conviction(signal_type: str, pc_ratio: Optional[float]) -> str:
-    """
-    Compare signal direction against the morning P/C ratio.
-
-    BULLISH signal: WITH_BIAS when call-heavy (P/C < PC_BULL_CUTOFF),
-                    AGAINST_BIAS when put-heavy (P/C > PC_BEAR_CUTOFF).
-    BEARISH signal: the reverse.
-    NEUTRAL when P/C is in the balanced zone or not yet available.
-    """
     if pc_ratio is None:
         return 'NEUTRAL'
     if signal_type == 'BULLISH':
@@ -99,7 +159,7 @@ def _pc_conviction(signal_type: str, pc_ratio: Optional[float]) -> str:
             return 'WITH_BIAS'
         if pc_ratio > config.PC_BEAR_CUTOFF:
             return 'AGAINST_BIAS'
-    else:  # BEARISH
+    else:
         if pc_ratio > config.PC_BEAR_CUTOFF:
             return 'WITH_BIAS'
         if pc_ratio < config.PC_BULL_CUTOFF:
@@ -111,32 +171,26 @@ def _target_room(
     signal_type: str,
     spot: float,
     levels: list,
+    position_only: bool = False,
 ) -> tuple[float, float]:
     """
-    Step 10: compute target room score and room % (Step 10 spec).
+    Step 10: nearest opposing level distance from spot.
+    BULLISH → nearest RESISTANCE above spot.
+    BEARISH → nearest SUPPORT below spot.
 
-    BULLISH: TargetRoom = nearest RESISTANCE above spot - spot
-    BEARISH: TargetRoom = spot - nearest SUPPORT below spot
-
-    Returns (score, room_pct).
-    If no opposing level exists in the direction, returns (1.00, inf) — unlimited room.
+    position_only=True (next-day mode) treats any level above spot as resistance
+    and any below as support, ignoring the frozen morning level_type.
+    Returns (score, room_pct). Unlimited room → (1.00, inf).
     """
+    above, below = _opposing_strikes(levels, spot, position_only)
     if signal_type == 'BULLISH':
-        targets = [
-            float(l['strike']) for l in levels
-            if l['level_type'] == 'RESISTANCE' and float(l['strike']) > spot
-        ]
-        if not targets:
+        if not above:
             return 1.00, float('inf')
-        room = min(targets) - spot
+        room = min(above) - spot
     else:
-        targets = [
-            float(l['strike']) for l in levels
-            if l['level_type'] == 'SUPPORT' and float(l['strike']) < spot
-        ]
-        if not targets:
+        if not below:
             return 1.00, float('inf')
-        room = spot - max(targets)
+        room = spot - max(below)
 
     room_pct = room / spot if spot > 0 else 0.0
 
@@ -152,17 +206,84 @@ def _target_room(
     return score, round(room_pct, 6)
 
 
+def _spread_pct(data: dict) -> Optional[float]:
+    """(ask − bid) / mid for a contract; None when quotes are missing or non-positive."""
+    bid = data.get('bid')
+    ask = data.get('ask')
+    if bid is None or ask is None:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
+
+
+def _opposing_strikes(levels: list, spot: float, position_only: bool) -> tuple[list, list]:
+    """
+    Split level strikes into (above_spot, below_spot).
+
+    In 0DTE mode (position_only=False) only the frozen RESISTANCE strikes count
+    as "above" and SUPPORT strikes as "below". In next-day mode (position_only=
+    True) levels are interchangeable: any strike above spot is resistance, any
+    below is support — so selling into S3 makes S2/S1 act as overhead resistance.
+    """
+    above, below = [], []
+    for l in levels:
+        s = float(l['strike'])
+        if position_only:
+            (above if s > spot else below).append(s)
+        elif l['level_type'] == 'RESISTANCE' and s > spot:
+            above.append(s)
+        elif l['level_type'] == 'SUPPORT' and s < spot:
+            below.append(s)
+    return above, below
+
+
+def _otm_target_contract(
+    signal_type: str,
+    confirm_type: str,
+    spot: float,
+    levels: list,
+    chain_quotes: dict,
+    depth: int,
+) -> Optional[tuple[float, float, dict]]:
+    """
+    Next-day strike pick: the ATM strike at the target level (OTM vs spot).
+
+    BULLISH → target the depth-th level above spot (e.g. S3 → S2); buy the call
+    strike nearest that level. BEARISH → depth-th level below spot (R3 → R2).
+    Returns (target_level_price, otm_strike, contract_dict) or None when the
+    target level or a matching chain contract is unavailable.
+    """
+    above, below = _opposing_strikes(levels, spot, position_only=True)
+    ladder = sorted(above) if signal_type == 'BULLISH' else sorted(below, reverse=True)
+    if not ladder:
+        return None
+    target_price = ladder[min(depth - 1, len(ladder) - 1)]
+
+    strikes = [s for (s, ot) in chain_quotes if ot == confirm_type]
+    if not strikes:
+        return None
+    otm_strike = min(strikes, key=lambda s: abs(s - target_price))
+    return target_price, otm_strike, chain_quotes[(otm_strike, confirm_type)]
+
+
 # ── Detector ──────────────────────────────────────────────────────────────────
 
 class SignalDetector:
 
     def __init__(self) -> None:
-        self._fired_today:  set[_FiredKey]       = set()   # (symbol, signal_type) once per day
+        # Hold enough bars for a 5-bar window plus its prior-10 baseline.
+        self._hist_maxlen = config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK
+        # Per-level fire log: (symbol, signal_type, strike) → (last_fire_time, rank).
+        # Drives the cooldown + upgrade logic (WATCH alerts share the same log).
+        self._last_fired:   dict[tuple, tuple]   = {}
         self._prev_opt_vol: dict[_OptKey, int]   = {}
         self._opt_vol_hist: dict[_OptKey, deque] = defaultdict(
-            lambda: deque(maxlen=config.OPT_SPIKE_LOOKBACK)
+            lambda: deque(maxlen=self._hist_maxlen)
         )
         self._opt_mark_low: dict[_OptKey, float] = {}
+        self._opt_last_bar: dict[_OptKey, datetime] = {}   # last bar a contract was seen
         self._history_date: Optional[date]       = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -175,19 +296,20 @@ class SignalDetector:
         option_quotes: dict | None = None,
         expiry: Optional[date] = None,
         pc_ratio: Optional[float] = None,
+        chain_quotes: dict | None = None,
     ) -> list[dict]:
         """
-        Run the full Steps 2-10 pipeline for the latest 1-min bar.
+        Run the full signal detection pipeline for the latest 1-min bar.
 
         Parameters
         ----------
-        bars          : 1-min bars sorted oldest-first (from SchwabClient.get_bars)
-        levels        : rows from db.get_today_levels()  — all 6 S/R levels
-        option_quotes : {(strike, opt_type): contract_dict}
-                        from SchwabClient.get_watched_contracts() — 2 nearest strikes
-                        per side.  If empty/None no alert fires (hard gate).
-        pc_ratio      : morning P/C OI ratio — used for pc_conviction label on signal.
-                        None means not yet available (no conviction label applied).
+        bars          : 1-min bars sorted oldest-first
+        levels        : rows from db.get_today_levels() — all S/R levels
+        option_quotes : {(strike, opt_type): contract_dict} from get_watched_contracts().
+                        If empty/None no alert fires (hard gate).
+        pc_ratio      : morning P/C OI ratio — used for conviction label.
+        chain_quotes  : full {(strike, opt_type): contract_dict} chain. Only needed
+                        in next-day mode to price the OTM target strike.
         """
         if not bars:
             return []
@@ -196,28 +318,50 @@ class SignalDetector:
         close_price = current['close']
         today       = current['bar_time'].date()
 
-        # ── Reset intraday state on a new trading day ─────────────────────────
-        if self._history_date != today:
-            self._history_date  = today
-            self._fired_today   = set()
-            self._prev_opt_vol  = {}
-            self._opt_vol_hist  = defaultdict(lambda: deque(maxlen=config.OPT_SPIKE_LOOKBACK))
-            self._opt_mark_low  = {}
+        # Next-day mode: no 0DTE today (nearest expiry is a future date) → Tue/Thu.
+        next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
+                         expiry is not None and expiry > today)
 
-        # ── Hard gate: no option quotes → no alert ────────────────────────────
+        # Reset intraday state on a new trading day
+        if self._history_date != today:
+            self._history_date   = today
+            self._last_fired     = {}
+            self._prev_opt_vol   = {}
+            self._opt_vol_hist   = defaultdict(lambda: deque(maxlen=self._hist_maxlen))
+            self._opt_mark_low   = {}
+            self._opt_last_bar   = {}
+
         if not option_quotes:
             return []
 
-        # ── Step 1: Compute deltas and update rolling histories ───────────────
+        # ── Step 1: Compute deltas, update rolling histories ──────────────────
+        # Watched strikes rotate as spot moves. If a contract was not seen on the
+        # immediately preceding bar, its cumulative volume jumped while unwatched —
+        # treat re-entry as a fresh start (delta 0, history cleared) so we don't
+        # manufacture a fake 1-min spike from accumulated volume.
+        bar_time = current['bar_time']
+        gap_limit = config.POLL_INTERVAL_SECONDS * 1.5
+
         opt_data_map: dict[tuple[float, str], dict] = {}
         vol_deltas:   dict[tuple[float, str], int]  = {}
 
         for (s, ot), data in option_quotes.items():
             opt_key: _OptKey = (symbol, s, ot)
             cur_vol  = int(data.get('volume', 0) or 0)
-            prev_vol = self._prev_opt_vol.get(opt_key, cur_vol)
-            delta    = max(0, cur_vol - prev_vol)
+            last_bar = self._opt_last_bar.get(opt_key)
+            discontinuous = (last_bar is not None and
+                             (bar_time - last_bar).total_seconds() > gap_limit)
+
+            if last_bar is None or discontinuous:
+                # First sight or re-entry after a gap → no spurious delta.
+                delta = 0
+                if discontinuous:
+                    self._opt_vol_hist[opt_key].clear()
+            else:
+                prev_vol = self._prev_opt_vol.get(opt_key, cur_vol)
+                delta    = max(0, cur_vol - prev_vol)
             self._prev_opt_vol[opt_key] = cur_vol
+            self._opt_last_bar[opt_key] = bar_time
 
             self._opt_vol_hist[opt_key].append(delta)
 
@@ -229,32 +373,56 @@ class SignalDetector:
             opt_data_map[(s, ot)] = data
             vol_deltas[(s, ot)]   = delta
 
-        new_signals: list[dict] = []
+        # (symbol, signal_dict, actionable) candidates collected across levels
+        candidates: list[tuple[dict, bool]] = []
 
         for level in levels:
             strike     = float(level['strike'])
-            level_type = level['level_type']
+            rank       = int(level.get('rank', 1))
+            # Next-day mode: levels are interchangeable — role is set by spot
+            # position each bar. A deadband around the strike avoids bull/bear
+            # whipsaw right at the level (keep the frozen role inside the band).
+            # 0DTE mode always keeps the frozen morning level_type.
+            if next_day_mode:
+                band = strike * config.LEVEL_FLIP_DEADBAND_PCT
+                if close_price > strike + band:
+                    level_type = 'SUPPORT'        # spot clearly above → level below
+                elif close_price < strike - band:
+                    level_type = 'RESISTANCE'     # spot clearly below → level overhead
+                else:
+                    level_type = level['level_type']
+            else:
+                level_type = level['level_type']
             confirm_type = 'PUT' if level_type == 'RESISTANCE' else 'CALL'
             signal_type  = 'BEARISH' if level_type == 'RESISTANCE' else 'BULLISH'
-            key: _LevelKey = (symbol, level_type, strike)
 
             # ── Step 2: Proximity score ───────────────────────────────────────
             prox_score = _proximity_score(close_price, strike)
             if prox_score == 0.0:
+                pct_away = abs(close_price - strike) / strike * 100
+                logger.info(
+                    "MONITOR  %s %s@%.2f  spot=%.2f  pct_away=%.2f%%  OUT_OF_RANGE",
+                    symbol, level_type, strike, close_price, pct_away,
+                )
                 continue
 
-            # ── Identify ATM / ITM watched contracts ──────────────────────────
-            # ATM = nearest strike to spot; ITM = second nearest (same confirm_type)
-            ct_keys = sorted(
-                [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type],
-                key=lambda k: abs(k[0] - close_price),
-            )
+            # ── Identify ATM + 1-ITM confirm-side contracts (directional) ─────
+            ct_keys = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
             if not ct_keys:
-                logger.debug("%s %s@%.4f: no %s quotes", symbol, level_type, strike, confirm_type)
+                logger.info(
+                    "MONITOR  %s %s@%.2f  spot=%.2f  prox=%.2f  NO_%s_QUOTES",
+                    symbol, level_type, strike, close_price, prox_score, confirm_type,
+                )
                 continue
 
-            atm_key  = ct_keys[0]
-            itm_key  = ct_keys[1] if len(ct_keys) > 1 else None
+            atm_key = min(ct_keys, key=lambda k: abs(k[0] - close_price))
+            # ITM = one strike in-the-money: CALL → below spot, PUT → above spot
+            if confirm_type == 'CALL':
+                itm_cands = [k for k in ct_keys if k[0] < close_price and k != atm_key]
+                itm_key   = max(itm_cands, key=lambda k: k[0]) if itm_cands else None
+            else:
+                itm_cands = [k for k in ct_keys if k[0] > close_price and k != atm_key]
+                itm_key   = min(itm_cands, key=lambda k: k[0]) if itm_cands else None
 
             atm_data  = opt_data_map[atm_key]
             atm_delta = vol_deltas.get(atm_key, 0)
@@ -266,211 +434,326 @@ class SignalDetector:
             itm_okey: _OptKey = (symbol, itm_key[0], confirm_type) if itm_key else ('', 0.0, '')
             itm_hist  = list(self._opt_vol_hist[itm_okey]) if itm_key else []
 
-            min_spike_vol   = config.OPT_MIN_SPIKE_VOL.get(symbol,   config.OPT_MIN_SPIKE_VOL_DEFAULT)
-            min_cluster_vol = config.OPT_MIN_CLUSTER_VOL.get(symbol, config.OPT_MIN_CLUSTER_VOL_DEFAULT)
+            min_single_vol = config.OPT_MIN_SINGLE_PRINT_VOL.get(
+                symbol, config.OPT_MIN_SINGLE_PRINT_VOL['default'])
 
-            # ── Step 3: 1-min spike ───────────────────────────────────────────
-            atm_spike_ratio, atm_is_spike = _spike_stats(atm_hist, atm_delta, min_spike_vol)
-            itm_spike_ratio, itm_is_spike = _spike_stats(itm_hist, itm_delta, min_spike_vol)
+            # ── Single print + 5-bar pressure cluster, per contract ───────────
+            atm_single_raw, atm_spike_ratio = _single_print(atm_hist, atm_delta, min_single_vol)
+            atm_clu = _cluster5(atm_hist)
+            atm_window_vol, atm_window_ratio = atm_clu['vol'], atm_clu['ratio']
 
-            # ── Step 4: 3-min cluster volumes ─────────────────────────────────
-            atm_vol_3m = sum(atm_hist[-3:]) if atm_hist else atm_delta
-            itm_vol_3m = sum(itm_hist[-3:]) if itm_hist else itm_delta
-
-            # ── Step 5: Timing ────────────────────────────────────────────────
-            timing = _timing_score(atm_hist, itm_hist)
-
-            # ── Step 6: ClusterStrength (informational) ───────────────────────
-            atm_component    = min(1.0, atm_vol_3m / max(min_cluster_vol, 1))
-            itm_component    = min(1.0, itm_vol_3m / max(min_cluster_vol, 1))
-            cluster_strength = (
-                0.45 * atm_component
-                + 0.35 * itm_component
-                + 0.20 * timing
-            )
-
-            # ── Step 7: Extreme single-strike override ─────────────────────────
-            atm_extreme = (
-                atm_spike_ratio >= config.OPT_EXTREME_SPIKE_RATIO
-                and atm_delta >= 2 * min_cluster_vol
-            )
-
-            # ── Volume gate: spike OR cluster (hard gate) ─────────────────────
-            # Spike path  — ATM OR ITM alone shows abnormal 1-min volume
-            spike_valid = atm_is_spike or itm_is_spike
-            # Cluster path — ATM AND ITM both show abnormal 3-min volume together
-            cluster_3m_valid = (
-                atm_vol_3m >= min_cluster_vol and itm_vol_3m >= min_cluster_vol
-            )
-            volume_valid = spike_valid or cluster_3m_valid or atm_extreme
-
-            if not volume_valid:
-                logger.debug(
-                    "%s %s@%.4f: no volume signal "
-                    "(atm_spike=%s itm_spike=%s atm_3m=%d itm_3m=%d min=%d)",
-                    symbol, level_type, strike,
-                    atm_is_spike, itm_is_spike,
-                    atm_vol_3m, itm_vol_3m, min_cluster_vol,
-                )
-                continue
-
-            # ── Flow shape ────────────────────────────────────────────────────
-            if atm_extreme:
-                flow_shape = 'CONCENTRATED'
-            elif atm_is_spike and itm_is_spike:
-                flow_shape = 'SPIKE_BOTH'
-            elif cluster_3m_valid:
-                flow_shape = 'CLUSTER'
-            elif atm_is_spike:
-                flow_shape = 'SPIKE_ATM'
+            if itm_key:
+                itm_single_raw, itm_spike_ratio = _single_print(itm_hist, itm_delta, min_single_vol)
+                itm_clu = _cluster5(itm_hist)
             else:
-                flow_shape = 'SPIKE_ITM'
+                itm_single_raw, itm_spike_ratio = False, 0.0
+                itm_clu = {'vol': 0, 'ratio': 0.0, 'active': 0, 'burst': 0, 'valid_core': False}
+            itm_window_vol, itm_window_ratio = itm_clu['vol'], itm_clu['ratio']
 
-            strong_cluster = atm_is_spike and itm_is_spike  # both 1-min spikes
+            # Per-contract distance above session low
+            atm_low_dist = self._contract_low_dist(atm_okey, atm_data)
+            itm_low_dist = self._contract_low_dist(itm_okey, itm_data) if itm_key else None
+            atm_near_low = (atm_low_dist is None or atm_low_dist <= config.NEAR_LOW_MAX_DIST)
+            itm_near_low = (itm_low_dist is not None and itm_low_dist <= config.NEAR_LOW_MAX_DIST)
+            atm_chased   = (atm_low_dist is not None and atm_low_dist > config.CONTRACT_LOW_MAX_DIST)
+            low_dist     = atm_low_dist
+            near_low     = atm_near_low
 
-            # ── Step 8: Contract low filter ────────────────────────────────────
-            atm_mark     = atm_data.get('mark')
-            atm_mark_low = self._opt_mark_low.get(atm_okey)
-            low_dist: Optional[float] = None
-            if atm_mark and atm_mark_low and atm_mark_low > 0:
-                low_dist = atm_mark / atm_mark_low
-                if low_dist > config.CONTRACT_LOW_MAX_DIST:
-                    if not atm_extreme:
-                        logger.debug(
-                            "%s %s@%.4f: contract low blocked — mark=%.2f low=%.2f ratio=%.2f",
-                            symbol, level_type, strike, atm_mark, atm_mark_low, low_dist,
-                        )
-                        continue
+            # Near-low-qualified validity (single OR cluster, per spec)
+            atm_single  = atm_single_raw and atm_near_low
+            atm_cluster = atm_clu['valid_core'] and atm_near_low
+            itm_single  = itm_single_raw and itm_near_low
+            itm_cluster = itm_clu['valid_core'] and itm_near_low
 
-            # ── Step 9: Spread filter ──────────────────────────────────────────
-            atm_bid = atm_data.get('bid')
-            atm_ask = atm_data.get('ask')
-            spread_pct: Optional[float] = None
-            if atm_bid is not None and atm_ask is not None:
-                mid = (atm_bid + atm_ask) / 2
-                if mid > 0:
-                    spread_pct = (atm_ask - atm_bid) / mid
-                    if spread_pct > config.MAX_SPREAD_PCT:
-                        logger.debug(
-                            "%s %s@%.4f: spread blocked — %.0f%%",
-                            symbol, level_type, strike, spread_pct * 100,
-                        )
-                        continue
+            atm_valid       = atm_single or atm_cluster
+            itm_valid       = itm_single or itm_cluster
+            atm_itm_confirm = atm_valid and itm_valid
+            cluster_valid   = atm_cluster or itm_cluster
+            extreme_single  = atm_single or itm_single          # near-low extreme print
+            extreme_raw     = atm_single_raw or itm_single_raw   # ignores near-low
+            cluster_core    = atm_clu['valid_core'] or itm_clu['valid_core']
 
-            # ── Step 10: Target room filter ────────────────────────────────────
-            # BULLISH: nearest resistance above spot must be ≥ 0.25% away
-            # BEARISH: nearest support below spot must be ≥ 0.25% away
-            room_score, room_pct = _target_room(signal_type, close_price, levels)
-            if room_score == 0.00:
-                logger.debug(
-                    "%s %s@%.4f: target room blocked — room=%.3f%% (need ≥%.2f%%)",
-                    symbol, level_type, strike,
-                    room_pct * 100, config.TARGET_ROOM_LOW * 100,
-                )
+            # Informational ClusterStrength (kept for storage/logging; no longer a gate)
+            timing   = _timing_score(atm_hist, itm_hist)
+            atm_norm = min(1.0, atm_window_ratio / max(config.OPT_CLUSTER_WINDOW_RATIO, 1))
+            itm_norm = min(1.0, itm_window_ratio / max(config.OPT_CLUSTER_WINDOW_RATIO, 1))
+            cluster_strength = round(0.45 * atm_norm + 0.35 * itm_norm + 0.20 * timing, 4)
+
+            # ── MONITOR log (every bar, every in-range level) ─────────────────
+            logger.info(
+                "MONITOR  %s %s@%.2f  rank=%d  spot=%.2f  prox=%.2f  "
+                "%s:1m=%d(x%.1f) win=%d(x%.1f,act=%d) itm:1m=%d(x%.1f) win=%d(x%.1f,act=%d)  "
+                "low=%s  atm_itm=%s clust=%s extreme=%s",
+                symbol, level_type, strike, rank, close_price, prox_score, confirm_type,
+                atm_delta, atm_spike_ratio, atm_window_vol, atm_window_ratio, atm_clu['active'],
+                itm_delta, itm_spike_ratio, itm_window_vol, itm_window_ratio, itm_clu['active'],
+                f"{low_dist:.2f}" if low_dist is not None else "n/a",
+                atm_itm_confirm, cluster_valid, extreme_single,
+            )
+
+            # Nothing notable at all → skip; chased ATM contract → hard block
+            if not (extreme_raw or cluster_core):
+                continue
+            if atm_chased:
+                logger.debug("%s %s@%.2f: TooChased — low_dist=%.2f",
+                             symbol, level_type, strike, low_dist)
                 continue
 
-            # ── P/C conviction multiplier ─────────────────────────────────────
-            # WITH_BIAS   — signal direction agrees with morning P/C reading
-            # AGAINST_BIAS — signal direction contradicts morning P/C reading
-            # NEUTRAL     — P/C is in the balanced zone (or not yet computed)
+            # ── Next-day OTM strike: buy the ATM contract at the target level ─
+            # (detection volume stays on the spot-side contracts above).
+            day_mode      = 'NEXT_DAY' if next_day_mode else '0DTE'
+            trade_data    = atm_data
+            traded_strike = strike
+            target_level: Optional[float] = None
+            if next_day_mode and chain_quotes:
+                otm = _otm_target_contract(signal_type, confirm_type, close_price,
+                                           levels, chain_quotes, config.NEXT_DAY_TARGET_DEPTH)
+                if otm:
+                    target_level, traded_strike, trade_data = otm
+
+            # ── Spread + target room — downgrade to WATCH, never silently drop ─
+            # Spread/room follow the contract we'd actually trade (OTM in next-day mode).
+            spread_pct = _spread_pct(trade_data)
+            spread_ok  = spread_pct is None or spread_pct <= config.MAX_SPREAD_PCT
+            room_score, room_pct = _target_room(signal_type, close_price, levels,
+                                                position_only=next_day_mode)
+            room_ok    = room_score > 0.0
+            gates_ok   = spread_ok and room_ok
+
+            # ── Classification + confidence tier ──────────────────────────────
+            confidence, signal_shape, actionable = 'WATCH', 'RANDOM_SINGLE_PRINT', False
+            if atm_itm_confirm and cluster_valid and gates_ok:
+                confidence, signal_shape, actionable = 'HIGH', 'ATM_ITM_CLUSTER', True
+            elif extreme_single and rank in config.SINGLE_PRINT_RANKS and gates_ok:
+                confidence, signal_shape, actionable = 'MEDIUM_HIGH', 'EXTREME_SINGLE_PRINT', True
+            elif cluster_valid and gates_ok:
+                confidence, signal_shape, actionable = 'MEDIUM', 'VOLUME_PRESSURE_CLUSTER', True
+            elif extreme_single and gates_ok:
+                confidence, signal_shape, actionable = 'MEDIUM', 'EXTREME_SINGLE_PRINT', True
+
+            if not actionable and not config.EMIT_WATCH_ONLY:
+                continue
+
             pc_conviction = _pc_conviction(signal_type, pc_ratio)
 
-            # ── All filters passed — attempt to fire ──────────────────────────
-            signal = self._maybe_fire(
-                symbol=symbol,
-                level=level,
-                confirm_type=confirm_type,
-                signal_type=signal_type,
-                current_bar=current,
-                expiry=expiry,
-                prox_score=prox_score,
-                atm_key=atm_key,
-                atm_data=atm_data,
-                atm_delta=atm_delta,
-                atm_spike_ratio=atm_spike_ratio,
-                atm_vol_3m=atm_vol_3m,
-                itm_delta=itm_delta,
-                itm_spike_ratio=itm_spike_ratio,
-                itm_vol_3m=itm_vol_3m,
-                cluster_strength=cluster_strength,
-                strong_cluster=strong_cluster,
-                flow_shape=flow_shape,
-                spread_pct=spread_pct,
-                low_dist=low_dist,
-                room_score=room_score,
-                room_pct=room_pct,
-                pc_ratio=pc_ratio,
-                pc_conviction=pc_conviction,
-                key=key,
+            signal = self._build_signal(
+                symbol=symbol, level=level, levels=levels, rank=rank,
+                level_type=level_type, confirm_type=confirm_type, signal_type=signal_type,
+                current_bar=current, expiry=expiry, prox_score=prox_score,
+                atm_data=atm_data, atm_delta=atm_delta, atm_spike_ratio=atm_spike_ratio,
+                atm_window_vol=atm_window_vol, atm_window_ratio=atm_window_ratio,
+                itm_delta=itm_delta, itm_spike_ratio=itm_spike_ratio,
+                itm_window_vol=itm_window_vol, itm_window_ratio=itm_window_ratio,
+                cluster_active=atm_clu['active'], cluster_burst=atm_clu['burst'],
+                atm_itm_confirm=atm_itm_confirm, cluster_strength=cluster_strength,
+                confidence=confidence, signal_shape=signal_shape,
+                spread_pct=spread_pct, low_dist=low_dist,
+                room_score=room_score, room_pct=room_pct,
+                pc_ratio=pc_ratio, pc_conviction=pc_conviction,
+                next_day_mode=next_day_mode, day_mode=day_mode,
+                trade_data=trade_data, traded_strike=traded_strike, target_level=target_level,
             )
-            if signal:
-                new_signals.append(signal)
+            candidates.append((signal, actionable))
 
-        # If multiple levels fired keep the one with the most target room
-        if len(new_signals) > 1:
-            new_signals = [max(new_signals, key=lambda s: s['room_score'])]
+        # ── Select one alert this bar from the eligible candidates ────────────
+        # Dedup is per LEVEL with a cooldown (not once-per-direction-per-day), so
+        # successive bounces at different levels (S3→S2→S1) each alert. Within a
+        # level's cooldown only a strictly higher-confidence upgrade gets through.
+        eligible: list[tuple[dict, bool, bool]] = []   # (sig, actionable, is_upgrade)
+        for sig, actionable in candidates:
+            decision, is_upgrade = self._fire_decision(sig, bar_time)
+            if decision != 'skip':
+                eligible.append((sig, actionable, is_upgrade))
+        if not eligible:
+            return []
 
-        return new_signals
+        # Prefer actionable, then confidence, then room.
+        act = [e for e in eligible if e[1]]
+        pool = act if act else eligible
+        sig, _, is_upgrade = max(
+            pool, key=lambda e: (_CONF_RANK[e[0]['confidence']], e[0]['room_score'])
+        )
+
+        key = (symbol, sig['signal_type'], float(sig['level_price']))
+        prev = self._last_fired.get(key)
+        prev_rank = prev[1] if prev else -1
+        self._last_fired[key] = (bar_time, max(_CONF_RANK[sig['confidence']], prev_rank))
+        sig['upgrade'] = is_upgrade
+        if is_upgrade:
+            logger.info(
+                "UPGRADE  %s %s @%.2f  → %s",
+                symbol, sig['signal_type'], float(sig['level_price']), sig['confidence'],
+            )
+        return [sig]
+
+    def _fire_decision(self, sig: dict, now: datetime) -> tuple[str, bool]:
+        """
+        Per-level cooldown + upgrade gate. Returns (action, is_upgrade) where
+        action is 'fire' | 'upgrade' | 'skip'.
+          - never fired this level        → fire
+          - cooldown elapsed              → fire (re-entry)
+          - within cooldown, higher tier  → upgrade (alert only, not re-traded)
+          - within cooldown, same/lower   → skip
+        """
+        key  = (sig['symbol'], sig['signal_type'], float(sig['level_price']))
+        rank = _CONF_RANK[sig['confidence']]
+        prev = self._last_fired.get(key)
+        if prev is None:
+            return 'fire', False
+        prev_time, prev_rank = prev
+        elapsed_min = (now - prev_time).total_seconds() / 60.0
+        if elapsed_min >= config.SIGNAL_COOLDOWN_MINUTES:
+            return 'fire', False
+        if config.CLUSTER_UPGRADE_ENABLED and rank > prev_rank:
+            # An upgrade only when the prior alert was actionable (already entered).
+            # A stronger signal over a prior WATCH is a fresh actionable entry.
+            if prev_rank >= _CONF_RANK['MEDIUM']:
+                return 'upgrade', True
+            return 'fire', False
+        return 'skip', False
+
+    # ── Opposite-side volume validation (for exit state machine) ─────────────
+
+    def check_opposite_side(
+        self,
+        symbol: str,
+        signal_type: str,
+        option_quotes: dict,
+        target_price: float,
+    ) -> bool:
+        """
+        Returns True if opposite-side volume shows TrueCluster-level activity
+        near target_price.  Used by check_exits() for early exit2 after exit1 fills.
+
+        BULLISH trade → watches PUT volume (put cluster at R1 = reversal signal)
+        BEARISH trade → watches CALL volume (call cluster at S1 = reversal signal)
+
+        Requires both ATM and ITM opposite contracts active (mirrors TrueCluster gate).
+        History is already current because check() runs before check_exits() each bar.
+        """
+        opp_type      = 'PUT' if signal_type == 'BULLISH' else 'CALL'
+        min_spike_vol = config.OPT_MIN_SPIKE_VOL.get(symbol, config.OPT_MIN_SPIKE_VOL['default'])
+        min_clust_vol = config.OPT_MIN_CLUSTER_VOL.get(symbol, config.OPT_MIN_CLUSTER_VOL['default'])
+
+        opp_keys = sorted(
+            [(s, ot) for (s, ot) in option_quotes if ot == opp_type],
+            key=lambda k: abs(k[0] - target_price),
+        )
+        if not opp_keys:
+            return False
+
+        def _side_active(key: tuple) -> bool:
+            okey: _OptKey = (symbol, key[0], opp_type)
+            hist = list(self._opt_vol_hist[okey])
+            if not hist:
+                return False
+            delta              = hist[-1]   # current bar delta, pushed by check()
+            ratio              = _spike_ratio(hist, delta)
+            win_vol, win_ratio = _window_ratio(hist)
+            burst   = delta >= min_spike_vol and ratio     >= config.OPT_SINGLE_SPIKE_RATIO
+            cluster = win_ratio >= config.OPT_CONSEC_SPIKE_RATIO and win_vol >= min_clust_vol
+            return burst or cluster
+
+        atm_active = _side_active(opp_keys[0])
+        itm_active = _side_active(opp_keys[1]) if len(opp_keys) > 1 else False
+        result     = atm_active and itm_active
+        if result:
+            logger.info(
+                "OppSide ACTIVE  %s %s  opp=%s  near=%.2f",
+                symbol, signal_type, opp_type, target_price,
+            )
+        return result
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _maybe_fire(
+    def _contract_low_dist(self, okey: _OptKey, data: dict) -> Optional[float]:
+        """
+        Ratio of current mark to the contract's true session low; None if unknown.
+
+        Uses the lower of Schwab's reported day_low and our watched-session min, so
+        a low that printed before we started watching still counts (a higher, stale
+        watched-min would otherwise understate how chased the contract is).
+        """
+        mark = data.get('mark')
+        candidates = [x for x in (self._opt_mark_low.get(okey), data.get('day_low'))
+                      if x and x > 0]
+        low = min(candidates) if candidates else None
+        if mark and low and low > 0:
+            return round(mark / low, 4)
+        return None
+
+    def _build_signal(
         self,
         symbol: str,
         level,
+        levels: list,
+        rank: int,
+        level_type: str,
         confirm_type: str,
         signal_type: str,
         current_bar: dict,
         expiry: Optional[date],
         prox_score: float,
-        atm_key: tuple,
         atm_data: dict,
         atm_delta: int,
         atm_spike_ratio: float,
-        atm_vol_3m: int,
+        atm_window_vol: int,
+        atm_window_ratio: float,
         itm_delta: int,
         itm_spike_ratio: float,
-        itm_vol_3m: int,
+        itm_window_vol: int,
+        itm_window_ratio: float,
+        cluster_active: int,
+        cluster_burst: int,
+        atm_itm_confirm: bool,
         cluster_strength: float,
-        strong_cluster: bool,
-        flow_shape: str,
+        confidence: str,
+        signal_shape: str,
         spread_pct: Optional[float],
         low_dist: Optional[float],
         room_score: float,
         room_pct: float,
         pc_ratio: Optional[float],
         pc_conviction: str,
-        key: tuple,
-    ) -> Optional[dict]:
+        next_day_mode: bool,
+        day_mode: str,
+        trade_data: dict,
+        traded_strike: float,
+        target_level: Optional[float],
+    ) -> dict:
+        """
+        Build the signal dict for a classified candidate. No state mutation —
+        dedup and one-per-direction selection happen in check().
+
+        `level_type` is the effective role (spot-based in next-day mode). The
+        traded contract (`trade_data`/`traded_strike`) is the OTM target strike
+        in next-day mode, else the spot-side ATM contract.
+        """
         now        = datetime.now(CST)
-        level_type = level['level_type']
         strike     = float(level['strike'])
+        spot       = current_bar['close']
 
-        # One alert per direction per symbol per day.
-        fired_key: _FiredKey = (symbol, signal_type)
-        if fired_key in self._fired_today:
-            logger.debug(
-                "%s %s@%.4f: already fired %s today — skipping",
-                symbol, level_type, strike, signal_type,
-            )
-            return None
-
-        self._fired_today.add(fired_key)
+        # Exit targets from opposing levels — position-based in next-day mode.
+        above, below = _opposing_strikes(levels, spot, position_only=next_day_mode)
+        if signal_type == 'BULLISH':
+            _exits = sorted(above)
+        else:
+            _exits = sorted(below, reverse=True)
+        exit1_price = _exits[0] if _exits else None
+        exit2_price = _exits[1] if len(_exits) > 1 else None
 
         bias = 'Call-side bias' if level_type == 'SUPPORT' else 'Put-side bias'
 
-        opt_mark = atm_data.get('mark')
-        opt_bid  = atm_data.get('bid')
-        opt_ask  = atm_data.get('ask')
+        opt_mark = trade_data.get('mark')
+        opt_bid  = trade_data.get('bid')
+        opt_ask  = trade_data.get('ask')
         price_to_enter = round(opt_ask, 2) if opt_ask else None
         price_to_exit  = round(opt_ask * 2, 2) if opt_ask else None
 
-        # ── Option H/L flag ───────────────────────────────────────────────────
-        # Compare current mark to today's intraday high/low for the ATM contract.
-        # AT_HIGH / NEAR_HIGH / AT_LOW / NEAR_LOW  (None when mid-range or no data)
+        # Option H/L flag (on the traded contract)
         option_hl_flag: Optional[str] = None
-        day_high = atm_data.get('day_high')
-        day_low  = atm_data.get('day_low')
+        day_high = trade_data.get('day_high')
+        day_low  = trade_data.get('day_low')
         mark     = opt_mark or 0
         if mark > 0:
             if day_high and day_high > 0:
@@ -492,48 +775,62 @@ class SignalDetector:
             'level_type':       level_type,
             'level_price':      strike,
             'expiry':           expiry,
-            'trigger_price':    current_bar['close'],
+            'trigger_price':    spot,
             'option_type':      confirm_type,
+            'day_mode':         day_mode,        # '0DTE' | 'NEXT_DAY'
+            'traded_strike':    traded_strike,   # OTM target strike in next-day mode
+            'target_level':     target_level,
             'opt_mark':         opt_mark,
             'opt_bid':          opt_bid,
             'opt_ask':          opt_ask,
             'price_to_enter':   price_to_enter,
             'price_to_exit':    price_to_exit,
-            # Cluster analytics
             'prox_score':       prox_score,
-            'cluster_strength': round(cluster_strength, 4),
-            'strong_cluster':   strong_cluster,
-            'flow_shape':       flow_shape,
+            'cluster_strength': cluster_strength,
+            'strong_cluster':   atm_itm_confirm,
+            'flow_shape':       signal_shape,
+            'signal_shape':     signal_shape,
+            'confidence':       confidence,
+            'upgrade':          False,   # set True in check() on a cluster upgrade
+            'cluster_active_bars': cluster_active,
+            'cluster_burst_bars':  cluster_burst,
             'atm_vol_1m':       atm_delta,
             'atm_spike_ratio':  atm_spike_ratio,
-            'atm_vol_3m':       atm_vol_3m,
+            'atm_vol_3m':       atm_window_vol,
             'itm_vol_1m':       itm_delta,
             'itm_spike_ratio':  itm_spike_ratio,
-            'itm_vol_3m':       itm_vol_3m,
+            'itm_vol_3m':       itm_window_vol,
             'spread_pct':       round(spread_pct, 4) if spread_pct is not None else None,
-            'low_dist':         round(low_dist, 4)   if low_dist  is not None else None,
+            'low_dist':         low_dist,
             'room_score':       room_score,
             'room_pct':         round(room_pct, 6)   if room_pct != float('inf') else None,
             'pc_ratio':         pc_ratio,
             'pc_conviction':    pc_conviction,
             'option_hl_flag':   option_hl_flag,
-            # Legacy columns kept nullable
+            'exit1_price':        exit1_price,
+            'exit2_price':        exit2_price,
+            # Legacy nullable columns expected by db.save_signal
             'opt_vol_delta':      atm_delta,
             'avg_volume_20':      None,
             'spike_volume':       None,
             'consecutive_spikes': None,
         }
 
+        tag = 'SIGNAL' if confidence != 'WATCH' else 'WATCH '
+        strike_note = (f"  [{day_mode} strike={traded_strike:.2f}→tgt {target_level:.2f}]"
+                       if next_day_mode and target_level is not None else "")
         logger.info(
-            "SIGNAL >> %s %s (%s)  %s@%.4f  prox=%.2f  "
-            "atm=%s 1m=%d(x%.1f) 3m=%d  itm=1m=%d(x%.1f) 3m=%d  "
-            "shape=%s  room=%.3f%%[%.2f]  pc=%.2f[%s]  mark=%s  enter=%s",
-            symbol, signal_type, bias, level_type, strike, prox_score,
-            confirm_type, atm_delta, atm_spike_ratio, atm_vol_3m,
-            itm_delta, itm_spike_ratio, itm_vol_3m,
-            flow_shape,
+            "%s >> %s %s (%s)  %s@%.2f  rank=%d  prox=%.2f  conf=%s  shape=%s%s  "
+            "%s:1m=%d(x%.1f) win=%d(x%.1f)  itm:1m=%d(x%.1f) win=%d(x%.1f)  "
+            "CS=%.2f  low=%.2f  room=%.3f%%  pc=%.2f[%s]  mark=%s  enter=%s",
+            tag, symbol, signal_type, bias, level_type, strike, rank, prox_score,
+            confidence, signal_shape, strike_note,
+            confirm_type,
+            atm_delta, atm_spike_ratio, atm_window_vol, atm_window_ratio,
+            itm_delta, itm_spike_ratio, itm_window_vol, itm_window_ratio,
+            cluster_strength,
+            low_dist if low_dist is not None else 0.0,
             (room_pct * 100) if room_pct != float('inf') else 999,
-            room_score,
             pc_ratio if pc_ratio is not None else 0.0,
             pc_conviction,
             f"${opt_mark:.2f}"       if opt_mark      else 'n/a',

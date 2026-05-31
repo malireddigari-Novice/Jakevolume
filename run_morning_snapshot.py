@@ -50,30 +50,30 @@ for symbol in config.SYMBOLS:
 
         chain      = schwab.get_option_chain(symbol)
         expiry     = chain['expiry']
-        levels     = compute_oi_levels(chain, prev_close)
-        snap       = get_top_oi_snapshot(chain, prev_close)
+        levels     = compute_oi_levels(chain, pm_price)
+        snap       = get_top_oi_snapshot(chain, pm_price)
         sentiment  = compute_sentiment(chain, pm_price, prev_close)
 
         # ── Postgres ──
         db.save_option_chain(
             symbol=symbol, snap_date=today, snap_time=now,
             expiry_date=expiry, contracts=chain['all'],
-            underlying_price=prev_close,
+            underlying_price=pm_price,
         )
         db.save_oi_levels(symbol, today, now, levels)
         db.save_morning_sentiment(symbol, today, sentiment['pc_ratio'], sentiment['bias'], now)
 
         # ── Google Sheets ──
-        sheets.log_daily_levels(symbol, levels, prev_close, now)
+        sheets.log_daily_levels(symbol, levels, pm_price, now)
         sheets.log_oi_snapshot(
             symbol=symbol, expiry=expiry,
             top_calls=snap['top_calls'], top_puts=snap['top_puts'],
-            underlying_price=prev_close, snap_time=now,
+            underlying_price=pm_price, snap_time=now,
         )
         sheets.log_morning_sentiment(sentiment, now)
         sheets.log_comparison_row(
             symbol=symbol, expiry=expiry,
-            underlying_price=prev_close, levels=levels,
+            underlying_price=pm_price, levels=levels,
             snap=snap, computed_at=now,
         )
 

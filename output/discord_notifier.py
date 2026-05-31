@@ -4,7 +4,7 @@ Discord notification layer — signal alerts and morning briefing.
 Uses Discord incoming webhooks (no bot token required).
 Configure in .env:
   DISCORD_WEBHOOK_URL          — receives intraday signal alerts
-  DISCORD_MORNING_WEBHOOK_URL  — receives the 8:10 AM briefing
+  DISCORD_MORNING_WEBHOOK_URL  — receives the 8:20 AM briefing
                                  (falls back to DISCORD_WEBHOOK_URL if not set)
 
 Both can point to the same channel or different ones.
@@ -48,12 +48,31 @@ def _post(url: str, payload: dict) -> None:
 
 # ── Signal alert ──────────────────────────────────────────────────────────────
 
+def _fmt_level(price: Optional[float]) -> str:
+    """Format a price level: drop .0 for whole numbers, keep .5 for halves."""
+    if price is None:
+        return 'n/a'
+    if price == int(price):
+        return str(int(price))
+    return f"{price:.1f}" if round(price % 1, 2) in (0.5, 0.25, 0.75) else f"{price:.2f}"
+
+
+def _fmt_stop(entry: Optional[float]) -> str:
+    """50% of entry price, expressed as cents or dollars."""
+    if not entry:
+        return 'n/a'
+    stop = round(entry * 0.5, 2)
+    if stop < 1.0:
+        return f"{int(round(stop * 100))} cents"
+    return f"${stop:.2f}"
+
+
 def send_signal(sig: dict) -> None:
     """
-    Send a fired signal as a colour-coded Discord embed.
+    Send a fired signal as a compact two-line Discord embed.
 
-    Green  = BULLISH (call at support)
-    Red    = BEARISH (put at resistance)
+    Line 1:  📈 TSLA 440C  2.15  5/29 @10:30
+    Line 2:  Spot 440.29  |  Exit 1/2 @ R1 442.5  |  Exit 1/2 @ R2 445  |  Stoploss 80 cents
     """
     url = config.DISCORD_WEBHOOK_URL
     if not url:
@@ -64,74 +83,84 @@ def send_signal(sig: dict) -> None:
     colour      = _GREEN if signal_type == 'BULLISH' else _RED
     arrow       = '📈' if signal_type == 'BULLISH' else '📉'
 
-    opt_char = 'C' if sig.get('option_type') == 'CALL' else 'P'
+    # ── Line 1: symbol  strike+side  entry_price  expiry @time ───────────────
+    price_to_enter = sig.get('price_to_enter')
+    enter_str  = f"{price_to_enter:.2f}" if price_to_enter else 'n/a'
+
+    strike     = sig.get('level_price')
+    opt_type   = sig.get('option_type', '')
+    side_char  = 'C' if opt_type == 'CALL' else 'P' if opt_type == 'PUT' else ''
+    strike_str = f"{_fmt_level(strike)}{side_char}" if strike else ''
+
     expiry   = sig.get('expiry')
-    expiry_s = expiry.strftime('%m/%d') if expiry else ''
-    strike   = sig.get('level_price', '')
-    contract = f"{symbol} {strike}{opt_char} {expiry_s}".strip()
-
-    enter = f"${sig['price_to_enter']:.2f}" if sig.get('price_to_enter') else 'n/a'
-    exit_ = f"${sig['price_to_exit']:.2f}"  if sig.get('price_to_exit')  else 'n/a'
-    spot  = f"${sig.get('trigger_price', 0):.2f}"
-
-    room_pct   = sig.get('room_pct')
-    room_str   = f"{room_pct * 100:.2f}%" if room_pct else '∞'
-    room_score = sig.get('room_score', '')
-
-    pc_ratio     = sig.get('pc_ratio')
-    pc_conviction = sig.get('pc_conviction', 'NEUTRAL')
-    pc_emoji     = _CONVICTION_EMOJI.get(pc_conviction, '⚪')
-    pc_str = (
-        f"{pc_emoji} {pc_conviction}  P/C={pc_ratio:.3f}"
-        if pc_ratio is not None else f"{pc_emoji} {pc_conviction}"
-    )
-
-    spread = sig.get('spread_pct')
-    spread_str = f"{spread * 100:.1f}%" if spread is not None else 'n/a'
-
-    atm_1m = sig.get('atm_vol_1m', 0)
-    itm_1m = sig.get('itm_vol_1m', 0)
-    atm_3m = sig.get('atm_vol_3m', 0)
-    itm_3m = sig.get('itm_vol_3m', 0)
-
-    hl_flag = sig.get('option_hl_flag')
-    hl_emoji = {'AT_HIGH': '🔴', 'NEAR_HIGH': '🟠', 'AT_LOW': '🟢', 'NEAR_LOW': '🔵'}.get(hl_flag, '')
-
-    fields = [
-        {"name": "Spot Price",    "value": spot,                                "inline": True},
-        {"name": "Enter (Ask)",   "value": enter,                               "inline": True},
-        {"name": "Exit Target",   "value": exit_,                               "inline": True},
-        {"name": "ATM Vol",       "value": f"1m={atm_1m}  3m={atm_3m}",        "inline": True},
-        {"name": "ITM Vol",       "value": f"1m={itm_1m}  3m={itm_3m}",        "inline": True},
-        {"name": "Spread",        "value": spread_str,                          "inline": True},
-        {"name": "Target Room",   "value": f"{room_str}  [score {room_score}]", "inline": True},
-        {"name": "PC Conviction", "value": pc_str,                              "inline": True},
-    ]
-    if hl_flag:
-        fields.append({"name": "Option H/L", "value": f"{hl_emoji} {hl_flag}", "inline": True})
+    expiry_s = f"{expiry.month}/{expiry.day}" if expiry else ''
 
     sig_time = sig.get('signal_time')
+    if isinstance(sig_time, datetime):
+        h = sig_time.hour % 12 or 12
+        time_str = f"{h}:{sig_time.minute:02d}"
+    else:
+        time_str = ''
+
+    line1 = f"{arrow} **{symbol} {strike_str}  {enter_str}  {expiry_s} @{time_str}**"
+
+    # ── Line 2: exits and stoploss ─────────────────────────────────────────────
+    exit1 = sig.get('exit1_price')
+    exit2 = sig.get('exit2_price')
+    lbl1, lbl2 = ('R1', 'R2') if signal_type == 'BULLISH' else ('S1', 'S2')
+
+    spot = sig.get('trigger_price')
+
+    parts: list[str] = []
+    if spot is not None:
+        parts.append(f"Spot {spot:.2f}")
+    if exit1 is not None:
+        parts.append(f"Exit 1/2 @ {lbl1} {_fmt_level(exit1)}")
+    if exit2 is not None:
+        parts.append(f"Exit 1/2 @ {lbl2} {_fmt_level(exit2)}")
+    parts.append(f"Stoploss {_fmt_stop(price_to_enter)}")
+    line2 = '  |  '.join(parts)
+
+    # ── Line 3: volume detail ──────────────────────────────────────────────────
+    atm_vol   = sig.get('atm_vol_1m')
+    atm_ratio = sig.get('atm_spike_ratio')
+    itm_vol   = sig.get('itm_vol_1m')
+    itm_ratio = sig.get('itm_spike_ratio')
+
+    vol_parts: list[str] = []
+    if atm_vol is not None:
+        ratio_s = f" x{atm_ratio:.1f}" if atm_ratio else ''
+        vol_parts.append(f"ATM Vol {atm_vol:,}{ratio_s}")
+    if itm_vol is not None:
+        ratio_s = f" x{itm_ratio:.1f}" if itm_ratio else ''
+        vol_parts.append(f"ITM Vol {itm_vol:,}{ratio_s}")
+    line3 = '  |  '.join(vol_parts)
+
+    # ── Assemble and send ──────────────────────────────────────────────────────
+    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
-    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
+    body = f"{prefix}{line1}\n\n{line2}"
+    if line3:
+        body += f"\n\n{line3}"
+
     payload = {
         "embeds": [{
-            "title":  f"{prefix}{arrow} {signal_type} — {contract}",
+            "description": body,
             "color":  colour,
-            "fields": fields,
             "footer": {"text": "Jakevolume 0DTE" + (" — SAMPLE ONLY" if config.SAMPLE_MODE else "")},
             **({"timestamp": ts} if ts else {}),
         }]
     }
     _post(url, payload)
-    logger.info("Discord: signal sent  %s %s  enter=%s", symbol, signal_type, enter)
+    logger.info("Discord: signal sent  %s %s  enter=%s", symbol, signal_type, enter_str)
 
 
 # ── Morning briefing ──────────────────────────────────────────────────────────
 
 def send_morning_briefing(results: list, now: datetime) -> None:
     """
-    Send the 8:10 AM morning briefing as a single Discord message.
+    Send the 8:20 AM morning briefing as a single Discord message.
 
     `results` is the list built in run_morning_snapshot.py / morning_snapshot():
     each item has keys: symbol, prev_close, pm_price, expiry, supports,

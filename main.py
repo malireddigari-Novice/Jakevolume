@@ -20,7 +20,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 import config
@@ -40,8 +40,6 @@ from output.sheets_logger import SheetsLogger
 from output.discord_notifier import (
     send_signal as discord_signal,
     send_morning_briefing as discord_briefing,
-    send_trade_alert as discord_trade,
-    send_exit_alert as discord_exit,
 )
 
 
@@ -70,7 +68,7 @@ logger = logging.getLogger('jakevolume.main')
 
 def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
     """
-    Run the daily 08:10 CST setup using Schwab for option chains, quotes, and prices.
+    Run the daily 08:20 CST setup using Schwab for option chains, quotes, and prices.
     """
     now   = now_cst()
     today = today_cst()
@@ -90,11 +88,11 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
             chain  = schwab.get_option_chain(symbol)
             expiry = chain['expiry']
 
-            # OI levels anchored to prev_close (not pre-market price)
-            levels = compute_oi_levels(chain, prev_close)
+            # OI levels anchored to the 8:20 AM spot price (pre-market)
+            levels = compute_oi_levels(chain, pm_price)
 
             # Top-3 OI snapshot
-            snap = get_top_oi_snapshot(chain, prev_close)
+            snap = get_top_oi_snapshot(chain, pm_price)
 
             # Sentiment (pre-market drift + put/call OI ratio)
             sentiment = compute_sentiment(chain, pm_price, prev_close)
@@ -108,26 +106,26 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
                 snap_time=now,
                 expiry_date=expiry,
                 contracts=chain['all'],
-                underlying_price=prev_close,
+                underlying_price=pm_price,
             )
             db.save_oi_levels(symbol, today, now, levels)
             db.save_morning_sentiment(symbol, today, sentiment['pc_ratio'], sentiment['bias'], now)
 
             # ── Log to Google Sheets ──
-            sheets.log_daily_levels(symbol, levels, prev_close, now)
+            sheets.log_daily_levels(symbol, levels, pm_price, now)
             sheets.log_oi_snapshot(
                 symbol=symbol,
                 expiry=expiry,
                 top_calls=snap['top_calls'],
                 top_puts=snap['top_puts'],
-                underlying_price=prev_close,
+                underlying_price=pm_price,
                 snap_time=now,
             )
             sheets.log_morning_sentiment(sentiment, now)
             sheets.log_comparison_row(
                 symbol=symbol,
                 expiry=expiry,
-                underlying_price=prev_close,
+                underlying_price=pm_price,
                 levels=levels,
                 snap=snap,
                 computed_at=now,
@@ -160,6 +158,13 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
         for s in sentiments
     ]
     discord_briefing(discord_results, now)
+
+    # Retention: keep only the most recent N trading days of 1-min bar data.
+    # Runs once per trading day here; alerts/signals are never pruned.
+    try:
+        db.prune_old_bars(config.BAR_RETENTION_DAYS)
+    except Exception:
+        logger.warning("Bar retention prune failed", exc_info=True)
 
     logger.info("═══ MORNING SNAPSHOT COMPLETE ═══")
 
@@ -234,11 +239,15 @@ def intraday_check(
 
     for symbol in config.SYMBOLS:
         try:
-            # 1-min equity bars — Schwab primary, Databento fallback
+            # 1-min equity bars — Schwab primary, Databento fallback.
+            # Schwab path pulls the full session so cumulative volume is correct;
+            # the signal detector still sees only the trailing BARS_TO_FETCH slice.
             if schwab:
-                bars = schwab.get_bars(symbol)
+                session_bars = schwab.get_bars(symbol, count=config.SESSION_BARS)
+                bars = session_bars[-config.BARS_TO_FETCH:] if session_bars else []
             elif dbc:
                 bars = dbc.get_bars(symbol)
+                session_bars = bars
             else:
                 logger.warning("%s: no data source available for bars", symbol)
                 continue
@@ -247,7 +256,10 @@ def intraday_check(
                 logger.warning("%s: no bars returned", symbol)
                 continue
 
-            db.save_bars(symbol, bars)
+            # Persist 7 fields/bar: OHLC, volume (per-min), spot_price, cum_volume.
+            # cum_volume is only valid on the Schwab full-session pull; the
+            # Databento rolling buffer is partial → store NULL cum_volume.
+            db.save_bars(symbol, session_bars, full_session=bool(schwab))
             underlying_price = bars[-1]['close']
 
             # Load today's OI-derived S/R levels
@@ -268,8 +280,9 @@ def intraday_check(
                 elif dbc:
                     expiry = dbc.get_nearest_expiry(symbol)
                 if schwab and expiry:
+                    # n=3 so a genuine ATM + in-the-money strike pair is available
                     option_quotes = schwab.get_watched_contracts(
-                        symbol, expiry, underlying_price, n=2
+                        symbol, expiry, underlying_price, n=3
                     )
                     logger.debug(
                         "%s: watched contracts near %.2f — %d quotes (expiry %s)",
@@ -282,22 +295,43 @@ def intraday_check(
             except Exception:
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
+            # Next-day mode (no 0DTE today): pull the full chain so the detector
+            # can price the OTM target strike. Only on Schwab, only when needed.
+            chain_quotes = None
+            if (schwab and expiry and config.NEXT_DAY_MODE_ENABLED and expiry > today):
+                try:
+                    chain_quotes = schwab.get_option_chain_full(symbol, expiry)
+                except Exception:
+                    logger.warning("%s: full chain fetch failed (next-day OTM strike)", symbol)
+
+            # Per-minute 1-min OHLCV for the 6 S/R level option contracts
+            if schwab and config.COLLECT_LEVEL_BARS and expiry:
+                try:
+                    _collect_level_bars(symbol, levels, expiry, today, schwab)
+                except Exception:
+                    logger.warning("%s: level option-bar collection failed", symbol, exc_info=True)
+
             # Morning P/C ratio for conviction multiplier
             pc_ratio = db.get_today_pc_ratio(symbol, today)
 
-            signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry, pc_ratio=pc_ratio)
+            signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
+                                     pc_ratio=pc_ratio, chain_quotes=chain_quotes)
 
             for sig in signals:
                 sig_id = db.save_signal(sig)
                 sheets.log_signal(sig)
                 db.mark_signal_logged(sig_id)
                 _notify_signal(sig)
-                if alpaca and config.ALPACA_ENABLED:
-                    _execute_trade(sig, sig_id, alpaca)
+                # WATCH-only alerts and cluster upgrades are recorded + notified
+                # but never auto-traded (an upgrade's original alert already entered)
+                if (alpaca and config.ALPACA_ENABLED
+                        and sig.get('confidence') != 'WATCH'
+                        and not sig.get('upgrade')):
+                    _execute_trade(sig, sig_id, alpaca, sheets)
 
             # Exit monitoring — check R1/R2 or S1/S2 targets for open trades
             if alpaca and config.ALPACA_ENABLED:
-                check_exits(symbol, underlying_price, alpaca, now_cst())
+                check_exits(symbol, underlying_price, alpaca, now_cst(), sheets, option_quotes, detector)
 
             # Volume cluster positioning monitor (Postgres only, no signals)
             if dbc:
@@ -310,6 +344,42 @@ def intraday_check(
 
         except Exception:
             logger.exception("Intraday check failed for %s", symbol)
+
+
+def _collect_level_bars(symbol, levels, expiry, level_date, schwab) -> None:
+    """
+    Pull and persist 1-min OHLCV for each S/R level's option contract.
+
+    Fetches the full session per contract (self-backfilling across polls) and
+    upserts into option_level_bars. All 6 levels share the nearest expiry, which
+    the morning snapshot anchored them to.
+    """
+    rows: list[dict] = []
+    for lv in levels:
+        strike      = float(lv['strike'])
+        option_type = lv['option_type']
+        occ         = occ_symbol(symbol, expiry, strike, option_type)
+        obars       = schwab.get_option_bars(occ, count=config.SESSION_BARS)
+        for b in obars:
+            rows.append({
+                'symbol':      symbol,
+                'level_date':  level_date,
+                'level_type':  lv['level_type'],
+                'rank':        lv['rank'],
+                'strike':      strike,
+                'option_type': option_type,
+                'expiry':      expiry,
+                'occ_symbol':  occ,
+                'bar_time':    b['bar_time'],
+                'open':        b['open'],
+                'high':        b['high'],
+                'low':         b['low'],
+                'close':       b['close'],
+                'volume':      b['volume'],
+            })
+
+    db.save_option_level_bars(rows)
+    logger.debug("%s: saved %d option-level bars across %d levels", symbol, len(rows), len(levels))
 
 
 # ── Desktop notification ──────────────────────────────────────────────────────
@@ -337,7 +407,7 @@ def _notify_signal(sig: dict) -> None:
 
 # ── Alpaca trade execution ────────────────────────────────────────────────────
 
-def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
+def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsLogger) -> None:
     """
     Place a buy-to-open option order on Alpaca, computing exit targets from today's levels.
 
@@ -351,7 +421,8 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
     symbol      = sig.get('symbol', '')
     price       = sig.get('price_to_enter')
     expiry      = sig.get('expiry')
-    strike      = sig.get('level_price')
+    # In next-day mode the traded contract is the OTM target strike, not the level.
+    strike      = sig.get('traded_strike') or sig.get('level_price')
     option_type = sig.get('option_type')
     signal_type = sig.get('signal_type', '')
 
@@ -360,6 +431,11 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
         return
     if not expiry:
         logger.warning("Alpaca: trade skipped for %s — no expiry in signal", symbol)
+        return
+    # Next-day mode without a resolved OTM target strike → alert only, no trade
+    # (we couldn't price the intended OTM contract from the chain).
+    if sig.get('day_mode') == 'NEXT_DAY' and not sig.get('target_level'):
+        logger.warning("Alpaca: trade skipped for %s — next-day OTM strike unresolved", symbol)
         return
 
     open_pos = alpaca.open_position_count()
@@ -379,26 +455,30 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
         )
         return
 
-    # ── Determine exit targets from today's OI levels ──
-    exit1_underlying = exit2_underlying = None
-    try:
-        levels = db.get_today_levels(symbol, today_cst())
-        if signal_type == 'BULLISH':
+    # ── Exit targets: use the signal's own targets so the next-day level flip is
+    # honored (the detector already picked position-based exits). Fall back to
+    # rank-ordered morning levels only if the signal didn't carry them. ──
+    exit1_underlying = sig.get('exit1_price')
+    exit2_underlying = sig.get('exit2_price')
+    if exit1_underlying is None:
+        try:
+            levels = db.get_today_levels(symbol, today_cst())
+            opp = 'RESISTANCE' if signal_type == 'BULLISH' else 'SUPPORT'
             targets = sorted(
-                [lv for lv in levels if lv['level_type'] == 'RESISTANCE'],
+                [lv for lv in levels if lv['level_type'] == opp],
                 key=lambda x: x['rank'],
             )
-        else:
-            targets = sorted(
-                [lv for lv in levels if lv['level_type'] == 'SUPPORT'],
-                key=lambda x: x['rank'],
-            )
-        if len(targets) >= 1:
-            exit1_underlying = float(targets[0]['strike'])
-        if len(targets) >= 2:
-            exit2_underlying = float(targets[1]['strike'])
-    except Exception:
-        logger.warning("Alpaca: could not resolve exit targets for %s", symbol, exc_info=True)
+            if len(targets) >= 1:
+                exit1_underlying = float(targets[0]['strike'])
+            if len(targets) >= 2:
+                exit2_underlying = float(targets[1]['strike'])
+        except Exception:
+            logger.warning("Alpaca: could not resolve exit targets for %s", symbol, exc_info=True)
+
+    # No defined exit target → no risk-managed exit → don't enter (alert only).
+    if exit1_underlying is None:
+        logger.warning("Alpaca: trade skipped for %s — no exit target available", symbol)
+        return
 
     exit1_qty = qty // 2
     exit2_qty = qty - exit1_qty   # remaining (handles odd numbers)
@@ -430,11 +510,12 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient) -> None:
             'exit2_underlying':  exit2_underlying,
             'exit1_qty':         exit1_qty,
             'exit2_qty':         exit2_qty,
+            'stoploss_price':    round(price * 0.5, 4),
+            'strike':            strike,
+            'option_type':       option_type,
+            'expiry':            expiry,
         })
-        try:
-            discord_trade(order, sig, qty, spend)
-        except Exception:
-            logger.warning("Discord trade alert failed", exc_info=True)
+        sheets.log_trade_entry(order, sig, qty, spend)
 
 
 def check_exits(
@@ -442,20 +523,48 @@ def check_exits(
     underlying_price: float,
     alpaca: AlpacaClient,
     now: datetime,
+    sheets: SheetsLogger,
+    option_quotes: dict,
+    detector: SignalDetector,
 ) -> None:
     """
-    For every open trade on this symbol, check whether the underlying has
-    reached the exit targets and fire partial sell orders accordingly.
-
-    BULLISH: exit1 when price >= R1, exit2 when price >= R2 (after exit1 filled)
-    BEARISH: exit1 when price <= S1, exit2 when price <= S2 (after exit1 filled)
+    For every open trade on this symbol:
+      1. Stoploss — if option mark drops to/below stoploss_price, close the position.
+      2. Exit 1   — close half at R1/S1; move stoploss to breakeven.
+                    Then check opposite-side volume at the target level:
+                    → If opposite-side active (TrueCluster-level): close remainder early.
+                    → If not: hold remainder for Exit 2.
+      3. Exit 2   — close remainder at R2/S2 price target, OR earlier if opposite-side
+                    volume validates at the exit1 level in a subsequent bar.
     """
     trades = db.get_open_trades(symbol)
     for trade in trades:
         sig_type = trade.get('signal_type', '')
         occ      = trade['occ_symbol']
 
-        # ── Exit 1 ──────────────────────────────────────────────────────────
+        # ── Stoploss check (option mark vs stored stoploss_price) ────────────
+        stoploss_price = trade.get('stoploss_price')
+        if stoploss_price is not None and option_quotes:
+            strike   = trade.get('strike')
+            opt_type = trade.get('option_type')
+            if strike and opt_type:
+                quote = option_quotes.get((float(strike), opt_type))
+                if quote:
+                    current_mark = quote.get('mark') or quote.get('ask') or 0
+                    if current_mark and current_mark <= float(stoploss_price):
+                        remaining_qty = trade['exit2_qty'] if trade['exit1_filled'] else trade['qty']
+                        logger.info(
+                            "Stoploss triggered  %s  mark=%.2f  stop=%.2f  qty=%d",
+                            occ, current_mark, float(stoploss_price), remaining_qty,
+                        )
+                        order = alpaca.close_position_qty(occ, remaining_qty)
+                        if order:
+                            db.mark_trade_stopped(trade['id'], now)
+                            label = f"Stoploss ${float(stoploss_price):.2f}"
+                            sheets.log_trade_exit(order, dict(trade), label, underlying_price)
+                        continue  # skip exit target checks for this trade
+
+        # ── Exit 1 ───────────────────────────────────────────────────────────
         if not trade['exit1_filled'] and trade.get('exit1_underlying'):
             target = float(trade['exit1_underlying'])
             hit = (
@@ -463,6 +572,8 @@ def check_exits(
                 (sig_type == 'BEARISH' and underlying_price <= target)
             )
             if hit:
+                r1_label = 'R1' if sig_type == 'BULLISH' else 'S1'
+                r2_label = 'R2' if sig_type == 'BULLISH' else 'S2'
                 logger.info(
                     "Exit1 triggered  %s  spot=%.2f  target=%.2f  qty=%d",
                     occ, underlying_price, target, trade['exit1_qty'],
@@ -470,56 +581,126 @@ def check_exits(
                 order = alpaca.close_position_qty(occ, trade['exit1_qty'])
                 if order:
                     db.mark_exit1_filled(trade['id'], now)
-                    label = f"Exit 1/2 @ {'R1' if sig_type=='BULLISH' else 'S1'}"
-                    try:
-                        discord_exit(order, dict(trade), label, underlying_price)
-                    except Exception:
-                        logger.warning("Discord exit alert failed", exc_info=True)
+                    new_stop = float(trade['limit_price'])
+                    db.update_stoploss(trade['id'], new_stop)
+                    stop_str = f"${new_stop:.2f}" if new_stop >= 1 else f"{int(new_stop * 100)}¢"
+                    label    = f"Exit 1/2 @ {r1_label}  |  Stop → {stop_str} (breakeven)"
+                    sheets.log_trade_exit(order, dict(trade), label, underlying_price)
 
-        # ── Exit 2 — only after exit1 is confirmed ──────────────────────────
+                    # Opposite-side volume validation — may trigger early exit2
+                    exit2_qty = trade.get('exit2_qty') or 0
+                    if exit2_qty > 0 and option_quotes:
+                        opp_valid = detector.check_opposite_side(
+                            symbol, sig_type, option_quotes, target,
+                        )
+                        if opp_valid:
+                            logger.info(
+                                "OppSide validated at %s %.2f — early exit2  %s  qty=%d",
+                                r1_label, target, occ, exit2_qty,
+                            )
+                            order2 = alpaca.close_position_qty(occ, exit2_qty)
+                            if order2:
+                                db.mark_exit2_filled(trade['id'], now)
+                                sheets.log_trade_exit(
+                                    order2, dict(trade),
+                                    f"Exit 2/2 @ {r2_label} (opp-side early)",
+                                    underlying_price,
+                                )
+                            if config.FLIP_ENABLED:
+                                logger.info(
+                                    "FLIP_ENABLED: opp-side confirmed at %s %.2f"
+                                    " — flip not implemented",
+                                    r1_label, target,
+                                )
+                        else:
+                            logger.info(
+                                "OppSide not active at %s %.2f — holding %s  qty=%d  for %s",
+                                r1_label, target, occ, exit2_qty, r2_label,
+                            )
+
+        # ── Exit 2 — after exit 1 filled; price target OR opposite-side vol ──
         elif trade['exit1_filled'] and not trade['exit2_filled'] and trade.get('exit2_underlying'):
-            target = float(trade['exit2_underlying'])
-            hit = (
-                (sig_type == 'BULLISH' and underlying_price >= target) or
-                (sig_type == 'BEARISH' and underlying_price <= target)
+            target2  = float(trade['exit2_underlying'])
+            target1  = float(trade['exit1_underlying']) if trade.get('exit1_underlying') else 0.0
+            r2_label = 'R2' if sig_type == 'BULLISH' else 'S2'
+
+            price_hit = (
+                (sig_type == 'BULLISH' and underlying_price >= target2) or
+                (sig_type == 'BEARISH' and underlying_price <= target2)
             )
-            if hit:
+
+            # Still watching opposite side at exit1 level each bar
+            opp_valid = False
+            if option_quotes and target1:
+                opp_valid = detector.check_opposite_side(
+                    symbol, sig_type, option_quotes, target1,
+                )
+
+            if price_hit or opp_valid:
+                trigger_reason = 'price' if price_hit else 'opp-side'
                 logger.info(
-                    "Exit2 triggered  %s  spot=%.2f  target=%.2f  qty=%d",
-                    occ, underlying_price, target, trade['exit2_qty'],
+                    "Exit2 triggered (%s)  %s  spot=%.2f  target=%.2f  qty=%d",
+                    trigger_reason, occ, underlying_price, target2, trade['exit2_qty'],
                 )
                 order = alpaca.close_position_qty(occ, trade['exit2_qty'])
                 if order:
                     db.mark_exit2_filled(trade['id'], now)
-                    label = f"Exit 2/2 @ {'R2' if sig_type=='BULLISH' else 'S2'}"
-                    try:
-                        discord_exit(order, dict(trade), label, underlying_price)
-                    except Exception:
-                        logger.warning("Discord exit alert failed", exc_info=True)
+                    suffix = ' (opp-side early)' if opp_valid and not price_hit else ''
+                    label  = f"Exit 2/2 @ {r2_label}{suffix}"
+                    sheets.log_trade_exit(order, dict(trade), label, underlying_price)
+                    if opp_valid and config.FLIP_ENABLED:
+                        logger.info(
+                            "FLIP_ENABLED: opp-side confirmed at %s — flip not implemented",
+                            r2_label,
+                        )
 
 
-def eod_liquidate(alpaca: AlpacaClient, now: datetime) -> None:
+def eod_liquidate(alpaca: AlpacaClient, now: datetime, sheets: SheetsLogger) -> None:
     """
-    Close every open option position at market (14:55 CST).
-    Marks all remaining open trades as eod_closed in the DB.
+    Close positions at 14:55 CST.
+
+    0DTE (expiry == today or None) is always closed. Next-day+ positions are also
+    closed when EOD_CLOSE_NEXT_DAY is set (default: keep EOD close, no overnight
+    hold); otherwise they're left open for the next session.
     """
+    today = today_cst()
     logger.info("EOD liquidation starting at %s", now.strftime('%H:%M CST'))
-    count = alpaca.close_all_positions()
 
     open_trades = db.get_open_trades()
-    for trade in open_trades:
-        db.mark_trade_eod_closed(trade['id'], now)
-        try:
-            discord_exit(
-                {'id': 'eod', 'qty': trade['exit2_qty'] or trade['exit1_qty']},
-                dict(trade),
-                'EOD Close',
-                0.0,
-            )
-        except Exception:
-            pass
+    closed = skipped = 0
 
-    logger.info("EOD liquidation complete — %d position(s) closed", count)
+    for trade in open_trades:
+        expiry = trade.get('expiry')
+        # expiry stored as date; if None treat as 0DTE (legacy rows)
+        if expiry is not None and expiry > today and not config.EOD_CLOSE_NEXT_DAY:
+            logger.info(
+                "EOD: skipping %s — expiry %s is next-day+ (EOD_CLOSE_NEXT_DAY off)",
+                trade['occ_symbol'], expiry,
+            )
+            skipped += 1
+            continue
+
+        # 0DTE — close the remaining qty
+        remaining_qty = 0
+        if not trade['exit1_filled']:
+            remaining_qty = trade['qty']
+        elif not trade['exit2_filled']:
+            remaining_qty = trade['exit2_qty'] or 0
+
+        if remaining_qty > 0:
+            order = alpaca.close_position_qty(trade['occ_symbol'], remaining_qty)
+        else:
+            order = None
+
+        db.mark_trade_eod_closed(trade['id'], now)
+        eod_order = order or {'id': 'eod', 'qty': remaining_qty}
+        sheets.log_trade_exit(eod_order, dict(trade), 'EOD Close', 0.0)
+        closed += 1
+
+    logger.info(
+        "EOD liquidation complete — %d closed, %d next-day position(s) left open",
+        closed, skipped,
+    )
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -633,7 +814,8 @@ def main() -> None:
     eod_done:  date | None = None   # guard: run EOD liquidation only once per day
 
     logger.info(
-        "Loop running. Snapshot @ 08:10 CST | Market hours 08:30–15:00 CST"
+        "Loop running. Snapshot @ %02d:%02d CST | Market hours 08:30–15:00 CST",
+        config.SNAPSHOT_HOUR, config.SNAPSHOT_MINUTE,
     )
 
     while True:
@@ -655,7 +837,7 @@ def main() -> None:
 
             # EOD liquidation — 14:55 CST, once per day
             if alpaca and config.ALPACA_ENABLED and is_eod_window(now) and eod_done != now.date():
-                eod_liquidate(alpaca, now)
+                eod_liquidate(alpaca, now, sheets)
                 eod_done = now.date()
 
         except Exception:
