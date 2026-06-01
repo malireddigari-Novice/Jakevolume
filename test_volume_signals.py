@@ -111,22 +111,35 @@ if sigB:
     check("B: confidence MEDIUM_HIGH (rank 2)", s['confidence'] == 'MEDIUM_HIGH')
 
 # Scenario C: single print fires first, then a cluster forms on BOTH sides and
-# UPGRADES to HIGH/ATM_ITM_CLUSTER (fresh alert, upgrade=True). A later HIGH does
-# not re-fire.
+# UPGRADES to HIGH/ATM_ITM_CLUSTER. The upgrade follow-up only emits when
+# EMIT_UPGRADE_ALERT is on (default off: one call symbol per ticker).
 d_atm = [10] * 10 + [500] + [180] * 6     # ATM: one extreme print, then sustained
 d_itm = [10] * 11 + [180] * 6             # ITM: quiet, then joins the pressure
-sigs = run(d_atm, d_itm, collect=True)
-check("C: at least two alerts (single + upgrade)", len(sigs) >= 2)
+
+# Default (EMIT_UPGRADE_ALERT off): only the first alert, no HIGH follow-up.
+sigs_off = run(d_atm, d_itm, collect=True)
+check("C: default off: exactly one alert (one call symbol)", len(sigs_off) == 1)
+check("C: default off: no HIGH follow-up",
+      all(s['confidence'] != 'HIGH' for s in sigs_off))
+
+# With EMIT_UPGRADE_ALERT on: single print, then one HIGH upgrade (alert only).
+config.EMIT_UPGRADE_ALERT = True
+try:
+    sigs = run(d_atm, d_itm, collect=True)
+finally:
+    config.EMIT_UPGRADE_ALERT = False
+check("C: upgrade on: at least two alerts (single + upgrade)", len(sigs) >= 2)
 if sigs:
     check("C: first alert is EXTREME_SINGLE_PRINT",
           sigs[0]['signal_shape'] == 'EXTREME_SINGLE_PRINT' and sigs[0]['upgrade'] is False)
 highs = [s for s in sigs if s['confidence'] == 'HIGH']
-check("C: exactly one HIGH upgrade fires (no re-fire)", len(highs) == 1)
+check("C: upgrade on: exactly one HIGH upgrade (no re-fire)", len(highs) == 1)
 if highs:
     check("C: upgrade flagged + ATM_ITM_CLUSTER",
           highs[0]['upgrade'] is True and highs[0]['signal_shape'] == 'ATM_ITM_CLUSTER')
 
-# Scenario D: with upgrades disabled, the HIGH cluster must NOT supersede.
+# Scenario D: upgrades disabled entirely → never a HIGH follow-up.
+config.EMIT_UPGRADE_ALERT = True
 config.CLUSTER_UPGRADE_ENABLED = False
 try:
     sigs_d = run(d_atm, d_itm, collect=True)
@@ -134,6 +147,7 @@ try:
           all(s['confidence'] != 'HIGH' for s in sigs_d))
 finally:
     config.CLUSTER_UPGRADE_ENABLED = True
+    config.EMIT_UPGRADE_ALERT = False
 
 print()
 print("ALL PASS" if _fail == 0 else f"{_fail} FAILURE(S)")

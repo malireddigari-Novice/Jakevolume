@@ -256,11 +256,36 @@ def intraday_check(
                 logger.warning("%s: no bars returned", symbol)
                 continue
 
+            # ── Staleness guard — never act on stale/previous-session data ──
+            latest_bt = bars[-1]['bar_time']
+            age_sec   = (now_cst() - latest_bt).total_seconds()
+            if latest_bt.date() != today or age_sec > config.MAX_BAR_AGE_SECONDS:
+                logger.warning(
+                    "%s: STALE bars — latest %s (%.0fs old) — skipping symbol",
+                    symbol, latest_bt.strftime('%Y-%m-%d %H:%M CST'), age_sec,
+                )
+                continue
+
             # Persist 7 fields/bar: OHLC, volume (per-min), spot_price, cum_volume.
             # cum_volume is only valid on the Schwab full-session pull; the
             # Databento rolling buffer is partial → store NULL cum_volume.
             db.save_bars(symbol, session_bars, full_session=bool(schwab))
+
+            # ── Live spot from a real-time quote (freshest tick) ──
+            # The last *completed* candle lags up to a minute; use the live last
+            # price for the spot and fall back to the bar close only on failure.
             underlying_price = bars[-1]['close']
+            if schwab:
+                try:
+                    q = schwab.get_quote(symbol)
+                    if q and q.get('price'):
+                        underlying_price = float(q['price'])
+                except Exception:
+                    logger.warning("%s: live quote failed, using last bar close", symbol)
+
+            # The detector reads the latest bar's close as spot — feed it the live
+            # spot (persisted bars keep their true candle close).
+            bars = bars[:-1] + [{**bars[-1], 'close': underlying_price}]
 
             # Load today's OI-derived S/R levels
             levels = db.get_today_levels(symbol, today)

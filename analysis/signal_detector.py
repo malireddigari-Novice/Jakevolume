@@ -275,9 +275,9 @@ class SignalDetector:
     def __init__(self) -> None:
         # Hold enough bars for a 5-bar window plus its prior-10 baseline.
         self._hist_maxlen = config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK
-        # Per-level fire log: (symbol, signal_type, strike) → (last_fire_time, rank).
-        # Drives the cooldown + upgrade logic (WATCH alerts share the same log).
-        self._last_fired:   dict[tuple, tuple]   = {}
+        # One alert per direction per ticker per day: (symbol, signal_type) → best
+        # confidence rank fired. Yields at most one CALL and one PUT symbol/ticker.
+        self._fired_today:  dict[_FiredKey, int] = {}
         self._prev_opt_vol: dict[_OptKey, int]   = {}
         self._opt_vol_hist: dict[_OptKey, deque] = defaultdict(
             lambda: deque(maxlen=self._hist_maxlen)
@@ -325,7 +325,7 @@ class SignalDetector:
         # Reset intraday state on a new trading day
         if self._history_date != today:
             self._history_date   = today
-            self._last_fired     = {}
+            self._fired_today    = {}
             self._prev_opt_vol   = {}
             self._opt_vol_hist   = defaultdict(lambda: deque(maxlen=self._hist_maxlen))
             self._opt_mark_low   = {}
@@ -555,13 +555,13 @@ class SignalDetector:
             )
             candidates.append((signal, actionable))
 
-        # ── Select one alert this bar from the eligible candidates ────────────
-        # Dedup is per LEVEL with a cooldown (not once-per-direction-per-day), so
-        # successive bounces at different levels (S3→S2→S1) each alert. Within a
-        # level's cooldown only a strictly higher-confidence upgrade gets through.
+        # ── Select one alert this bar — at most one CALL and one PUT per ticker ──
+        # Dedup is per DIRECTION per day (not per level), so the best bullish setup
+        # yields a single call symbol and the best bearish setup a single put
+        # symbol. Across the day's levels we keep the strongest, not one each.
         eligible: list[tuple[dict, bool, bool]] = []   # (sig, actionable, is_upgrade)
         for sig, actionable in candidates:
-            decision, is_upgrade = self._fire_decision(sig, bar_time)
+            decision, is_upgrade = self._fire_decision(sig)
             if decision != 'skip':
                 eligible.append((sig, actionable, is_upgrade))
         if not eligible:
@@ -574,42 +574,35 @@ class SignalDetector:
             pool, key=lambda e: (_CONF_RANK[e[0]['confidence']], e[0]['room_score'])
         )
 
-        key = (symbol, sig['signal_type'], float(sig['level_price']))
-        prev = self._last_fired.get(key)
-        prev_rank = prev[1] if prev else -1
-        self._last_fired[key] = (bar_time, max(_CONF_RANK[sig['confidence']], prev_rank))
+        key: _FiredKey = (symbol, sig['signal_type'])
+        prev_rank = self._fired_today.get(key, -1)
+        self._fired_today[key] = max(_CONF_RANK[sig['confidence']], prev_rank)
         sig['upgrade'] = is_upgrade
         if is_upgrade:
-            logger.info(
-                "UPGRADE  %s %s @%.2f  → %s",
-                symbol, sig['signal_type'], float(sig['level_price']), sig['confidence'],
-            )
+            logger.info("UPGRADE  %s %s  → %s", symbol, sig['signal_type'], sig['confidence'])
         return [sig]
 
-    def _fire_decision(self, sig: dict, now: datetime) -> tuple[str, bool]:
+    def _fire_decision(self, sig: dict) -> tuple[str, bool]:
         """
-        Per-level cooldown + upgrade gate. Returns (action, is_upgrade) where
-        action is 'fire' | 'upgrade' | 'skip'.
-          - never fired this level        → fire
-          - cooldown elapsed              → fire (re-entry)
-          - within cooldown, higher tier  → upgrade (alert only, not re-traded)
-          - within cooldown, same/lower   → skip
+        One alert per direction per day. Returns (action, is_upgrade) where action
+        is 'fire' | 'upgrade' | 'skip'.
+          - never fired this direction         → fire
+          - actionable after a prior WATCH     → fire (the real call/put)
+          - stronger actionable, upgrades on   → upgrade (alert only; not re-traded)
+          - otherwise (already fired)          → skip
+        Result: at most one CALL and one PUT symbol per ticker per day (plus an
+        optional upgrade follow-up when EMIT_UPGRADE_ALERT is enabled).
         """
-        key  = (sig['symbol'], sig['signal_type'], float(sig['level_price']))
+        key  = (sig['symbol'], sig['signal_type'])
         rank = _CONF_RANK[sig['confidence']]
-        prev = self._last_fired.get(key)
+        prev = self._fired_today.get(key)
         if prev is None:
             return 'fire', False
-        prev_time, prev_rank = prev
-        elapsed_min = (now - prev_time).total_seconds() / 60.0
-        if elapsed_min >= config.SIGNAL_COOLDOWN_MINUTES:
-            return 'fire', False
-        if config.CLUSTER_UPGRADE_ENABLED and rank > prev_rank:
-            # An upgrade only when the prior alert was actionable (already entered).
-            # A stronger signal over a prior WATCH is a fresh actionable entry.
-            if prev_rank >= _CONF_RANK['MEDIUM']:
-                return 'upgrade', True
-            return 'fire', False
+        if rank > prev:
+            if prev < _CONF_RANK['MEDIUM']:
+                return 'fire', False          # prior was WATCH → this is the real entry
+            if config.EMIT_UPGRADE_ALERT and config.CLUSTER_UPGRADE_ENABLED:
+                return 'upgrade', True         # optional stronger-signal follow-up
         return 'skip', False
 
     # ── Opposite-side volume validation (for exit state machine) ─────────────

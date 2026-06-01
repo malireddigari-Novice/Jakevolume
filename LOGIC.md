@@ -111,16 +111,16 @@ For **each symbol**:
 
 ---
 
-## F. Fire decision — one alert per bar (`_fire_decision` + selection)
+## F. Fire decision — one CALL + one PUT per ticker (`_fire_decision` + selection)
 
-51. **Per-level cooldown** keyed on `(symbol, direction, level strike)`:
-    - Never fired this level → **fire**.
-    - Cooldown (`SIGNAL_COOLDOWN_MINUTES=30`) elapsed → **fire** (re-entry).
-    - Within cooldown, **strictly higher confidence** and prior was actionable → **upgrade** (fresh alert, flagged so it isn't re-traded).
-    - Within cooldown, actionable over a prior WATCH → **fresh fire** (the watch wasn't traded).
-    - Otherwise → **skip**.
-52. Among eligible candidates this bar, pick **actionable first, then highest confidence, then most room**.
-53. Record the fire (time + rank) for that level; return exactly that one signal.
+51. **One alert per direction per ticker per day**, keyed on `(symbol, direction)`:
+    - Never fired this direction → **fire**.
+    - Actionable after a prior WATCH → **fire** (the real call/put entry).
+    - Stronger same-direction signal, only if `EMIT_UPGRADE_ALERT` is on → **upgrade** (a second alert, flagged so it isn't re-traded).
+    - Otherwise (direction already alerted) → **skip**.
+52. Among eligible candidates this bar, pick **actionable first, then highest confidence, then most room** — so the best bullish setup becomes the single call symbol and the best bearish setup the single put symbol.
+53. Record the best rank fired for that direction; return exactly that one signal.
+54. Net effect: **at most one CALL and one PUT symbol per ticker per day** (plus an optional upgrade follow-up only when `EMIT_UPGRADE_ALERT=true`).
 
 ---
 
@@ -192,8 +192,8 @@ For **each symbol**:
 | `OPT_CLUSTER_ACTIVE_MIN` | 3 | Min active bars in the window |
 | `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / TooChased |
 | `SINGLE_PRINT_RANKS` | {2,3} | Ranks eligible for MEDIUM_HIGH single print |
-| `SIGNAL_COOLDOWN_MINUTES` | 30 | Per-level cooldown |
 | `CLUSTER_UPGRADE_ENABLED` | true | Allow higher-confidence upgrades |
+| `EMIT_UPGRADE_ALERT` | false | Whether an upgrade emits a 2nd same-direction alert (off ⇒ one call + one put per ticker) |
 | `EMIT_WATCH_ONLY` | true | Emit non-qualifying prints as WATCH |
 | `NEXT_DAY_MODE_ENABLED` | true | Tue/Thu interchangeable levels + OTM strike |
 | `NEXT_DAY_TARGET_DEPTH` | 1 | Levels to step for the OTM strike |

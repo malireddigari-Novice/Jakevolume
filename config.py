@@ -79,6 +79,10 @@ EMIT_WATCH_ONLY = os.getenv('EMIT_WATCH_ONLY', 'true').lower() == 'true'
 # supersede an earlier single-print alert in the same direction. The upgrade
 # fires as a fresh alert but is not auto-traded (the original already entered).
 CLUSTER_UPGRADE_ENABLED = os.getenv('CLUSTER_UPGRADE_ENABLED', 'true').lower() == 'true'
+# Whether a cluster upgrade emits a SECOND same-direction alert. Off by default so
+# each ticker yields at most one call and one put symbol; the upgrade still updates
+# internal state but won't add another message.
+EMIT_UPGRADE_ALERT = os.getenv('EMIT_UPGRADE_ALERT', 'false').lower() == 'true'
 
 # ── Next-day-expiry mode (Tue/Thu — no 0DTE) ──────────────────────────────────
 # When today has no same-day expiry, the nearest expiry is next-day. In that
@@ -134,6 +138,9 @@ LEVEL_PROXIMITY_PCT          = float(os.getenv('LEVEL_PROXIMITY_PCT', '0.002'))
 # ── Data / polling ────────────────────────────────────────────────────────────
 BAR_INTERVAL          = 'm1'   # 1-minute bars
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', '60'))
+# Staleness guard: skip a symbol if its newest 1-min bar is older than this many
+# seconds (or not today's date). Prevents acting on stale/previous-session data.
+MAX_BAR_AGE_SECONDS   = int(os.getenv('MAX_BAR_AGE_SECONDS', '300'))
 
 # ── Charles Schwab / TD Ameritrade ───────────────────────────────────────────
 # Register a developer app at developer.schwab.com to obtain these values.

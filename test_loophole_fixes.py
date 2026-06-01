@@ -29,25 +29,32 @@ def _sig(strike, conf, sigtype='BULLISH'):
     return {'symbol': 'X', 'signal_type': sigtype, 'level_price': strike, 'confidence': conf}
 
 
-# ── #3 Per-level cooldown + upgrade ───────────────────────────────────────────
+# ── #3 One alert per DIRECTION per ticker (one call + one put) ────────────────
 det = SignalDetector()
-cd = config.SIGNAL_COOLDOWN_MINUTES
-check("cooldown: first sight fires", det._fire_decision(_sig(100.0, 'MEDIUM_HIGH'), T0) == ('fire', False))
+check("dedup: first bullish fires", det._fire_decision(_sig(100.0, 'MEDIUM_HIGH')) == ('fire', False))
 
-det._last_fired[('X', 'BULLISH', 100.0)] = (T0, _CONF_RANK['MEDIUM_HIGH'])
-check("cooldown: same level same tier within cooldown skips",
-      det._fire_decision(_sig(100.0, 'MEDIUM_HIGH'), T0 + timedelta(minutes=5)) == ('skip', False))
-check("cooldown: higher tier within cooldown upgrades",
-      det._fire_decision(_sig(100.0, 'HIGH'), T0 + timedelta(minutes=5)) == ('upgrade', True))
-check("cooldown: re-entry after cooldown fires",
-      det._fire_decision(_sig(100.0, 'MEDIUM_HIGH'), T0 + timedelta(minutes=cd + 1)) == ('fire', False))
-check("cooldown: a different level fires independently",
-      det._fire_decision(_sig(102.0, 'MEDIUM_HIGH'), T0 + timedelta(minutes=5)) == ('fire', False))
+# Direction already fired (any level) → further bullish at ANY level is suppressed
+det._fired_today[('X', 'BULLISH')] = _CONF_RANK['MEDIUM_HIGH']
+check("dedup: second bullish (same tier) at another level skips",
+      det._fire_decision(_sig(102.0, 'MEDIUM_HIGH')) == ('skip', False))
+check("dedup: stronger bullish does not re-alert by default (EMIT_UPGRADE_ALERT off)",
+      det._fire_decision(_sig(102.0, 'HIGH')) == ('skip', False))
+check("dedup: opposite direction (put) still fires",
+      det._fire_decision(_sig(98.0, 'MEDIUM_HIGH', 'BEARISH')) == ('fire', False))
 
-# watch then actionable = fresh entry, NOT an upgrade (so the trade isn't skipped)
-det._last_fired[('X', 'BULLISH', 104.0)] = (T0, _CONF_RANK['WATCH'])
-check("cooldown: actionable over prior WATCH is a fresh fire",
-      det._fire_decision(_sig(104.0, 'MEDIUM'), T0 + timedelta(minutes=5)) == ('fire', False))
+# Actionable after a prior WATCH = the real entry (fresh fire, not an upgrade)
+det._fired_today[('X', 'BULLISH')] = _CONF_RANK['WATCH']
+check("dedup: actionable over prior WATCH is a fresh fire",
+      det._fire_decision(_sig(104.0, 'MEDIUM')) == ('fire', False))
+
+# With EMIT_UPGRADE_ALERT on, a stronger same-direction signal upgrades (alert only)
+config.EMIT_UPGRADE_ALERT = True
+try:
+    det._fired_today[('X', 'BULLISH')] = _CONF_RANK['MEDIUM_HIGH']
+    check("dedup: stronger bullish upgrades when EMIT_UPGRADE_ALERT on",
+          det._fire_decision(_sig(102.0, 'HIGH')) == ('upgrade', True))
+finally:
+    config.EMIT_UPGRADE_ALERT = False
 
 
 # ── #5 chase guard uses the true day low ──────────────────────────────────────

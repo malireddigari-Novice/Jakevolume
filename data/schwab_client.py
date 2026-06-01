@@ -260,12 +260,18 @@ class SchwabClient:
         if not self._client:
             return []
         try:
+            # Bound the query to TODAY so Schwab cannot return a stale/previous
+            # session. Without explicit start/end the DAY/ONE_DAY query can hand
+            # back the last completed session, producing a wrong spot price.
+            now   = datetime.now(CST)
+            start = CST.localize(datetime(now.year, now.month, now.day, 0, 0))
             resp = self._client.get_price_history(
                 symbol,
                 period_type=schwab.client.Client.PriceHistory.PeriodType.DAY,
-                period=schwab.client.Client.PriceHistory.Period.ONE_DAY,
                 frequency_type=schwab.client.Client.PriceHistory.FrequencyType.MINUTE,
                 frequency=schwab.client.Client.PriceHistory.Frequency.EVERY_MINUTE,
+                start_datetime=start,
+                end_datetime=now,
                 need_extended_hours_data=False,
             )
             resp.raise_for_status()
@@ -284,7 +290,9 @@ class SchwabClient:
                     'volume':   int(c['volume']),
                 })
             bars.sort(key=lambda b: b['bar_time'])
-            logger.debug("Schwab: %s — %d bars returned", symbol, len(bars))
+            logger.debug("Schwab: %s — %d bars returned (latest %s)",
+                         symbol, len(bars),
+                         bars[-1]['bar_time'].strftime('%Y-%m-%d %H:%M') if bars else 'none')
             return bars[-count:]
         except Exception as exc:
             logger.warning("Schwab: get_bars failed for %s: %s", symbol, exc)
@@ -303,12 +311,16 @@ class SchwabClient:
         if not self._client:
             return []
         try:
+            # Bound to today (same staleness fix as the equity get_bars).
+            now   = datetime.now(CST)
+            start = CST.localize(datetime(now.year, now.month, now.day, 0, 0))
             resp = self._client.get_price_history(
                 occ_symbol,
                 period_type=schwab.client.Client.PriceHistory.PeriodType.DAY,
-                period=schwab.client.Client.PriceHistory.Period.ONE_DAY,
                 frequency_type=schwab.client.Client.PriceHistory.FrequencyType.MINUTE,
                 frequency=schwab.client.Client.PriceHistory.Frequency.EVERY_MINUTE,
+                start_datetime=start,
+                end_datetime=now,
                 need_extended_hours_data=False,
             )
             resp.raise_for_status()
