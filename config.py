@@ -141,6 +141,10 @@ POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', '60'))
 # Staleness guard: skip a symbol if its newest 1-min bar is older than this many
 # seconds (or not today's date). Prevents acting on stale/previous-session data.
 MAX_BAR_AGE_SECONDS   = int(os.getenv('MAX_BAR_AGE_SECONDS', '300'))
+# Single-instance lock file — prevents two copies running (which doubles alerts).
+LOCK_FILE             = os.getenv('LOCK_FILE', 'jakevolume.lock')
+# Minimum seconds between Google Sheets writes (quota is ~60 writes/min/user).
+SHEETS_MIN_WRITE_INTERVAL = float(os.getenv('SHEETS_MIN_WRITE_INTERVAL', '1.1'))
 
 # ── Charles Schwab / TD Ameritrade ───────────────────────────────────────────
 # Register a developer app at developer.schwab.com to obtain these values.

@@ -119,6 +119,7 @@ class SheetsLogger:
         # Non-blocking write queue: public log_* methods enqueue tasks here;
         # _drain_queue() serialises all actual Sheets API calls in a daemon thread.
         self._write_queue: queue.Queue = queue.Queue()
+        self._last_write_ts = 0.0   # throttle clock — keeps us under the write quota
         self._worker = threading.Thread(
             target=self._drain_queue,
             name="sheets-writer",
@@ -383,6 +384,12 @@ class SheetsLogger:
         """
         while True:
             sheet_key, row = self._write_queue.get()
+            # Throttle to stay under the Sheets per-minute write quota (the cause
+            # of the 429 "Quota exceeded" errors, especially during the morning
+            # burst). One write per SHEETS_MIN_WRITE_INTERVAL ≈ 54 writes/min.
+            wait = config.SHEETS_MIN_WRITE_INTERVAL - (time.monotonic() - self._last_write_ts)
+            if wait > 0:
+                time.sleep(wait)
             try:
                 self._insert_row(sheet_key, row)
             except Exception:
@@ -390,6 +397,7 @@ class SheetsLogger:
                     "Sheets background write failed for sheet '%s'", sheet_key
                 )
             finally:
+                self._last_write_ts = time.monotonic()
                 self._write_queue.task_done()
 
     def _insert_row(self, sheet_key: str, row: list, max_retries: int = 4) -> None:

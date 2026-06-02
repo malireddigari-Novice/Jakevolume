@@ -25,6 +25,7 @@ from typing import Optional
 
 import config
 import db.ops as db
+import single_instance
 from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
@@ -47,6 +48,14 @@ from output.discord_notifier import (
 
 def _setup_logging() -> None:
     """Configure root logger to write INFO+ to stdout and a rotating log file."""
+    # Make the console handler tolerate non-ASCII (e.g. → arrows) on Windows
+    # code pages; without this, logging a "→" raises UnicodeEncodeError. The
+    # file handler is already UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
     fmt = '%(asctime)s %(levelname)-8s %(name)-30s %(message)s'
     logging.basicConfig(
         level=logging.INFO,
@@ -769,6 +778,16 @@ def main() -> None:
     if args.login:
         logger.info("--login flag: session cached. Exiting.")
         return
+
+    # Single-instance guard — a second copy would double every alert and the
+    # Sheets write volume. Exit immediately if another instance is already running.
+    if not single_instance.acquire(config.LOCK_FILE):
+        logger.error(
+            "Another Jakevolume instance already holds %s — exiting to avoid "
+            "duplicate alerts. (Stop the other copy or the Task Scheduler job.)",
+            config.LOCK_FILE,
+        )
+        sys.exit(1)
 
     # Databento Live is used only for the positioning monitor.
     try:

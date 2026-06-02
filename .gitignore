@@ -16,6 +16,9 @@ venv/
 *.log
 startup.log
 
+# Single-instance lock (runtime)
+*.lock
+
 # IDE
 .vscode/
 .idea/
