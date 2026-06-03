@@ -25,6 +25,11 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -RunOnlyIfNetworkAvailable
 
+# Keep running on battery. A laptop switching to battery power was killing the
+# task (~11:08 daily) with "process terminated unexpectedly" (0x8007042B).
+$settings.DisallowStartIfOnBatteries = $false
+$settings.StopIfGoingOnBatteries     = $false
+
 # Run as the current logged-in user so env vars / credentials are available
 $principal = New-ScheduledTaskPrincipal `
     -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
