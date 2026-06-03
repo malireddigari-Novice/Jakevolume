@@ -552,6 +552,27 @@ def get_open_trades(symbol: str = None) -> list:
         _put(conn)
 
 
+def count_open_trades() -> int:
+    """
+    Count currently-open positions (status='placed', not fully exited).
+
+    Written synchronously by save_trade and cleared on close, so this reflects
+    orders placed earlier in the same poll cycle without the lag of Alpaca's
+    positions endpoint — used for the atomic MAX_OPEN_POSITIONS cap.
+    """
+    sql = """
+        SELECT COUNT(*) FROM trades
+        WHERE status = 'placed' AND (exit1_filled = FALSE OR exit2_filled = FALSE)
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return int(cur.fetchone()[0])
+    finally:
+        _put(conn)
+
+
 def mark_exit1_filled(trade_id: int, filled_at: datetime) -> None:
     """Record that the first half of the position was sold."""
     conn = _get()

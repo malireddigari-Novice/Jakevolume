@@ -472,7 +472,13 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         logger.warning("Alpaca: trade skipped for %s — next-day OTM strike unresolved", symbol)
         return
 
-    open_pos = alpaca.open_position_count()
+    # Atomic position cap. Alpaca's position count lags newly-placed orders, so a
+    # burst of signals in one poll cycle could each see "room" and blow past the
+    # cap (this opened 5 positions vs a max of 3 on 06-02). Count the DB's open
+    # trades too — those are written the instant each order is placed and cleared
+    # on close — and take the max, so the cap holds even before Alpaca registers
+    # the fills.
+    open_pos = max(alpaca.open_position_count(), db.count_open_trades())
     if open_pos >= config.MAX_OPEN_POSITIONS:
         logger.info(
             "Alpaca: trade skipped for %s — at MAX_OPEN_POSITIONS (%d/%d)",
