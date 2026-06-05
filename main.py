@@ -32,7 +32,7 @@ from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector
 from data.market_utils import (
     now_cst, today_cst,
-    is_market_open, is_snapshot_window, is_eod_window,
+    is_market_open, is_snapshot_window, is_eod_window, is_warmup,
 )
 from data.schwab_client import SchwabClient
 from data.databento_client import DatabentoClient
@@ -349,7 +349,8 @@ def intraday_check(
             pc_ratio = db.get_today_pc_ratio(symbol, today)
 
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
-                                     pc_ratio=pc_ratio, chain_quotes=chain_quotes)
+                                     pc_ratio=pc_ratio, chain_quotes=chain_quotes,
+                                     warmup=is_warmup())
 
             for sig in signals:
                 sig_id = db.save_signal(sig)

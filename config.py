@@ -25,6 +25,11 @@ MARKET_OPEN_MINUTE  = 30
 MARKET_CLOSE_HOUR   = 15   # 15:00 CST = 16:00 ET
 MARKET_CLOSE_MINUTE = 0
 
+# Warm-up window: for the first N minutes after open the detector still ingests
+# bars and builds its volume baselines, but emits NO signals — this avoids acting
+# on noisy opening prints before a baseline exists. Set 0 to disable.
+SIGNAL_WARMUP_MINUTES = int(os.getenv('SIGNAL_WARMUP_MINUTES', '5'))
+
 # ── OI level computation ──────────────────────────────────────────────────────
 # Strikes considered "near ATM": ± ATM_RANGE_PCT of current price
 ATM_RANGE_PCT  = float(os.getenv('ATM_RANGE_PCT', '0.05'))   # 5 %

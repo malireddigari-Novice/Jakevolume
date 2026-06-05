@@ -297,6 +297,7 @@ class SignalDetector:
         expiry: Optional[date] = None,
         pc_ratio: Optional[float] = None,
         chain_quotes: dict | None = None,
+        warmup: bool = False,
     ) -> list[dict]:
         """
         Run the full signal detection pipeline for the latest 1-min bar.
@@ -310,6 +311,9 @@ class SignalDetector:
         pc_ratio      : morning P/C OI ratio — used for conviction label.
         chain_quotes  : full {(strike, opt_type): contract_dict} chain. Only needed
                         in next-day mode to price the OTM target strike.
+        warmup        : if True (first minutes after open), ingest bars and update
+                        rolling volume histories but emit no signals — builds a
+                        baseline before scoring without burning fire/dedup state.
         """
         if not bars:
             return []
@@ -372,6 +376,14 @@ class SignalDetector:
 
             opt_data_map[(s, ot)] = data
             vol_deltas[(s, ot)]   = delta
+
+        # Warm-up window: rolling histories are now updated (above), so baselines
+        # build normally, but we score nothing and fire nothing for the first few
+        # minutes after open. Returning here leaves _fired_today untouched, so a
+        # genuine post-warm-up signal is never pre-empted by a discarded one.
+        if warmup:
+            logger.debug("%s: warm-up — baselines updated, signal emission suppressed", symbol)
+            return []
 
         # (symbol, signal_dict, actionable) candidates collected across levels
         candidates: list[tuple[dict, bool]] = []

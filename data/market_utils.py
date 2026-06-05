@@ -3,7 +3,7 @@ Market-hours and timezone helpers.
 All public functions use America/Chicago (CST/CDT) as the reference timezone.
 NYSE open = 08:30 CST, close = 15:00 CST.
 """
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 
 import pytz
 
@@ -14,6 +14,10 @@ CST = pytz.timezone(config.SESSION_TZ)
 _MARKET_OPEN  = time(config.MARKET_OPEN_HOUR,  config.MARKET_OPEN_MINUTE)
 _MARKET_CLOSE = time(config.MARKET_CLOSE_HOUR, config.MARKET_CLOSE_MINUTE)
 _SNAPSHOT     = time(config.SNAPSHOT_HOUR,      config.SNAPSHOT_MINUTE)
+
+# End of the post-open warm-up window (open + SIGNAL_WARMUP_MINUTES).
+_WARMUP_END = (datetime.combine(date.min, _MARKET_OPEN)
+               + timedelta(minutes=config.SIGNAL_WARMUP_MINUTES)).time()
 
 
 def now_cst() -> datetime:
@@ -37,6 +41,24 @@ def is_market_open(dt: datetime = None) -> bool:
         return False
     t = dt.time().replace(second=0, microsecond=0)
     return _MARKET_OPEN <= t < _MARKET_CLOSE
+
+
+def is_warmup(dt: datetime = None) -> bool:
+    """
+    True during the first SIGNAL_WARMUP_MINUTES after open (08:30 CST).
+
+    The detector still ingests bars in this window to build its volume baselines,
+    but no signals are emitted — this filters out noisy opening-print spikes that
+    fire before any baseline exists. Returns False when SIGNAL_WARMUP_MINUTES is 0.
+    """
+    if config.SIGNAL_WARMUP_MINUTES <= 0:
+        return False
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    t = dt.time().replace(second=0, microsecond=0)
+    return _MARKET_OPEN <= t < _WARMUP_END
 
 
 def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:
