@@ -27,6 +27,9 @@ Classification + confidence
 
 Surrounding filters (unchanged): proximity band, spread, target room, P/C conviction.
 Contract low: NearLow (<=1.75) qualifies prints; TooChased (>2.50) hard-blocks the ATM.
+Historical-low entry gate (HIST_LOW_ENTRY_GATE): an actionable entry must trade at/near
+the contract's multi-day historical low (mark/hist_low <= HIST_LOW_NEAR_RATIO); otherwise
+it is downgraded to WATCH. No-op for 0DTE contracts (no prior-day history).
 """
 import logging
 from collections import defaultdict, deque
@@ -34,6 +37,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config
+from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
 logger = logging.getLogger(__name__)
@@ -284,6 +288,10 @@ class SignalDetector:
         )
         self._opt_mark_low: dict[_OptKey, float] = {}
         self._opt_last_bar: dict[_OptKey, datetime] = {}   # last bar a contract was seen
+        # Multi-day historical low per contract (OCC symbol → low|None), fetched
+        # once per contract per day and reused for the historical-low entry gate.
+        self._opt_hist_low: dict[str, Optional[float]] = {}
+        self._hist_low_fn = None                            # set per-call in check()
         self._history_date: Optional[date]       = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -298,6 +306,7 @@ class SignalDetector:
         pc_ratio: Optional[float] = None,
         chain_quotes: dict | None = None,
         warmup: bool = False,
+        hist_low_fn=None,
     ) -> list[dict]:
         """
         Run the full signal detection pipeline for the latest 1-min bar.
@@ -314,6 +323,10 @@ class SignalDetector:
         warmup        : if True (first minutes after open), ingest bars and update
                         rolling volume histories but emit no signals — builds a
                         baseline before scoring without burning fire/dedup state.
+        hist_low_fn   : optional callable (occ_symbol -> Optional[float]) returning a
+                        contract's multi-day historical low. Backs the historical-low
+                        entry gate (config.HIST_LOW_ENTRY_GATE); results are cached
+                        per contract per day. None disables the gate.
         """
         if not bars:
             return []
@@ -321,6 +334,7 @@ class SignalDetector:
         current     = bars[-1]
         close_price = current['close']
         today       = current['bar_time'].date()
+        self._hist_low_fn = hist_low_fn
 
         # Next-day mode: no 0DTE today (nearest expiry is a future date) → Tue/Thu.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -334,6 +348,7 @@ class SignalDetector:
             self._opt_vol_hist   = defaultdict(lambda: deque(maxlen=self._hist_maxlen))
             self._opt_mark_low   = {}
             self._opt_last_bar   = {}
+            self._opt_hist_low   = {}
 
         if not option_quotes:
             return []
@@ -543,6 +558,23 @@ class SignalDetector:
             elif extreme_single and gates_ok:
                 confidence, signal_shape, actionable = 'MEDIUM', 'EXTREME_SINGLE_PRINT', True
 
+            # ── Historical-low entry gate ─────────────────────────────────────
+            # An actionable entry must be trading at/near the contract's multi-day
+            # historical low — not merely near today's low. Evaluated on the
+            # contract we'd actually buy (the OTM target in next-day mode). When no
+            # history exists (0DTE) the gate is skipped. A failing entry is kept as
+            # a WATCH alert (it still surfaces) but is not auto-traded.
+            if actionable and config.HIST_LOW_ENTRY_GATE:
+                hist_low_dist = self._historical_low_dist(
+                    symbol, traded_strike, confirm_type, expiry, trade_data)
+                if hist_low_dist is not None and hist_low_dist > config.HIST_LOW_NEAR_RATIO:
+                    logger.info(
+                        "%s %s@%.2f: HIST_LOW gate — mark/hist_low=%.2f > %.2f → WATCH",
+                        symbol, level_type, traded_strike, hist_low_dist,
+                        config.HIST_LOW_NEAR_RATIO,
+                    )
+                    confidence, signal_shape, actionable = 'WATCH', 'RANDOM_SINGLE_PRINT', False
+
             if not actionable and not config.EMIT_WATCH_ONLY:
                 continue
 
@@ -684,6 +716,39 @@ class SignalDetector:
                       if x and x > 0]
         low = min(candidates) if candidates else None
         if mark and low and low > 0:
+            return round(mark / low, 4)
+        return None
+
+    def _historical_low_dist(
+        self,
+        symbol: str,
+        strike: float,
+        opt_type: str,
+        expiry: Optional[date],
+        data: dict,
+    ) -> Optional[float]:
+        """
+        Ratio of the trade contract's current mark to its multi-day historical low.
+
+        The historical low is fetched once per contract per day via the injected
+        hist_low_fn and cached on _opt_hist_low. Returns None when the gate can't
+        be evaluated (no fn, no expiry, no mark, or no prior history — e.g. 0DTE),
+        which the caller treats as "gate not applicable".
+        """
+        if self._hist_low_fn is None or expiry is None:
+            return None
+        mark = data.get('mark')
+        if not mark or mark <= 0:
+            return None
+        occ = occ_symbol(symbol, expiry, strike, opt_type)
+        if occ not in self._opt_hist_low:
+            try:
+                self._opt_hist_low[occ] = self._hist_low_fn(occ)
+            except Exception as exc:
+                logger.warning("hist_low_fn failed for %s: %s", occ, exc)
+                self._opt_hist_low[occ] = None
+        low = self._opt_hist_low.get(occ)
+        if low and low > 0:
             return round(mark / low, 4)
         return None
 

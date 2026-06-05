@@ -107,6 +107,7 @@ For **each symbol**:
     - **MEDIUM / `VOLUME_PRESSURE_CLUSTER`** — single-side cluster.
     - **MEDIUM / `EXTREME_SINGLE_PRINT`** — extreme single at rank 1.
     - **WATCH / `RANDOM_SINGLE_PRINT`** — notable but missing a condition (not near low / no room / no ITM). Recorded + notified, **never traded**.
+49a. **Historical-low entry gate** (`HIST_LOW_ENTRY_GATE`, on by default) — before an actionable entry stands, the contract you'd actually buy (the OTM target in next-day mode) must trade at/near its **multi-day historical low**: `mark / hist_low ≤ HIST_LOW_NEAR_RATIO` (1.25). `hist_low` is the lowest daily candle over `OPT_HIST_LOOKBACK_DAYS` (10) pulled from Schwab, fetched once per contract per day and cached. **0DTE contracts have no prior-day history → gate is a no-op those days** (only bites Tue/Thu next-day mode). A failing entry is **downgraded to WATCH** (still alerted, not auto-traded), never silently dropped.
 50. Build the full signal dict (option prices, exits, P/C conviction, option H/L flag, day_mode, traded_strike, target_level, etc.) and add it to the bar's candidate list.
 
 ---
@@ -190,7 +191,10 @@ For **each symbol**:
 | `OPT_CLUSTER_WINDOW` | 5 | Cluster window (bars) |
 | `OPT_CLUSTER_WINDOW_RATIO` | 3.0 | Cluster window-ratio threshold |
 | `OPT_CLUSTER_ACTIVE_MIN` | 3 | Min active bars in the window |
-| `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / TooChased |
+| `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / TooChased (today's low) |
+| `HIST_LOW_ENTRY_GATE` | true | Require actionable entries to be near the contract's multi-day historical low |
+| `OPT_HIST_LOOKBACK_DAYS` | 10 | Days of Schwab daily candles for the historical low |
+| `HIST_LOW_NEAR_RATIO` | 1.25 | Max `mark / hist_low` for an entry (else downgraded to WATCH) |
 | `SINGLE_PRINT_RANKS` | {2,3} | Ranks eligible for MEDIUM_HIGH single print |
 | `CLUSTER_UPGRADE_ENABLED` | true | Allow higher-confidence upgrades |
 | `EMIT_UPGRADE_ALERT` | false | Whether an upgrade emits a 2nd same-direction alert (off ⇒ one call + one put per ticker) |

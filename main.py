@@ -348,9 +348,13 @@ def intraday_check(
             # Morning P/C ratio for conviction multiplier
             pc_ratio = db.get_today_pc_ratio(symbol, today)
 
+            # Historical-low entry gate: let the detector fetch a contract's
+            # multi-day low on demand (Schwab daily candles), cached per day.
+            hist_low_fn = (schwab.get_option_history_low
+                           if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio, chain_quotes=chain_quotes,
-                                     warmup=is_warmup())
+                                     warmup=is_warmup(), hist_low_fn=hist_low_fn)
 
             for sig in signals:
                 sig_id = db.save_signal(sig)

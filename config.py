@@ -110,6 +110,23 @@ EOD_CLOSE_NEXT_DAY = os.getenv('EOD_CLOSE_NEXT_DAY', 'true').lower() == 'true'
 NEAR_LOW_MAX_DIST     = float(os.getenv('NEAR_LOW_MAX_DIST',     '1.75'))
 CONTRACT_LOW_MAX_DIST = float(os.getenv('CONTRACT_LOW_MAX_DIST', '2.50'))
 
+# ── Historical-low entry gate ──────────────────────────────────────────────────
+# "For entry and alerts look for the historical low for that option": before an
+# actionable entry fires, the contract we'd actually buy must be trading at/near
+# its multi-day historical low (not merely near today's low). The contract's
+# historical low is pulled from Schwab daily candles over OPT_HIST_LOOKBACK_DAYS,
+# fetched once per contract per day and cached.
+#
+# NOTE: 0DTE contracts (Mon/Wed/Fri) have no prior-day history, so the gate is a
+# no-op those days and only bites in next-day mode (Tue/Thu). When no history is
+# available the entry is allowed (the existing today-low NearLow/TooChased gates
+# still apply). A failing entry is downgraded to a WATCH alert, never silently
+# dropped — so it still surfaces, it just isn't auto-traded.
+HIST_LOW_ENTRY_GATE    = os.getenv('HIST_LOW_ENTRY_GATE', 'true').lower() == 'true'
+OPT_HIST_LOOKBACK_DAYS = int(os.getenv('OPT_HIST_LOOKBACK_DAYS', '10'))
+# Actionable entry requires mark / historical_low <= this ratio (≤25% above low).
+HIST_LOW_NEAR_RATIO    = float(os.getenv('HIST_LOW_NEAR_RATIO', '1.25'))
+
 # ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
 CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
 CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2

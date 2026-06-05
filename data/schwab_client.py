@@ -345,6 +345,46 @@ class SchwabClient:
             logger.warning("Schwab: get_option_bars failed for %s: %s", occ_symbol, exc)
             return []
 
+    def get_option_history_low(
+        self, occ_symbol: str, lookback_days: int = None
+    ) -> Optional[float]:
+        """
+        Lowest traded price for an option contract over the last `lookback_days`
+        calendar days (daily candles), or None if unavailable.
+
+        Backs the historical-low entry gate (config.HIST_LOW_ENTRY_GATE): an
+        actionable entry only fires when the contract is at/near this multi-day
+        low. 0DTE contracts have no prior-day history and return None, making the
+        gate a no-op those days. Returns None on any error so the caller can
+        treat "no history" as "gate not applicable".
+        """
+        lookback_days = lookback_days or config.OPT_HIST_LOOKBACK_DAYS
+        if not self._client:
+            return None
+        try:
+            now   = datetime.now(CST)
+            start = now - timedelta(days=lookback_days)
+            resp  = self._client.get_price_history_every_day(
+                occ_symbol,
+                start_datetime=start,
+                end_datetime=now,
+                need_extended_hours_data=False,
+            )
+            resp.raise_for_status()
+            candles = resp.json().get('candles', [])
+            lows = [float(c['low']) for c in candles
+                    if c.get('low') is not None and float(c['low']) > 0]
+            if not lows:
+                return None
+            low = min(lows)
+            logger.debug("Schwab: %s — %d-day historical low %.4f (%d candles)",
+                         occ_symbol, lookback_days, low, len(candles))
+            return low
+        except Exception as exc:
+            logger.warning("Schwab: get_option_history_low failed for %s: %s",
+                           occ_symbol, exc)
+            return None
+
     def get_nearest_expiry(self, symbol: str) -> Optional[date]:
         """
         Return the nearest available option expiry for a symbol.
