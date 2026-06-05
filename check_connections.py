@@ -39,6 +39,13 @@ def check_schwab() -> bool:
     if not config.SCHWAB_API_KEY or not config.SCHWAB_APP_SECRET:
         _fail("SCHWAB_API_KEY / SCHWAB_APP_SECRET not set in .env")
         return False
+    # Guard: never trigger the interactive browser OAuth flow from a health check.
+    # login() falls into client_from_manual_flow() when the token file is absent,
+    # which blocks on stdin and EOFs in any non-interactive context.
+    import os
+    if not os.path.exists(config.SCHWAB_TOKEN_FILE):
+        _fail(f"no token file ({config.SCHWAB_TOKEN_FILE}) - run the login flow to create it")
+        return False
     try:
         from data.schwab_client import SchwabClient
         c = SchwabClient()
