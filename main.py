@@ -425,11 +425,21 @@ def _collect_level_bars(symbol, levels, expiry, level_date, schwab) -> None:
 # ── Desktop notification ──────────────────────────────────────────────────────
 
 def _notify_signal(sig: dict) -> None:
-    """Best-effort desktop + Discord notification when a signal fires."""
-    try:
-        discord_signal(sig)
-    except Exception:
-        logger.warning("Discord signal send failed", exc_info=True)
+    """Best-effort desktop + Discord notification when a signal fires.
+
+    WATCH alerts are still recorded (DB + Sheets) by the caller but are not sent
+    to Discord unless DISCORD_NOTIFY_WATCH is on — this avoids a WATCH heads-up
+    and the subsequent real entry showing as two Discord messages for the same
+    ticker/direction.
+    """
+    if sig.get('confidence') == 'WATCH' and not config.DISCORD_NOTIFY_WATCH:
+        logger.debug("%s %s WATCH — Discord muted (DISCORD_NOTIFY_WATCH off)",
+                     sig.get('symbol'), sig.get('signal_type'))
+    else:
+        try:
+            discord_signal(sig)
+        except Exception:
+            logger.warning("Discord signal send failed", exc_info=True)
 
     try:
         from plyer import notification

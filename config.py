@@ -208,6 +208,13 @@ CLUSTER_FADE     = int(os.getenv('CLUSTER_FADE', '3'))
 DISCORD_WEBHOOK_URL         = os.getenv('DISCORD_WEBHOOK_URL', '')
 DISCORD_MORNING_WEBHOOK_URL = os.getenv('DISCORD_MORNING_WEBHOOK_URL', '')
 
+# WATCH alerts are early heads-ups (never traded). They are always recorded in
+# Postgres and Google Sheets, but by default are NOT sent to Discord — otherwise
+# each setup produces two Discord messages (the WATCH then the real entry) for
+# the same ticker/direction, which reads as a duplicate. Set true to also push
+# WATCH alerts to Discord.
+DISCORD_NOTIFY_WATCH = os.getenv('DISCORD_NOTIFY_WATCH', 'false').lower() == 'true'
+
 # Set SAMPLE_MODE=true in .env to prefix all Discord messages with [SAMPLE].
 # Remove or set to false when going live.
 SAMPLE_MODE = os.getenv('SAMPLE_MODE', 'false').lower() == 'true'
