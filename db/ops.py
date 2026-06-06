@@ -423,6 +423,34 @@ def get_today_pc_ratio(symbol: str, snap_date: date) -> Optional[float]:
         _put(conn)
 
 
+def get_fired_directions_today(symbol: str, day: date) -> dict[str, list[str]]:
+    """
+    Confidences already fired for a symbol today, grouped by direction.
+
+    Returns {signal_type: [confidence, ...]} from the signals table for `day`.
+    Backs the detector's durable dedup so a restarted or second concurrent
+    process sees what was already alerted and does not re-fire the same
+    direction (the in-memory _fired_today alone is lost on restart and is
+    per-process). Returns {} on any error so the caller falls back to in-memory.
+    """
+    sql = """
+        SELECT signal_type, confidence
+        FROM signals
+        WHERE symbol = %s AND signal_time::date = %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, day))
+            rows = cur.fetchall()
+        out: dict[str, list[str]] = {}
+        for signal_type, confidence in rows:
+            out.setdefault(signal_type, []).append(confidence)
+        return out
+    finally:
+        _put(conn)
+
+
 def mark_signal_logged(signal_id: int) -> None:
     """Set sheets_logged=TRUE on a signal after it has been written to Google Sheets."""
     conn = _get()

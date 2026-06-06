@@ -354,7 +354,8 @@ def intraday_check(
                            if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio, chain_quotes=chain_quotes,
-                                     warmup=is_warmup(), hist_low_fn=hist_low_fn)
+                                     warmup=is_warmup(), hist_low_fn=hist_low_fn,
+                                     fired_today_fn=db.get_fired_directions_today)
 
             for sig in signals:
                 sig_id = db.save_signal(sig)

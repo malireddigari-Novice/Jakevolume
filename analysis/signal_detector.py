@@ -307,6 +307,7 @@ class SignalDetector:
         chain_quotes: dict | None = None,
         warmup: bool = False,
         hist_low_fn=None,
+        fired_today_fn=None,
     ) -> list[dict]:
         """
         Run the full signal detection pipeline for the latest 1-min bar.
@@ -327,6 +328,11 @@ class SignalDetector:
                         contract's multi-day historical low. Backs the historical-low
                         entry gate (config.HIST_LOW_ENTRY_GATE); results are cached
                         per contract per day. None disables the gate.
+        fired_today_fn: optional callable (symbol, day -> {signal_type: [confidence]})
+                        returning directions already fired today (from the DB). Makes
+                        the one-call/one-put-per-day dedup durable across process
+                        restarts and a second concurrent instance. None → in-memory
+                        dedup only (lost on restart, per-process).
         """
         if not bars:
             return []
@@ -349,6 +355,21 @@ class SignalDetector:
             self._opt_mark_low   = {}
             self._opt_last_bar   = {}
             self._opt_hist_low   = {}
+
+        # Durable dedup: fold in directions already fired today (DB) so a restart
+        # or a second concurrent instance won't re-fire the same call/put. Done
+        # every bar so fires by another live process are picked up mid-session.
+        if fired_today_fn is not None:
+            try:
+                db_fired = fired_today_fn(symbol, today) or {}
+            except Exception as exc:
+                logger.warning("fired_today_fn failed for %s: %s", symbol, exc)
+                db_fired = {}
+            for st, confs in db_fired.items():
+                ranks = [_CONF_RANK[c] for c in confs if c in _CONF_RANK]
+                if ranks:
+                    k: _FiredKey = (symbol, st)
+                    self._fired_today[k] = max(self._fired_today.get(k, -1), max(ranks))
 
         if not option_quotes:
             return []

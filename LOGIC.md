@@ -121,6 +121,7 @@ For **each symbol**:
     - Otherwise (direction already alerted) → **skip**.
 52. Among eligible candidates this bar, pick **actionable first, then highest confidence, then most room** — so the best bullish setup becomes the single call symbol and the best bearish setup the single put symbol.
 53. Record the best rank fired for that direction; return exactly that one signal.
+53a. **Durable dedup** — at the top of each `check`, the directions already fired today are read back from the `signals` table (`get_fired_directions_today`) and folded into `_fired_today` (max confidence per direction). The in-memory state alone is **per-process and lost on restart**, so without this a watchdog restart — or a second concurrent instance — would re-fire the same call/put. With it, the first fire is persisted and every later bar/process sees it and skips. Defends the one-per-direction guarantee across restarts and overlapping instances (the lock is the first line; this is the backstop).
 54. Net effect: **at most one CALL and one PUT symbol per ticker per day** (plus an optional upgrade follow-up only when `EMIT_UPGRADE_ALERT=true`).
 
 ---

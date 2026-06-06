@@ -164,7 +164,14 @@ POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', '60'))
 # seconds (or not today's date). Prevents acting on stale/previous-session data.
 MAX_BAR_AGE_SECONDS   = int(os.getenv('MAX_BAR_AGE_SECONDS', '300'))
 # Single-instance lock file — prevents two copies running (which doubles alerts).
-LOCK_FILE             = os.getenv('LOCK_FILE', 'jakevolume.lock')
+# Resolved to an absolute path next to this module so launches from different
+# working directories contend for the SAME lock (a relative path would let two
+# launchers — e.g. the Startup-folder copy and the Task Scheduler watchdog — lock
+# different files and both run, doubling every alert).
+LOCK_FILE             = os.getenv(
+    'LOCK_FILE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jakevolume.lock'),
+)
 # Minimum seconds between Google Sheets writes (quota is ~60 writes/min/user).
 SHEETS_MIN_WRITE_INTERVAL = float(os.getenv('SHEETS_MIN_WRITE_INTERVAL', '1.1'))
 
