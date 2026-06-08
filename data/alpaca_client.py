@@ -83,6 +83,27 @@ class AlpacaClient:
             logger.warning("Alpaca: could not fetch positions: %s", exc)
             return 0
 
+    def position_qty(self, occ: str) -> int:
+        """
+        Contracts currently held for a specific OCC option symbol, 0 if none.
+
+        Returns 0 when Alpaca holds no position for `occ` — e.g. the buy-to-open
+        limit order has not filled yet. Callers use this to avoid arming exit
+        management (and firing sells that reject as 'uncovered') on a position
+        that was never actually acquired.
+        """
+        try:
+            r = requests.get(
+                f"{self._base}/v2/positions/{occ}", headers=self._headers, timeout=10
+            )
+            if r.status_code == 404:
+                return 0
+            r.raise_for_status()
+            return int(float(r.json().get('qty', 0)))
+        except Exception as exc:
+            logger.warning("Alpaca: could not fetch position for %s: %s", occ, exc)
+            return 0
+
     # ── Position sizing ───────────────────────────────────────────────────────
 
     def calculate_qty(self, limit_price: float) -> tuple[int, float]:

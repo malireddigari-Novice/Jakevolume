@@ -598,6 +598,16 @@ def check_exits(
         sig_type = trade.get('signal_type', '')
         occ      = trade['occ_symbol']
 
+        # ── Entry-fill guard ─────────────────────────────────────────────────
+        # The entry is a limit day-order that may not have filled. If Alpaca
+        # holds no contracts for this option there is nothing to exit — selling
+        # would open an uncovered short (rejected every poll). Skip until the
+        # position is actually held; a fully-exited leg shows qty 0 too, which
+        # is fine (its exit flags are already set, so nothing re-fires).
+        if alpaca.position_qty(occ) <= 0:
+            logger.debug("%s: no position held (entry unfilled?) — skipping exits", occ)
+            continue
+
         # ── Stoploss check (option mark vs stored stoploss_price) ────────────
         stoploss_price = trade.get('stoploss_price')
         if stoploss_price is not None and option_quotes:
