@@ -32,7 +32,7 @@ from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector
 from data.market_utils import (
     now_cst, today_cst,
-    is_market_open, is_snapshot_window, is_eod_window, is_warmup,
+    is_market_open, is_snapshot_window, is_past_snapshot, is_eod_window, is_warmup,
 )
 from data.schwab_client import SchwabClient
 from data.databento_client import DatabentoClient
@@ -889,10 +889,21 @@ def main() -> None:
         now = now_cst()
 
         try:
-            # Morning snapshot — once per trading day
-            if is_snapshot_window(now) and snap_done != now.date():
+            # Morning snapshot — once per trading day. Fires at the 08:20 window,
+            # OR as a catch-up if the process started/restarted after the window
+            # (watchdog crash-restart) so the day still gets levels + a briefing.
+            if snap_done != now.date() and (is_snapshot_window(now) or is_past_snapshot(now)):
                 if schwab:
-                    morning_snapshot(schwab, sheets)
+                    # A prior process this session may have already snapshotted
+                    # today (then crashed). Re-running would re-pull every chain
+                    # and re-send the briefing, so skip if levels already exist.
+                    if is_past_snapshot(now) and db.get_today_levels(config.SYMBOLS[0], now.date()):
+                        logger.info(
+                            "Snapshot already present for %s — skipping catch-up run",
+                            now.date(),
+                        )
+                    else:
+                        morning_snapshot(schwab, sheets)
                 else:
                     logger.warning("Schwab not available — morning snapshot skipped")
                 snap_done = now.date()

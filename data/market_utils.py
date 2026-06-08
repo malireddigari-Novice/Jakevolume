@@ -61,6 +61,23 @@ def is_warmup(dt: datetime = None) -> bool:
     return _MARKET_OPEN <= t < _WARMUP_END
 
 
+def is_past_snapshot(dt: datetime = None) -> bool:
+    """
+    True on a weekday once the 08:20 snapshot time has passed, up to market close.
+
+    Used to trigger a *catch-up* morning snapshot when the process starts (or is
+    restarted by the watchdog) after the narrow 08:20 snapshot window has already
+    elapsed — otherwise a late start would leave the day with no S/R levels and no
+    morning briefing.
+    """
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    t = dt.time().replace(second=0, microsecond=0)
+    return _SNAPSHOT <= t < _MARKET_CLOSE
+
+
 def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:
     """
     True if `dt` is within `window_sec` seconds of 14:55 CST (EOD liquidation trigger).
