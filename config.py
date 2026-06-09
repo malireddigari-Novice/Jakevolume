@@ -127,6 +127,69 @@ OPT_HIST_LOOKBACK_DAYS = int(os.getenv('OPT_HIST_LOOKBACK_DAYS', '10'))
 # Actionable entry requires mark / historical_low <= this ratio (≤25% above low).
 HIST_LOW_NEAR_RATIO    = float(os.getenv('HIST_LOW_NEAR_RATIO', '1.25'))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMPLIFIED V1 ENTRY LOGIC  (Mag-7 call/put alert engine)
+# These parameters drive analysis/signal_detector.py. Several legacy params above
+# (PROX_BAND_*, SINGLE_PRINT_RANKS, MAX_SPREAD_PCT, TARGET_ROOM_*, *_UPGRADE_*,
+# LEVEL_FLIP_DEADBAND_PCT, HIST_LOW_NEAR_RATIO) are no longer used by the detector
+# under V1 — they are retained only so older test_*.py imports keep working.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Symbols treated as high-volatility (wider proximity, higher absolute floors).
+VOLATILE_SYMBOLS = {'TSLA', 'NVDA'}
+
+# §3 Premarket OI levels — valid strikes within ±OI_LEVEL_BAND_PCT of spot,
+# ranked by OI, top 3 per side (R1/R2/R3 calls above, S1/S2/S3 puts below).
+OI_LEVEL_BAND_PCT = float(os.getenv('OI_LEVEL_BAND_PCT', '0.05'))   # 5%
+
+# §4 Level proximity — NearLevel if abs(spot-level)/spot <= distance. Binary.
+NEAR_LEVEL_DIST_DEFAULT  = float(os.getenv('NEAR_LEVEL_DIST_DEFAULT',  '0.0035'))
+NEAR_LEVEL_DIST_VOLATILE = float(os.getenv('NEAR_LEVEL_DIST_VOLATILE', '0.0050'))
+
+# §10 Volume cluster — absolute WindowVol5 floor (reuses the existing per-symbol
+# map, which already holds the spec's 600/600/300). WindowRatio5 / ActiveBars5
+# thresholds come from OPT_CLUSTER_WINDOW_RATIO / OPT_CLUSTER_ACTIVE_* above.
+OPT_MIN_CLUSTER_WINDOW_VOL = OPT_MIN_CLUSTER_VOL
+
+# §11 Stair-step accumulation — weighted excitation over the last 5 ratios.
+#   ExcitationRaw   = Σ STAIRSTEP_WEIGHTS[i] * VolumeRatio[t-i]
+#   ExcitationScore = min(ExcitationRaw, 10)/10
+#   valid if score >= min AND WindowRatio5 >= ratio_min AND ActiveBars5 >= active
+#          AND ContractLowDistance <= low_dist_max
+STAIRSTEP_WEIGHTS          = (1.00, 0.60, 0.35, 0.20, 0.10)
+STAIRSTEP_EXCITATION_MIN   = float(os.getenv('STAIRSTEP_EXCITATION_MIN',   '0.70'))
+STAIRSTEP_WINDOW_RATIO_MIN = float(os.getenv('STAIRSTEP_WINDOW_RATIO_MIN', '2.5'))
+STAIRSTEP_ACTIVE_MIN       = int(os.getenv('STAIRSTEP_ACTIVE_MIN', '3'))
+STAIRSTEP_LOW_DIST_MAX     = float(os.getenv('STAIRSTEP_LOW_DIST_MAX', '2.0'))
+
+# §13 Historical value percentile — (mark-HistLow)/(HistHigh-HistLow) over the
+# current day + prior sessions. Block an alert when the contract is too rich.
+HIST_VALUE_PCTILE_MAX = float(os.getenv('HIST_VALUE_PCTILE_MAX', '0.60'))
+
+# §14 Short-cover risk — a fresh major volume event that mirrors an earlier event
+# of similar size but at a much lower price looks like shorts covering, not new
+# longs. Block when SimilarVolume AND RepriceRatio <= reprice_max.
+SHORT_COVER_FILTER     = os.getenv('SHORT_COVER_FILTER', 'true').lower() == 'true'
+SHORT_COVER_SIM_LOW    = float(os.getenv('SHORT_COVER_SIM_LOW',    '0.70'))
+SHORT_COVER_SIM_HIGH   = float(os.getenv('SHORT_COVER_SIM_HIGH',   '1.50'))
+SHORT_COVER_REPRICE_MAX = float(os.getenv('SHORT_COVER_REPRICE_MAX', '0.50'))
+
+# §15 Opening range — first N minutes after open. Not blocked, but entries need
+# stronger evidence: single-print floor ×mult, cluster WindowRatio5 >= ratio,
+# stair-step ExcitationScore >= excitation.
+OPENING_RANGE_MINUTES        = int(os.getenv('OPENING_RANGE_MINUTES', '15'))
+OPENING_RANGE_VOL_MULT       = float(os.getenv('OPENING_RANGE_VOL_MULT', '1.5'))
+OPENING_RANGE_CLUSTER_RATIO  = float(os.getenv('OPENING_RANGE_CLUSTER_RATIO', '4.0'))
+OPENING_RANGE_EXCITATION_MIN = float(os.getenv('OPENING_RANGE_EXCITATION_MIN', '0.80'))
+
+# Exit-target shift — the nearest opposite level is usually too close, so skip it:
+#   CALL entered at support    → Exit1 = R2, Exit2 = R3  (skip R1)
+#   PUT  entered at resistance → Exit1 = S2, Exit2 = S3  (skip S1)
+# Fall back to the nearest (R1/S1) only when no farther level exists. After the
+# shift, drop any target still within EXIT_MIN_ROOM_PCT of the entry spot.
+EXIT_MIN_ROOM_PCT = float(os.getenv('EXIT_MIN_ROOM_PCT', '0.0025'))   # 0.25%
+
 # ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
 CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
 CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2

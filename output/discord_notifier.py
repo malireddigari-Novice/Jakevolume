@@ -69,10 +69,16 @@ def _fmt_stop(entry: Optional[float]) -> str:
 
 def send_signal(sig: dict) -> None:
     """
-    Send a fired signal as a compact two-line Discord embed.
+    Send a Simplified V1 entry alert (§20) — a single compact card:
 
-    Line 1:  📈 TSLA 440C  2.15  5/29 @10:30
-    Line 2:  Spot 440.29  |  Exit 1/2 @ R1 442.5  |  Exit 1/2 @ R2 445  |  Stoploss 80 cents
+        AAPL 315P @ 1.40
+        Spot: 315.20
+        Level: R1 315
+        Volume: 497
+        Ratio: 12.4x
+        ContractLowDistance: 1.18
+
+    No volume-shape label, spread, target room, or exit/stop lines (§1).
     """
     url = config.DISCORD_WEBHOOK_URL
     if not url:
@@ -83,7 +89,6 @@ def send_signal(sig: dict) -> None:
     colour      = _GREEN if signal_type == 'BULLISH' else _RED
     arrow       = '📈' if signal_type == 'BULLISH' else '📉'
 
-    # ── Line 1: symbol  strike+side  entry_price  expiry @time ───────────────
     price_to_enter = sig.get('price_to_enter')
     enter_str  = f"{price_to_enter:.2f}" if price_to_enter else 'n/a'
 
@@ -92,63 +97,40 @@ def send_signal(sig: dict) -> None:
     side_char  = 'C' if opt_type == 'CALL' else 'P' if opt_type == 'PUT' else ''
     strike_str = f"{_fmt_level(strike)}{side_char}" if strike else ''
 
-    expiry   = sig.get('expiry')
-    expiry_s = f"{expiry.month}/{expiry.day}" if expiry else ''
-
-    sig_time = sig.get('signal_time')
-    if isinstance(sig_time, datetime):
-        h = sig_time.hour % 12 or 12
-        time_str = f"{h}:{sig_time.minute:02d}"
-    else:
-        time_str = ''
-
-    line1 = f"{arrow} **{symbol} {strike_str}  {enter_str}  {expiry_s} @{time_str}**"
-
-    # ── Line 2: exits and stoploss ─────────────────────────────────────────────
-    exit1 = sig.get('exit1_price')
-    exit2 = sig.get('exit2_price')
-    lbl1, lbl2 = ('R1', 'R2') if signal_type == 'BULLISH' else ('S1', 'S2')
-
-    spot = sig.get('trigger_price')
-
-    parts: list[str] = []
-    if spot is not None:
-        parts.append(f"Spot {spot:.2f}")
-    if exit1 is not None:
-        parts.append(f"Exit 1/2 @ {lbl1} {_fmt_level(exit1)}")
-    if exit2 is not None:
-        parts.append(f"Exit 1/2 @ {lbl2} {_fmt_level(exit2)}")
-    parts.append(f"Stoploss {_fmt_stop(price_to_enter)}")
-    line2 = '  |  '.join(parts)
-
-    # ── Line 3: volume detail ──────────────────────────────────────────────────
+    spot      = sig.get('trigger_price')
+    label     = sig.get('level_label', '')
     atm_vol   = sig.get('atm_vol_1m')
     atm_ratio = sig.get('atm_spike_ratio')
-    itm_vol   = sig.get('itm_vol_1m')
-    itm_ratio = sig.get('itm_spike_ratio')
+    low_dist  = sig.get('low_dist')
 
-    vol_parts: list[str] = []
-    if atm_vol is not None:
-        ratio_s = f" x{atm_ratio:.1f}" if atm_ratio else ''
-        vol_parts.append(f"ATM Vol {atm_vol:,}{ratio_s}")
-    if itm_vol is not None:
-        ratio_s = f" x{itm_ratio:.1f}" if itm_ratio else ''
-        vol_parts.append(f"ITM Vol {itm_vol:,}{ratio_s}")
-    line3 = '  |  '.join(vol_parts)
-
-    # ── Assemble and send ──────────────────────────────────────────────────────
-    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
+    sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
-    body = f"{prefix}{line1}\n\n{line2}"
-    if line3:
-        body += f"\n\n{line3}"
+    lines = [f"{arrow} **{symbol} {strike_str} @ {enter_str}**"]
+    if spot is not None:
+        lines.append(f"Spot: {spot:.2f}")
+    lines.append(f"Level: {label} {_fmt_level(strike)}".rstrip())
+    if atm_vol is not None:
+        lines.append(f"Volume: {atm_vol:,}")
+    if atm_ratio:
+        lines.append(f"Ratio: {atm_ratio:.1f}x")
+    if low_dist is not None:
+        lines.append(f"ContractLowDistance: {low_dist:.2f}")
 
+    # Shifted exit targets (skip the too-close nearest level).
+    exit1 = sig.get('exit1_price')
+    exit2 = sig.get('exit2_price')
+    if exit1 is not None:
+        lines.append(f"Exit 1/2 @ {_fmt_level(exit1)}")
+    if exit2 is not None:
+        lines.append(f"Exit rest @ {_fmt_level(exit2)}")
+
+    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     payload = {
         "embeds": [{
-            "description": body,
+            "description": prefix + "\n".join(lines),
             "color":  colour,
-            "footer": {"text": "Jakevolume 0DTE" + (" — SAMPLE ONLY" if config.SAMPLE_MODE else "")},
+            "footer": {"text": "Jakevolume V1" + (" — SAMPLE ONLY" if config.SAMPLE_MODE else "")},
             **({"timestamp": ts} if ts else {}),
         }]
     }

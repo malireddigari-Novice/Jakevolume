@@ -19,6 +19,11 @@ _SNAPSHOT     = time(config.SNAPSHOT_HOUR,      config.SNAPSHOT_MINUTE)
 _WARMUP_END = (datetime.combine(date.min, _MARKET_OPEN)
                + timedelta(minutes=config.SIGNAL_WARMUP_MINUTES)).time()
 
+# End of the opening-range window (open + OPENING_RANGE_MINUTES). Unlike warm-up,
+# the opening range is not suppressed — it only raises entry thresholds.
+_OPENING_RANGE_END = (datetime.combine(date.min, _MARKET_OPEN)
+                      + timedelta(minutes=config.OPENING_RANGE_MINUTES)).time()
+
 
 def now_cst() -> datetime:
     return datetime.now(CST)
@@ -76,6 +81,24 @@ def is_past_snapshot(dt: datetime = None) -> bool:
         return False
     t = dt.time().replace(second=0, microsecond=0)
     return _SNAPSHOT <= t < _MARKET_CLOSE
+
+
+def is_opening_range(dt: datetime = None) -> bool:
+    """
+    True during the first OPENING_RANGE_MINUTES after open (08:30 CST).
+
+    The opening range is NOT blocked — the detector still scores and may fire in
+    this window, but entries require stronger evidence (higher volume floors,
+    cluster ratio, and excitation thresholds). Returns False when the window is 0.
+    """
+    if config.OPENING_RANGE_MINUTES <= 0:
+        return False
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    t = dt.time().replace(second=0, microsecond=0)
+    return _MARKET_OPEN <= t < _OPENING_RANGE_END
 
 
 def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:

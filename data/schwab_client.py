@@ -385,6 +385,46 @@ class SchwabClient:
                            occ_symbol, exc)
             return None
 
+    def get_option_history_range(
+        self, occ_symbol: str, lookback_days: int = None
+    ) -> Optional[tuple[float, float]]:
+        """
+        (historical_low, historical_high) for an option contract over the last
+        `lookback_days` calendar days (daily candles), or None if unavailable.
+
+        Backs the §13 historical-value-percentile gate. 0DTE contracts have no
+        prior-day history and return None, making the gate a no-op those days.
+        Returns None on any error so the caller treats it as "gate not applicable".
+        """
+        lookback_days = lookback_days or config.OPT_HIST_LOOKBACK_DAYS
+        if not self._client:
+            return None
+        try:
+            now   = datetime.now(CST)
+            start = now - timedelta(days=lookback_days)
+            resp  = self._client.get_price_history_every_day(
+                occ_symbol,
+                start_datetime=start,
+                end_datetime=now,
+                need_extended_hours_data=False,
+            )
+            resp.raise_for_status()
+            candles = resp.json().get('candles', [])
+            lows  = [float(c['low'])  for c in candles
+                     if c.get('low')  is not None and float(c['low'])  > 0]
+            highs = [float(c['high']) for c in candles
+                     if c.get('high') is not None and float(c['high']) > 0]
+            if not lows or not highs:
+                return None
+            lo, hi = min(lows), max(highs)
+            logger.debug("Schwab: %s — %d-day hist range low=%.4f high=%.4f (%d candles)",
+                         occ_symbol, lookback_days, lo, hi, len(candles))
+            return lo, hi
+        except Exception as exc:
+            logger.warning("Schwab: get_option_history_range failed for %s: %s",
+                           occ_symbol, exc)
+            return None
+
     def get_nearest_expiry(self, symbol: str) -> Optional[date]:
         """
         Return the nearest available option expiry for a symbol.

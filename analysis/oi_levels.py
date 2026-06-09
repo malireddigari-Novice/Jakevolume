@@ -1,28 +1,22 @@
 """
-OI-based support / resistance level computation — Step-1 spec (8:20 AM CST).
+OI-based support / resistance level computation — Simplified V1 (8:20 AM CST).
 
-Algorithm (6 levels per symbol)
----------------------------------
-R1 = nearest call strike strictly above ATM (proximity).
-S1 = nearest put  strike at or below ATM (proximity — ATM strike included).
+Algorithm (§3 — 6 levels per symbol)
+------------------------------------
+Anchor on the pre-market spot (Spot0). Consider only strikes within ±5% of spot.
 
-R2 = highest OI among the NEXT 2 call strikes above ATM after R1.
-S2 = highest OI among the NEXT 2 put  strikes below ATM after S1.
+  CALL RESISTANCE : valid call strikes   Spot0 <= Strike <= Spot0 * 1.05
+                    rank by CALL open interest, top 3 → R1, R2, R3
+  PUT  SUPPORT    : valid put strikes     Spot0 * 0.95 <= Strike <= Spot0
+                    rank by PUT  open interest, top 3 → S1, S2, S3
 
-R3 = highest OI among the next pair of 2 call strikes after the R2 window.
-S3 = highest OI among the next pair of 2 put  strikes after the S2 window.
-
-Example — AAPL prev_close=304.99, ATM=305, OTM puts: 305, 302.5, 300, 297.5, 295 …
-  S1 = 305  (ATM put, nearest)
-  S2 = max_OI(302.5, 300)  → whichever has higher OI
-  S3 = max_OI(297.5, 295)  → whichever has higher OI
-
-ATM is excluded from resistance (calls) but included in support (puts).
+Rank 1 is the highest-OI strike on each side (R1/S1), not the nearest. These are
+watch zones only; intraday proximity + volume decide whether anything fires.
 
 Level semantics
 ---------------
-  RESISTANCE  (R1/R2/R3)  — anchored by Call OI above ATM
-  SUPPORT     (S1/S2/S3)  — anchored by Put  OI below ATM
+  RESISTANCE  (R1/R2/R3)  — highest Call OI in [spot, spot*1.05]
+  SUPPORT     (S1/S2/S3)  — highest Put  OI in [spot*0.95, spot]
 """
 import logging
 from typing import Optional
@@ -37,18 +31,18 @@ def compute_oi_levels(
     underlying_price: float,
 ) -> list[dict]:
     """
-    Compute 6 S/R levels (R1-R3, S1-S3) from a normalised option chain.
+    Compute up to 6 S/R levels (R1-R3, S1-S3) from a normalised option chain.
 
     Parameters
     ----------
     chain            : Output of DatabentoClient.get_option_chain() or equivalent.
-    underlying_price : 8:20 AM spot price used as the ATM anchor.
+    underlying_price : 8:20 AM spot price used as the band anchor (Spot0).
 
     Returns
     -------
     list[dict]  — each dict:
         level_type    : 'SUPPORT' | 'RESISTANCE'
-        rank          : 1 | 2 | 3
+        rank          : 1 | 2 | 3   (1 = highest OI on that side)
         strike        : float
         open_interest : int
         option_type   : 'CALL' (resistance) | 'PUT' (support)
@@ -60,35 +54,22 @@ def compute_oi_levels(
 
     spot = underlying_price
     chain_expiry: Optional[object] = chain.get('expiry')
+    band = config.OI_LEVEL_BAND_PCT
+    call_hi = spot * (1 + band)
+    put_lo  = spot * (1 - band)
 
-    # ATM = strike closest to spot
-    all_strikes = sorted(set(float(c['strike']) for c in all_contracts))
-    if not all_strikes:
-        return []
-    atm_strike = min(all_strikes, key=lambda s: abs(s - spot))
-
-    # Resistance: call strikes strictly above ATM, sorted nearest-first (ASC)
-    call_strikes_above = sorted(
-        s for s in all_strikes if s > atm_strike
-    )
-
-    # Support: put strikes at or below ATM, sorted nearest-first (DESC)
-    put_strikes_below = sorted(
-        (s for s in all_strikes if s <= atm_strike),
-        reverse=True,
-    )
+    # Top-3 by OI within the ±band window, deduplicated by strike (keep highest
+    # OI at each strike). Calls at/above spot → resistance; puts at/below → support.
+    call_in_band = [c for c in all_contracts
+                    if c['option_type'] == 'CALL' and spot <= float(c['strike']) <= call_hi]
+    put_in_band  = [c for c in all_contracts
+                    if c['option_type'] == 'PUT'  and put_lo <= float(c['strike']) <= spot]
 
     levels: list[dict] = []
-
-    for rank, strike in enumerate(_select_levels(call_strikes_above, all_contracts, 'CALL'), start=1):
-        c = _best_contract(all_contracts, strike, 'CALL')
-        if c:
-            levels.append(_make_level('RESISTANCE', rank, c, chain_expiry))
-
-    for rank, strike in enumerate(_select_levels(put_strikes_below, all_contracts, 'PUT'), start=1):
-        c = _best_contract(all_contracts, strike, 'PUT')
-        if c:
-            levels.append(_make_level('SUPPORT', rank, c, chain_expiry))
+    for rank, c in enumerate(_top_by_oi(call_in_band, config.TOP_N_LEVELS), start=1):
+        levels.append(_make_level('RESISTANCE', rank, c, chain_expiry))
+    for rank, c in enumerate(_top_by_oi(put_in_band, config.TOP_N_LEVELS), start=1):
+        levels.append(_make_level('SUPPORT', rank, c, chain_expiry))
 
     # ── Logging ──────────────────────────────────────────────────────────────
     rl = _side(levels, 'RESISTANCE')
@@ -100,9 +81,9 @@ def compute_oi_levels(
         return '-'
 
     logger.info(
-        "OI levels  price=%.4f  ATM=%.4f | "
+        "OI levels  price=%.4f  band=±%.0f%% | "
         "R1=%s  R2=%s  R3=%s | S1=%s  S2=%s  S3=%s",
-        spot, atm_strike,
+        spot, config.OI_LEVEL_BAND_PCT * 100,
         _fmt(rl, 0), _fmt(rl, 1), _fmt(rl, 2),
         _fmt(sl, 0), _fmt(sl, 1), _fmt(sl, 2),
     )
@@ -135,58 +116,6 @@ def get_top_oi_snapshot(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _select_levels(
-    ordered_strikes: list[float],
-    all_contracts: list[dict],
-    opt_type: str,
-) -> list[float]:
-    """
-    Return 3 strikes using the window rule:
-      level 1 → ordered_strikes[0]  (nearest, always)
-      level 2 → highest OI of ordered_strikes[1:3]  (next pair)
-      level 3 → highest OI of ordered_strikes[3:5]  (pair after that)
-    """
-    chosen: list[float] = []
-
-    # Level 1: nearest
-    if len(ordered_strikes) >= 1:
-        chosen.append(ordered_strikes[0])
-
-    # Levels 2 and 3: non-overlapping pairs
-    windows = [ordered_strikes[1:3], ordered_strikes[3:5]]
-    for window in windows:
-        if not window:
-            break
-        best_strike = max(
-            window,
-            key=lambda s: _oi_at(all_contracts, s, opt_type),
-        )
-        chosen.append(best_strike)
-
-    return chosen
-
-
-def _oi_at(contracts: list[dict], strike: float, opt_type: str) -> int:
-    """Return the highest OI at a given strike and option type."""
-    return max(
-        (c.get('open_interest', 0)
-         for c in contracts
-         if float(c['strike']) == strike and c['option_type'] == opt_type),
-        default=0,
-    )
-
-
-def _best_contract(contracts: list[dict], strike: float, opt_type: str) -> Optional[dict]:
-    """Return the highest-OI contract at the given strike and option type."""
-    matching = [
-        c for c in contracts
-        if float(c['strike']) == strike
-        and c['option_type'] == opt_type
-        and c.get('open_interest', 0) > 0
-    ]
-    return max(matching, key=lambda c: c.get('open_interest', 0)) if matching else None
-
 
 def _top_by_oi(contracts: list[dict], n: int) -> list[dict]:
     """Deduplicate by strike (keep highest OI), return top-n sorted by OI descending."""

@@ -29,10 +29,10 @@ import single_instance
 from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
-from analysis.signal_detector import SignalDetector
+from analysis.signal_detector import SignalDetector, compute_exit_targets
 from data.market_utils import (
     now_cst, today_cst,
-    is_market_open, is_snapshot_window, is_past_snapshot, is_eod_window, is_warmup,
+    is_market_open, is_snapshot_window, is_past_snapshot, is_eod_window, is_opening_range,
 )
 from data.schwab_client import SchwabClient
 from data.databento_client import DatabentoClient
@@ -348,13 +348,13 @@ def intraday_check(
             # Morning P/C ratio for conviction multiplier
             pc_ratio = db.get_today_pc_ratio(symbol, today)
 
-            # Historical-low entry gate: let the detector fetch a contract's
-            # multi-day low on demand (Schwab daily candles), cached per day.
-            hist_low_fn = (schwab.get_option_history_low
-                           if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
+            # §13 historical-value gate: let the detector fetch a contract's
+            # multi-day (low, high) on demand (Schwab daily candles), cached per day.
+            hist_range_fn = (schwab.get_option_history_range
+                             if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio, chain_quotes=chain_quotes,
-                                     warmup=is_warmup(), hist_low_fn=hist_low_fn,
+                                     opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
                                      fired_today_fn=db.get_fired_directions_today)
 
             for sig in signals:
@@ -511,23 +511,19 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         )
         return
 
-    # ── Exit targets: use the signal's own targets so the next-day level flip is
-    # honored (the detector already picked position-based exits). Fall back to
-    # rank-ordered morning levels only if the signal didn't carry them. ──
+    # ── Exit targets: use the signal's own shifted targets (skip-nearest rule).
+    # Fall back to recomputing them with the same rule only if the signal didn't
+    # carry them. ──
     exit1_underlying = sig.get('exit1_price')
     exit2_underlying = sig.get('exit2_price')
     if exit1_underlying is None:
         try:
             levels = db.get_today_levels(symbol, today_cst())
-            opp = 'RESISTANCE' if signal_type == 'BULLISH' else 'SUPPORT'
-            targets = sorted(
-                [lv for lv in levels if lv['level_type'] == opp],
-                key=lambda x: x['rank'],
+            spot   = float(sig.get('trigger_price') or strike)
+            exit1_underlying, exit2_underlying = compute_exit_targets(
+                signal_type, spot, levels,
+                position_only=(sig.get('day_mode') == 'NEXT_DAY'),
             )
-            if len(targets) >= 1:
-                exit1_underlying = float(targets[0]['strike'])
-            if len(targets) >= 2:
-                exit2_underlying = float(targets[1]['strike'])
         except Exception:
             logger.warning("Alpaca: could not resolve exit targets for %s", symbol, exc_info=True)
 
