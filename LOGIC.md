@@ -1,7 +1,10 @@
 # Jakevolume — System Logic
 
-End-to-end logic of the 0DTE / next-day OI-alerting system, broken into small
-sequential steps. Reflects the current code. Times are CST.
+End-to-end logic of the <span style="color:#1a7f37">**Simplified V1**</span> Mag-7 call/put alert engine,
+broken into small sequential steps. Times are CST.
+
+> **Legend:** <span style="color:#1a7f37">green = added / changed in V1</span> ·
+> <span style="color:#d1242f">~~red strikethrough = removed in V1~~</span> · black = unchanged.
 
 ---
 
@@ -9,28 +12,28 @@ sequential steps. Reflects the current code. Times are CST.
 
 1. **Windows Task Scheduler** launches `run_scheduled.bat` at **08:10 CST** daily.
 2. The bat is a **watchdog** — it restarts `main.py` on crash every 5 min until 15:15.
-3. `main.py` boots: connects the Postgres pool, runs `init_schema()` (idempotent migrations), logs into Schwab (token auto-refresh), connects Google Sheets, optionally inits Databento/Alpaca.
-4. It enters a **60-second loop**. Each tick checks three time windows: snapshot (08:20), market hours (08:30–15:00), EOD (14:55). The 10-minute gap between launch (08:10) and snapshot (08:20) is deliberate warm-up.
+3. `main.py` boots: connects the Postgres pool, runs `init_schema()`, logs into Schwab (token auto-refresh), connects Google Sheets, optionally inits Databento/Alpaca.
+4. It enters a **60-second loop**. Each tick checks time windows: snapshot (08:20), market hours (08:30–15:00), EOD (14:55).
+5. <span style="color:#1a7f37">**[NEW] Catch-up snapshot** — if the process starts/restarts *after* the 08:20 window (e.g. a watchdog crash-restart) and today has no snapshot yet, the morning snapshot runs immediately as a catch-up, so a late start still gets levels + a briefing. Skipped (no duplicate) if today's levels already exist in the DB.</span>
 
 ---
 
-## B. Morning snapshot — once per day at 08:20 CST
+## B. Morning snapshot — once per day at 08:20 CST (or catch-up)
 
-For **each of the 9 symbols** (AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA, SPY, QQQ):
+For **each symbol** <span style="color:#d1242f">~~(9 symbols incl. SPY, QQQ)~~</span> <span style="color:#1a7f37">(7 Mag-7: AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA)</span>:
 
-5. **Fetch prices** — `prev_close` (yesterday's close) and `pm_price` = current/pre-market last price from Schwab (`pm_price = lastPrice or prev_close`).
-6. **Fetch the option chain** — Schwab's nearest expiry that has both calls and puts. On Mon/Wed/Fri this is **today (0DTE)**; on Tue/Thu it's the **next available expiry**.
-7. **Compute the 6 OI levels** anchored to the **8:20 spot** (`pm_price`):
-   - ATM = strike nearest spot.
-   - **R1** = nearest call strike above ATM; **R2** = higher-OI of the next 2 call strikes; **R3** = higher-OI of the pair after that.
-   - **S1** = nearest put strike at/below ATM; **S2/S3** = same window rule going down.
-   - Each level stores: type (SUPPORT/RESISTANCE), rank (1–3), strike, OI, option_type, expiry.
-8. **Compute sentiment** — pre-market drift (`pm_price` vs `prev_close`) + put/call OI ratio → bias (BULL/BEAR/NEUTRAL).
-9. **Top-OI snapshot** — the 2 highest-OI call and put strikes near ATM (reference).
-10. **Persist to Postgres** — full chain snapshot, the 6 OI levels, morning sentiment (all anchored to `pm_price`).
-11. **Log to Google Sheets** — daily levels, OI snapshot, sentiment, comparison row.
-12. **Print + send the briefing** — console table + Discord morning message.
-13. **Retention prune** — keep only the most recent **10 trading days** of 1-min data (`price_bars`, `option_level_bars`); delete older. Alerts/signals are never pruned. No-op until 10 days exist.
+6. **Fetch prices** — `prev_close` and `pm_price` (current/pre-market last) from Schwab.
+7. **Fetch the option chain** — nearest expiry with both calls and puts. Mon/Wed/Fri = **today (0DTE)**; Tue/Thu = **next expiry (1DTE)**.
+8. **Compute the 6 OI levels** anchored to the **8:20 spot** (`pm_price`):
+   - <span style="color:#d1242f">~~ATM = nearest strike. R1 = nearest call above ATM; R2/R3 = higher-OI of the next 2-strike windows. S1 = nearest put ≤ ATM; S2/S3 = same window rule down.~~</span>
+   - <span style="color:#1a7f37">**[CHANGED] Within ±5% of spot, rank by OI, take the top 3 per side:** CALL strikes in `[spot, spot×1.05]` ranked by call OI → **R1/R2/R3** (R1 = highest OI). PUT strikes in `[spot×0.95, spot]` ranked by put OI → **S1/S2/S3**. Rank 1 = highest OI, *not* nearest. Out-of-band strikes are ignored.</span>
+   - Each level stores: type, rank (1–3), strike, OI, option_type, expiry.
+9. **Compute sentiment** — pre-market drift + put/call OI ratio → bias.
+10. **Top-OI snapshot** — 2 highest-OI call & put strikes near ATM (reference).
+11. **Persist to Postgres** — chain snapshot, the 6 OI levels, morning sentiment.
+12. **Log to Google Sheets** — daily levels, OI snapshot, sentiment, comparison row.
+13. **Print + send the briefing** — console table + Discord morning message.
+14. **Retention prune** — keep the most recent **10 trading days** of 1-min data.
 
 ---
 
@@ -38,147 +41,135 @@ For **each of the 9 symbols** (AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA, SPY, Q
 
 For **each symbol**:
 
-14. **Equity bars** — Schwab pulls the **full session** of 1-min bars (`SESSION_BARS=400`). The detector is handed only the trailing 40 (`BARS_TO_FETCH`); the full set is persisted.
-15. **Persist 7 fields/bar** to `price_bars`: open, high(max), low(min), close, volume(per-min), spot_price, cum_volume (running session total; NULL on the partial Databento path).
-16. `underlying_price = last bar's close`.
-17. **Load today's 6 levels** from Postgres. If none, skip the symbol.
-18. **Watched option quotes** — Schwab returns the **3 nearest strikes per side** to spot (so a real ATM + ITM pair exists), each with bid/ask/mark/volume/OI/day-high/day-low.
-19. **(Tue/Thu only)** fetch the **full option chain** (`chain_quotes`) so the detector can price an OTM target strike.
-20. **Collect level-option bars** — for each of the 6 level contracts, pull 1-min OHLCV and upsert to `option_level_bars` (full-session, self-backfilling).
-21. **Get the morning P/C ratio** (conviction context).
-22. **Run the detector** (Section D) → 0 or 1 signal.
-23. For each returned signal: save to `signals`, log to Sheets, send Discord/desktop notification, and **auto-trade** if it's actionable (not WATCH, not an upgrade, Alpaca enabled).
+15. **Equity bars** — Schwab pulls the **full session** (`SESSION_BARS=400`); detector gets the trailing 40 (`BARS_TO_FETCH`); full set persisted to `price_bars`.
+16. **Staleness guard** — skip the symbol if the newest bar isn't today's or is > `MAX_BAR_AGE_SECONDS` (300 s) old.
+17. `underlying_price` = freshest live quote (fallback: last bar close).
+18. **Load today's 6 levels** from Postgres. If none, skip the symbol.
+19. **Watched option quotes** — Schwab returns the **3 nearest strikes per side** to spot, each with bid/ask/mark/volume/OI/day-high/day-low.
+20. **(Tue/Thu only)** fetch the **full chain** so the detector can price a target OTM strike.
+21. **Collect level-option bars** — 1-min OHLCV for the 6 level contracts → `option_level_bars`.
+22. **Run the detector** (Section D) → 0 or 1 signal per direction.
+23. For each signal: save to `signals`, log to Sheets, send Discord/desktop notification, and **auto-trade** if Alpaca is enabled. <span style="color:#d1242f">~~(unless WATCH or an upgrade)~~</span> <span style="color:#1a7f37">(every emitted V1 signal is actionable — there are no WATCH/upgrade signals)</span>.
 24. **Check exits** on open trades (Section H).
-25. **Positioning monitor** (Databento) — tracks unusual cluster accumulation without firing signals.
 
 ---
 
 ## D. The detection pipeline (`detector.check`) — per symbol, per bar
 
 ### D1. Setup
-26. Take the latest bar; `close_price` = its close; `today` = its date.
-27. **Determine mode**: `next_day_mode = NEXT_DAY_MODE_ENABLED and expiry > today` (i.e., no 0DTE today = Tue/Thu).
-28. **Daily reset** of all intraday state when the date changes.
+25. Take the latest bar; `close_price` = its close; `today` = its date.
+26. `next_day_mode = NEXT_DAY_MODE_ENABLED and expiry > today` (1DTE / Tue·Thu).
+27. **Daily reset** of all intraday state when the date changes <span style="color:#1a7f37">(incl. the historical-range cache and short-cover event store)</span>.
+28. **Durable dedup fold-in** — read directions already fired today from the `signals` table and mark them fired (survives restarts / a 2nd instance).
+29. <span style="color:#1a7f37">**[CHANGED] Opening range (§15)** — during the first `OPENING_RANGE_MINUTES` (15) after open, the bar is **not** suppressed; instead the volume thresholds below are *raised*. <span style="color:#d1242f">~~(Old: a 5-min warm-up emitted nothing.)~~</span></span>
 
 ### D2. Per-contract volume bookkeeping (all watched quotes)
-29. For each watched `(strike, type)`: read cumulative day volume.
-30. **Discontinuity guard** — if this contract wasn't seen on the previous bar (gap > 1.5× poll interval), treat re-entry as fresh: **delta = 0** and clear its history (prevents fake spikes from strike rotation).
-31. Otherwise **delta = current_cumulative − previous_cumulative** (clamped ≥ 0) — the proxy for "1-minute volume".
-32. Append delta to that contract's rolling history (deque of 15).
-33. Track the contract's **lowest mark** seen.
+30. For each watched `(strike, type)`: read cumulative day volume.
+31. **Discontinuity guard** — if not seen on the previous bar (gap > 1.5× poll), treat re-entry as fresh: **delta = 0**, clear history.
+32. Otherwise **delta = current − previous cumulative** (≥ 0) — the "1-minute volume".
+33. Append delta to the contract's rolling history; track its lowest mark.
 
 ### D3. Per-level loop — for each of the 6 levels
-34. **Effective role**:
-    - 0DTE: use the frozen morning type (SUPPORT/RESISTANCE).
-    - Next-day: role = position vs spot, with a **deadband** — clearly above strike → SUPPORT; clearly below → RESISTANCE; inside the band → keep frozen role.
+34. <span style="color:#d1242f">~~Effective role: 0DTE keeps the frozen type; next-day flips role by spot position with a deadband.~~</span> <span style="color:#1a7f37">**[CHANGED] Role is always the frozen morning type** (SUPPORT/RESISTANCE). Dynamic S/R flipping removed.</span>
 35. From role: `confirm_type` (CALL at support / PUT at resistance) and `signal_type` (BULLISH/BEARISH).
-36. **Proximity gate** — score by distance: ≤0.25%→1.0, ≤0.35%→0.7, ≤0.50%→0.5, beyond→**skip** (out of range).
-37. **Pick ATM + 1 ITM** confirm-side contracts: ATM = nearest strike to spot; ITM = nearest strike genuinely in-the-money (below spot for calls, above for puts).
+36. <span style="color:#d1242f">~~Proximity score by distance band (0.25%→1.0, 0.35%→0.7, 0.50%→0.5).~~</span> <span style="color:#1a7f37">**[CHANGED] Binary proximity** — `NearLevel` if `|spot−level|/spot ≤ 0.0035` (default) or `≤ 0.0050` for **TSLA/NVDA**. Not near → log `NOT_NEAR_LEVEL`, skip.</span>
+37. **Pick ATM + 1 ITM** confirm-side contracts (ATM nearest spot; ITM one strike in-the-money).
 
-### D4. Volume validation (per contract — ATM and ITM)
-38. **Single print** — valid if `delta ≥ floor` (300 big-caps / 750 NVDA·TSLA) **AND** `delta / max(avgPrior10, 10) ≥ 8×`.
-39. **5-bar cluster** — over the last 5 deltas: `WindowRatio = sum / (5 × max(avgPrior10,10)) ≥ 3×` **AND** `ActiveBars (per-bar ratio ≥ 2×) ≥ 3`.
-40. **Contract-low filter** — `low_dist = mark / min(watched-low, day_low)`; **NearLow** if ≤1.75 (required to qualify a print); **TooChased** if >2.50 (hard block on the ATM).
-41. **Near-low-qualified validity**: `atm_single`, `atm_cluster`, `itm_single`, `itm_cluster` (each = raw validity AND that contract is near its low).
-42. **Combine**:
-    - `atm_itm_confirm` = ATM valid **and** ITM valid
-    - `cluster_valid` = ATM **or** ITM cluster
-    - `extreme_single` = ATM **or** ITM near-low single print
+### D4. Volume validation — a valid signal needs **any one** of §9/§10/§11 (per contract, ATM or ITM)
+38. **§9 Extreme single print** — `delta ≥ floor` (300 / 750 NVDA·TSLA) **AND** `delta / max(avgPrior10,10) ≥ 8×` **AND** `low_dist ≤ 1.75`.
+39. **§10 Cluster** (last 5 deltas) — <span style="color:#1a7f37">**[ADDED] `WindowVol5 ≥ floor` (300 / 600)** **AND**</span> `WindowRatio5 ≥ 3×` **AND** `ActiveBars5 (per-bar ≥ 2×) ≥ 3` **AND** `low_dist ≤ 1.75`.
+40. <span style="color:#1a7f37">**[NEW] §11 Stair-step accumulation** — `ExcitationScore ≥ 0.70` **AND** `WindowVol5 ≥ floor (300/600)` **AND** `WindowRatio5 ≥ 2.5` **AND** `ActiveBars5 ≥ 3` **AND** `low_dist ≤ 2.0`, where `ExcitationRaw = 1.0·r[t] + 0.6·r[t-1] + 0.35·r[t-2] + 0.20·r[t-3] + 0.10·r[t-4]` and `ExcitationScore = min(ExcitationRaw,10)/10`. The absolute `WindowVol5` floor (same as the cluster path) stops it firing on ratios alone in a quiet contract.</span>
+41. **§12 Contract-low filter** — `low_dist = mark / min(watched-low, day_low)`; preferred ≤ 1.75 (required by §9/§10); **hard block** if > 2.50 (chased).
+42. <span style="color:#1a7f37">**[CHANGED, opening range]** during the first 15 min: single-print floor ×1.5, cluster `WindowRatio5 ≥ 4.0`, stair-step `ExcitationScore ≥ 0.80`.</span>
+43. `valid_volume = (ATM passes any of §9/§10/§11) OR (ITM passes any)`.
 
-### D5. Hard gates
-43. If nothing notable (no raw single, no raw cluster) → skip the level.
-44. If the ATM contract is **TooChased** (>2.50) → skip (don't chase).
+### D5. Entry gates (block → no alert; §21 logs the reason)
+44. <span style="color:#d1242f">~~Spread gate — block if (ask−bid)/mid > 50%.~~</span> <span style="color:#d1242f">**[REMOVED]** (kept only as a logged field)</span>
+45. <span style="color:#d1242f">~~Target-room gate — require room to the nearest opposing level.~~</span> <span style="color:#d1242f">**[REMOVED]**</span>
+46. **Chased** — ATM `low_dist > 2.50` → block `CONTRACT_CHASED`.
+47. No valid volume → block `NO_VALID_VOLUME_SIGNAL`.
+48. <span style="color:#1a7f37">**[CHANGED] §13 Historical value percentile** — on the contract you'd buy: `pctile = (mark − HistLow)/(HistHigh − HistLow)` over the multi-day window (Schwab daily candles, cached/day). `pctile > 0.60` → block `HISTORICAL_VALUE_TOO_HIGH`. 0DTE has no history → gate skipped. <span style="color:#d1242f">~~(Old: `mark/hist_low ≤ 1.25`, and a failure only downgraded to WATCH.)~~</span></span>
+49. <span style="color:#1a7f37">**[NEW] §14 Short-cover risk** — store prior *major* volume events per contract. If the current major event has `VolumeSimilarity ∈ [0.70, 1.50]` vs a prior event **and** `CurrentPrice/PriorPrice ≤ 0.50` (similar size, much cheaper now → shorts covering), block `SHORT_COVER_RISK`.</span>
+50. **§19 Already alerted** this direction today → block `ALREADY_ALERTED_TODAY`.
 
-### D6. OTM strike (next-day only)
-45. Default trade contract = the ATM-near-spot contract; `traded_strike` = the level strike.
-46. If next-day + full chain available: find the **target level** (nearest opposing level beyond spot — at S3, that's S2) and pick the chain strike nearest it → that becomes the **OTM contract** you'd actually buy.
-
-### D7. Soft gates (downgrade, don't discard)
-47. **Spread** — on the contract you'd trade; OK if ≤ 50% of mid.
-48. **Target room** — distance to the nearest opposing level (position-based in next-day mode); scored; `room_ok` if > 0.
+### D6. Trade contract
+51. <span style="color:#1a7f37">**[CHANGED] Trade the ATM confirm-side contract at/near the level** (the same strike volume was detected on) in **both** 0DTE and next-day mode. `traded_strike` = that contract's strike, so the label, quote, and price always agree. <span style="color:#d1242f">~~(Removed: the 1DTE OTM target-shift that bought a further-OTM strike toward the next level — it made the traded strike differ from the level on Tue/Thu.)~~</span></span>
 
 ---
 
-## E. Classification & confidence (per qualifying level)
+## E. <span style="color:#d1242f">~~Classification & confidence~~</span> <span style="color:#1a7f37">Alert decision — single boolean</span>
 
-49. Evaluate in priority order (all require spread + room OK to be actionable):
-    - **HIGH / `ATM_ITM_CLUSTER`** — `atm_itm_confirm` AND `cluster_valid`.
-    - **MEDIUM_HIGH / `EXTREME_SINGLE_PRINT`** — extreme single at S2/S3 or R2/R3.
-    - **MEDIUM / `VOLUME_PRESSURE_CLUSTER`** — single-side cluster.
-    - **MEDIUM / `EXTREME_SINGLE_PRINT`** — extreme single at rank 1.
-    - **WATCH / `RANDOM_SINGLE_PRINT`** — notable but missing a condition (not near low / no room / no ITM). Recorded + notified, **never traded**.
-49a. **Historical-low entry gate** (`HIST_LOW_ENTRY_GATE`, on by default) — before an actionable entry stands, the contract you'd actually buy (the OTM target in next-day mode) must trade at/near its **multi-day historical low**: `mark / hist_low ≤ HIST_LOW_NEAR_RATIO` (1.25). `hist_low` is the lowest daily candle over `OPT_HIST_LOOKBACK_DAYS` (10) pulled from Schwab, fetched once per contract per day and cached. **0DTE contracts have no prior-day history → gate is a no-op those days** (only bites Tue/Thu next-day mode). A failing entry is **downgraded to WATCH** (still alerted, not auto-traded), never silently dropped.
-50. Build the full signal dict (option prices, exits, P/C conviction, option H/L flag, day_mode, traded_strike, target_level, etc.) and add it to the bar's candidate list.
+52. <span style="color:#d1242f">~~Priority tiers: HIGH / MEDIUM_HIGH / MEDIUM / WATCH, each with spread+room gates; WATCH recorded but never traded.~~</span> <span style="color:#1a7f37">**[REMOVED all tiers.]** A level that passes every gate (§4 near + §5 side + §8 valid volume + §12 not chased + §13 not rich + §14 no short-cover + §19 not yet fired) produces **one actionable signal** (`confidence = HIGH`). No WATCH, no upgrades.</span>
+53. Build the full signal dict (option prices, **shifted exits — Section G**, day_mode, traded_strike, target_level, the §21 metrics, etc.).
 
 ---
 
-## F. Fire decision — one CALL + one PUT per ticker (`_fire_decision` + selection)
+## F. Fire decision — one CALL + one PUT per ticker per day
 
-51. **One alert per direction per ticker per day**, keyed on `(symbol, direction)`:
-    - Never fired this direction → **fire**.
-    - Actionable after a prior WATCH → **fire** (the real call/put entry).
-    - Stronger same-direction signal, only if `EMIT_UPGRADE_ALERT` is on → **upgrade** (a second alert, flagged so it isn't re-traded).
-    - Otherwise (direction already alerted) → **skip**.
-52. Among eligible candidates this bar, pick **actionable first, then highest confidence, then most room** — so the best bullish setup becomes the single call symbol and the best bearish setup the single put symbol.
-53. Record the best rank fired for that direction; return exactly that one signal.
-53a. **Durable dedup** — at the top of each `check`, the directions already fired today are read back from the `signals` table (`get_fired_directions_today`) and folded into `_fired_today` (max confidence per direction). The in-memory state alone is **per-process and lost on restart**, so without this a watchdog restart — or a second concurrent instance — would re-fire the same call/put. With it, the first fire is persisted and every later bar/process sees it and skips. Defends the one-per-direction guarantee across restarts and overlapping instances (the lock is the first line; this is the backstop).
-54. Net effect: **at most one CALL and one PUT symbol per ticker per day** (plus an optional upgrade follow-up only when `EMIT_UPGRADE_ALERT=true`).
+54. Across the in-range levels this bar, keep the **strongest per direction**: lowest rank (highest-OI level) then largest ATM 1-min volume.
+55. <span style="color:#d1242f">~~Upgrade path / WATCH→real promotion.~~</span> <span style="color:#1a7f37">**[REMOVED].**</span> Fire only if this direction hasn't fired today; then mark it fired.
+56. **Durable dedup** backs the one-per-direction guarantee across restarts / overlapping instances (DB is the backstop; the single-instance lock is the first line).
+57. Net: **at most one CALL and one PUT symbol per ticker per day.**
 
 ---
 
-## G. Trade execution (actionable, non-upgrade, Alpaca on)
+## G. <span style="color:#1a7f37">Exit targets — skip-the-nearest shift</span>
 
-54. Strike = `traded_strike` (OTM in next-day mode, else the level strike); entry price = the contract's ask.
-55. **Skip** if: no entry price, no expiry, next-day OTM unresolved, at `MAX_OPEN_POSITIONS`, or portfolio too small for 1 contract.
-56. **Exit targets** = the signal's own `exit1_price`/`exit2_price` (honors the next-day flip); **skip the trade if no exit target exists**.
-57. Quantity split: half at exit 1, remainder at exit 2.
-58. **Stop-loss = 50% of entry premium** (set at entry).
-59. Place the buy-to-open order; persist the trade row; log to Sheets.
+58. <span style="color:#1a7f37">**[CHANGED] The nearest opposing level is usually too close**, so skip it:</span>
+    - <span style="color:#1a7f37">**CALL at support** → Exit1 = 2nd resistance (**R2**), Exit2 = 3rd (**R3**); skip R1.</span>
+    - <span style="color:#1a7f37">**PUT at resistance** → Exit1 = 2nd support (**S2**), Exit2 = 3rd (**S3**); skip S1.</span>
+    - <span style="color:#d1242f">~~(Old: Exit1 = nearest opposing level (R1/S1), Exit2 = next.)~~</span>
+59. <span style="color:#1a7f37">**Fallbacks:** only 2 opposing levels → Exit2 = null; only 1 → use the nearest (R1/S1).</span>
+60. <span style="color:#1a7f37">**Min-room safety** — drop any shifted target within `EXIT_MIN_ROOM_PCT` (0.25%) of the entry spot and advance to the next farther level.</span>
+61. <span style="color:#1a7f37">These exits are shown on the Discord card (`Exit 1/2 @ … / Exit rest @ …`) and used by the exit state machine.</span>
 
 ---
 
-## H. Exit management (every bar, per open trade)
+## H. Trade execution & exit management (Alpaca on)
 
-60. **Stop-loss first** — if current mark ≤ stop, close the **entire remaining** qty, mark stopped. (Soft, poll-based.)
-61. **Exit 1** — when underlying reaches R1/S1: sell half, then **raise the stop to breakeven (entry)**.
-62. **Opposite-side check** — after exit 1, if opposite-side volume clusters at the target, close the remainder early.
-63. **Exit 2** — when underlying reaches R2/S2 (or the early opposite-side trigger): sell the remainder.
+62. Strike = `traded_strike`; entry = the contract's ask. **Skip** if no price/expiry, at `MAX_OPEN_POSITIONS` (atomic via `max(alpaca count, DB open count)`), or portfolio too small for 1 contract.
+63. <span style="color:#1a7f37">**[NEW] Entry-fill guard** — before managing exits, confirm Alpaca actually holds the contract (`position_qty(occ) > 0`); an unfilled limit entry never triggers phantom "uncovered" exit orders.</span>
+64. Quantity split half/half; **stop-loss = 50% of entry** (set at entry).
+65. **Stop-loss first** — mark ≤ stop → close remaining qty.
+66. **Exit 1** — underlying reaches the **shifted** Exit1 (R2/S2): sell half, raise stop to breakeven; opposite-side cluster at target → close remainder early.
+67. **Exit 2** — underlying reaches the **shifted** Exit2 (R3/S3), or the early opposite-side trigger: sell the remainder.
 
 ---
 
 ## I. EOD liquidation — 14:55 CST
 
-64. Close all 0DTE positions. With `EOD_CLOSE_NEXT_DAY=true` (default), **next-day positions are also closed** — no overnight hold.
+68. Close all 0DTE positions. With `EOD_CLOSE_NEXT_DAY=true`, next-day positions are also closed — no overnight hold.
 
 ---
 
-## J. Retention
+## J. Discord card (§20)
 
-65. Once per day (end of the morning snapshot), prune `price_bars` + `option_level_bars` to the **last 10 trading days** (`BAR_RETENTION_DAYS`); signals/trades untouched.
+69. <span style="color:#1a7f37">**[CHANGED] Simplified card:**</span>
+    ```
+    AAPL 315P @ 1.40
+    Spot: 315.20
+    Level: R1 315
+    Volume: 497
+    Ratio: 12.4x
+    ContractLowDistance: 1.18
+    Exit 1/2 @ 265
+    Exit rest @ 262.50
+    ```
+    <span style="color:#d1242f">~~No volume-shape label, spread, or target-room shown.~~</span> <span style="color:#1a7f37">(The volume *kind* — single / cluster / stair-step — is computed internally but never surfaced.)</span>
 
 ---
 
-## K. How Tue/Thu (next-day mode) changes the above
+## K. What's stored (Postgres)
 
-66. **Expiry** rolls to next-day automatically (Step 6).
-67. **Levels flip by spot position** each bar, with a deadband (Step 34) — sell into S3 ⇒ S2/S1 act as resistance; push into R3 ⇒ R2/R1 act as support.
-68. **Strike is OTM at the target level** (Step 46) — at S3 you buy the contract at S2; detection volume still comes from the spot-side contracts.
-69. **Exits + room are position-based** (Steps 48, 56); the trade exits at the flipped levels.
-70. Positions still **close at EOD** (`EOD_CLOSE_NEXT_DAY`).
-
----
-
-## L. What's stored (Postgres)
-
-71. `price_bars` (per-min equity OHLCV + spot + cum_volume), `option_level_bars` (per-min OHLCV of the 6 level contracts), `option_chain_snapshots`, `oi_levels`, `morning_sentiment`, `signals` (with confidence/shape/day_mode/traded_strike/target_level/upgrade), `trades`, `volume_clusters`.
+70. `price_bars`, `option_level_bars`, `option_chain_snapshots`, `oi_levels`, `morning_sentiment`, `signals`, `trades`, `volume_clusters`.
 
 ---
 
 ## Notes & caveats
 
-- **"1-minute volume" is an approximation** (Steps 31, 38–39): a quote-delta sampled each poll, not a true candle. It's robust to strike rotation now (Step 30) but still cadence-sensitive between polls.
-- **Stop-loss is a soft, poll-based mark check** (Step 60), not a resting broker order — a fast gap between polls can overshoot the 50% level. The 50% is currently hardcoded in `_execute_trade`.
-- **WATCH alerts and cluster upgrades are never auto-traded** (Steps 49, 51).
+- **"1-minute volume" is an approximation** — a quote-delta sampled each poll, robust to strike rotation but cadence-sensitive.
+- **Stop-loss is a soft, poll-based mark check** (50% hardcoded), not a resting broker order.
+- <span style="color:#1a7f37">**§13 and §14 are data-dependent** (Schwab daily candles / intraday event history) — worth watching the `MONITOR … → <REASON>` logs early to confirm they gate rather than over-block.</span>
 
 ---
 
@@ -187,23 +178,28 @@ For **each symbol**:
 | Setting | Default | Meaning |
 |---|---|---|
 | `SNAPSHOT_HOUR` / `SNAPSHOT_MINUTE` | 08:20 | Morning snapshot time |
+| <span style="color:#1a7f37">`OI_LEVEL_BAND_PCT`</span> | <span style="color:#1a7f37">0.05</span> | <span style="color:#1a7f37">±5% band for top-3-by-OI levels</span> |
+| <span style="color:#1a7f37">`NEAR_LEVEL_DIST_DEFAULT` / `_VOLATILE`</span> | <span style="color:#1a7f37">0.0035 / 0.0050</span> | <span style="color:#1a7f37">Binary proximity (TSLA/NVDA wider)</span> |
 | `OPT_SINGLE_PRINT_RATIO` | 8.0 | Single-print ratio threshold |
-| `OPT_MIN_SINGLE_PRINT_VOL` | 300 / 750 | Per-symbol single-print volume floors |
-| `OPT_CLUSTER_WINDOW` | 5 | Cluster window (bars) |
-| `OPT_CLUSTER_WINDOW_RATIO` | 3.0 | Cluster window-ratio threshold |
-| `OPT_CLUSTER_ACTIVE_MIN` | 3 | Min active bars in the window |
-| `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / TooChased (today's low) |
-| `HIST_LOW_ENTRY_GATE` | true | Require actionable entries to be near the contract's multi-day historical low |
-| `OPT_HIST_LOOKBACK_DAYS` | 10 | Days of Schwab daily candles for the historical low |
-| `HIST_LOW_NEAR_RATIO` | 1.25 | Max `mark / hist_low` for an entry (else downgraded to WATCH) |
-| `SINGLE_PRINT_RANKS` | {2,3} | Ranks eligible for MEDIUM_HIGH single print |
-| `CLUSTER_UPGRADE_ENABLED` | true | Allow higher-confidence upgrades |
-| `EMIT_UPGRADE_ALERT` | false | Whether an upgrade emits a 2nd same-direction alert (off ⇒ one call + one put per ticker) |
-| `EMIT_WATCH_ONLY` | true | Emit non-qualifying prints as WATCH |
-| `NEXT_DAY_MODE_ENABLED` | true | Tue/Thu interchangeable levels + OTM strike |
-| `NEXT_DAY_TARGET_DEPTH` | 1 | Levels to step for the OTM strike |
-| `LEVEL_FLIP_DEADBAND_PCT` | 0.0015 | Deadband before a level flips role |
+| `OPT_MIN_SINGLE_PRINT_VOL` | 300 / 750 | Per-symbol single-print floors |
+| `OPT_CLUSTER_WINDOW` / `_WINDOW_RATIO` / `_ACTIVE_MIN` | 5 / 3.0 / 3 | Cluster window / ratio / active bars |
+| <span style="color:#1a7f37">`OPT_MIN_CLUSTER_WINDOW_VOL`</span> | <span style="color:#1a7f37">300 / 600</span> | <span style="color:#1a7f37">Absolute WindowVol5 floor (§10)</span> |
+| <span style="color:#1a7f37">`STAIRSTEP_WEIGHTS` / `_EXCITATION_MIN` / `_WINDOW_RATIO_MIN`</span> | <span style="color:#1a7f37">1/.6/.35/.2/.1 · 0.70 · 2.5</span> | <span style="color:#1a7f37">Stair-step accumulation (§11)</span> |
+| `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / chased block |
+| `HIST_LOW_ENTRY_GATE` | true | Enable the historical-value gate |
+| `OPT_HIST_LOOKBACK_DAYS` | 10 | Days of daily candles |
+| <span style="color:#1a7f37">`HIST_VALUE_PCTILE_MAX`</span> | <span style="color:#1a7f37">0.60</span> | <span style="color:#1a7f37">Block if value percentile above this (§13)</span> |
+| <span style="color:#1a7f37">`SHORT_COVER_FILTER` / `_SIM_LOW/HIGH` / `_REPRICE_MAX`</span> | <span style="color:#1a7f37">true · 0.70/1.50 · 0.50</span> | <span style="color:#1a7f37">Short-cover risk filter (§14)</span> |
+| <span style="color:#1a7f37">`OPENING_RANGE_MINUTES` / `_VOL_MULT` / `_CLUSTER_RATIO` / `_EXCITATION_MIN`</span> | <span style="color:#1a7f37">15 · 1.5 · 4.0 · 0.80</span> | <span style="color:#1a7f37">Opening-range raised thresholds (§15)</span> |
+| <span style="color:#1a7f37">`EXIT_MIN_ROOM_PCT`</span> | <span style="color:#1a7f37">0.0025</span> | <span style="color:#1a7f37">Min room after the exit-target shift</span> |
+| `NEXT_DAY_MODE_ENABLED` | true | Tue/Thu use the next expiry (1DTE); <span style="color:#1a7f37">trades at the level like 0DTE</span> |
+| <span style="color:#d1242f">~~`NEXT_DAY_TARGET_DEPTH`~~</span> | <span style="color:#d1242f">~~1~~</span> | <span style="color:#d1242f">**[REMOVED]** OTM target-shift no longer used</span> |
 | `EOD_CLOSE_NEXT_DAY` | true | Close next-day positions at EOD |
 | `BAR_RETENTION_DAYS` | 10 | Trading days of 1-min data kept |
-| `COLLECT_LEVEL_BARS` | true | Collect 1-min OHLCV for the 6 levels |
-| `SESSION_BARS` / `BARS_TO_FETCH` | 400 / 40 | Full session vs detector slice |
+| `MAX_OPEN_POSITIONS` / `TRADE_PCT` | 3 / 0.01 | Position cap / size per trade |
+| <span style="color:#d1242f">~~`PROX_BAND_TIGHT/MID/WIDE`~~</span> | <span style="color:#d1242f">~~0.0025/.0035/.0050~~</span> | <span style="color:#d1242f">**[REMOVED]** tiered proximity → binary</span> |
+| <span style="color:#d1242f">~~`MAX_SPREAD_PCT` / `TARGET_ROOM_*`~~</span> | <span style="color:#d1242f">~~0.50 / …~~</span> | <span style="color:#d1242f">**[REMOVED]** spread + target-room gates</span> |
+| <span style="color:#d1242f">~~`SINGLE_PRINT_RANKS` / `CLUSTER_UPGRADE_ENABLED` / `EMIT_UPGRADE_ALERT` / `EMIT_WATCH_ONLY`~~</span> | <span style="color:#d1242f">~~…~~</span> | <span style="color:#d1242f">**[REMOVED]** tiers / WATCH / upgrades</span> |
+| <span style="color:#d1242f">~~`LEVEL_FLIP_DEADBAND_PCT` / `HIST_LOW_NEAR_RATIO`~~</span> | <span style="color:#d1242f">~~0.0015 / 1.25~~</span> | <span style="color:#d1242f">**[REMOVED]** S/R flipping / old hist-low ratio</span> |
+
+> Removed config constants are retained (unused) in `config.py` only so older `test_*.py` imports keep working.

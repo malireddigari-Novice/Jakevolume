@@ -71,9 +71,10 @@ def send_signal(sig: dict) -> None:
     """
     Send a Simplified V1 entry alert (§20) — a single compact card:
 
-        AAPL 315P @ 1.40
+        AAPL 315P 6/9 @ 1.40
         Spot: 315.20
         Level: R1 315
+        Expiry: 6/9
         Volume: 497
         Ratio: 12.4x
         ContractLowDistance: 1.18
@@ -92,10 +93,19 @@ def send_signal(sig: dict) -> None:
     price_to_enter = sig.get('price_to_enter')
     enter_str  = f"{price_to_enter:.2f}" if price_to_enter else 'n/a'
 
-    strike     = sig.get('level_price')
     opt_type   = sig.get('option_type', '')
     side_char  = 'C' if opt_type == 'CALL' else 'P' if opt_type == 'PUT' else ''
-    strike_str = f"{_fmt_level(strike)}{side_char}" if strike else ''
+    # The headline strike is the contract we'd actually buy (traded_strike). In
+    # next-day mode this is the OTM target strike, which differs from the detection
+    # level (level_price) — the price_to_enter belongs to THIS strike, so the card
+    # must label it as such (a 420-level BEARISH signal trading the 410 put shows
+    # "410P @ 2.57", with "Level: R1 420" below).
+    level_strike = sig.get('level_price')
+    trade_strike = sig.get('traded_strike') or level_strike
+    strike_str   = f"{_fmt_level(trade_strike)}{side_char}" if trade_strike else ''
+
+    expiry    = sig.get('expiry')
+    expiry_s  = f"{expiry.month}/{expiry.day}" if expiry else ''
 
     spot      = sig.get('trigger_price')
     label     = sig.get('level_label', '')
@@ -106,10 +116,13 @@ def send_signal(sig: dict) -> None:
     sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
-    lines = [f"{arrow} **{symbol} {strike_str} @ {enter_str}**"]
+    head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
+    lines = [f"{arrow} **{head}**"]
     if spot is not None:
         lines.append(f"Spot: {spot:.2f}")
-    lines.append(f"Level: {label} {_fmt_level(strike)}".rstrip())
+    lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())
+    if expiry_s:
+        lines.append(f"Expiry: {expiry_s}")
     if atm_vol is not None:
         lines.append(f"Volume: {atm_vol:,}")
     if atm_ratio:

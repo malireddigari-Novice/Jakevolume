@@ -329,15 +329,6 @@ def intraday_check(
             except Exception:
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
-            # Next-day mode (no 0DTE today): pull the full chain so the detector
-            # can price the OTM target strike. Only on Schwab, only when needed.
-            chain_quotes = None
-            if (schwab and expiry and config.NEXT_DAY_MODE_ENABLED and expiry > today):
-                try:
-                    chain_quotes = schwab.get_option_chain_full(symbol, expiry)
-                except Exception:
-                    logger.warning("%s: full chain fetch failed (next-day OTM strike)", symbol)
-
             # Per-minute 1-min OHLCV for the 6 S/R level option contracts
             if schwab and config.COLLECT_LEVEL_BARS and expiry:
                 try:
@@ -353,7 +344,7 @@ def intraday_check(
             hist_range_fn = (schwab.get_option_history_range
                              if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
-                                     pc_ratio=pc_ratio, chain_quotes=chain_quotes,
+                                     pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
                                      fired_today_fn=db.get_fired_directions_today)
 
@@ -471,7 +462,7 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
     symbol      = sig.get('symbol', '')
     price       = sig.get('price_to_enter')
     expiry      = sig.get('expiry')
-    # In next-day mode the traded contract is the OTM target strike, not the level.
+    # The traded contract is the ATM strike at/near the level (no OTM shift).
     strike      = sig.get('traded_strike') or sig.get('level_price')
     option_type = sig.get('option_type')
     signal_type = sig.get('signal_type', '')
@@ -481,11 +472,6 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         return
     if not expiry:
         logger.warning("Alpaca: trade skipped for %s — no expiry in signal", symbol)
-        return
-    # Next-day mode without a resolved OTM target strike → alert only, no trade
-    # (we couldn't price the intended OTM contract from the chain).
-    if sig.get('day_mode') == 'NEXT_DAY' and not sig.get('target_level'):
-        logger.warning("Alpaca: trade skipped for %s — next-day OTM strike unresolved", symbol)
         return
 
     # Atomic position cap. Alpaca's position count lags newly-placed orders, so a
@@ -521,8 +507,7 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
             levels = db.get_today_levels(symbol, today_cst())
             spot   = float(sig.get('trigger_price') or strike)
             exit1_underlying, exit2_underlying = compute_exit_targets(
-                signal_type, spot, levels,
-                position_only=(sig.get('day_mode') == 'NEXT_DAY'),
+                signal_type, spot, levels, position_only=False,
             )
         except Exception:
             logger.warning("Alpaca: could not resolve exit targets for %s", symbol, exc_info=True)

@@ -235,32 +235,6 @@ def compute_exit_targets(
     return chosen[0], (chosen[1] if len(chosen) > 1 else None)
 
 
-def _otm_target_contract(
-    signal_type: str,
-    confirm_type: str,
-    spot: float,
-    levels: list,
-    chain_quotes: dict,
-    depth: int,
-) -> Optional[tuple[float, float, dict]]:
-    """
-    §6 optional 1DTE target-based strike: the ATM strike at the target level.
-
-    BULLISH → depth-th level above spot; BEARISH → depth-th level below spot.
-    Returns (target_level_price, otm_strike, contract_dict) or None.
-    """
-    above, below = _opposing_strikes(levels, spot, position_only=True)
-    ladder = sorted(above) if signal_type == 'BULLISH' else sorted(below, reverse=True)
-    if not ladder:
-        return None
-    target_price = ladder[min(depth - 1, len(ladder) - 1)]
-    strikes = [s for (s, ot) in chain_quotes if ot == confirm_type]
-    if not strikes:
-        return None
-    otm_strike = min(strikes, key=lambda s: abs(s - target_price))
-    return target_price, otm_strike, chain_quotes[(otm_strike, confirm_type)]
-
-
 # ── Detector ──────────────────────────────────────────────────────────────────
 
 class SignalDetector:
@@ -292,7 +266,6 @@ class SignalDetector:
         option_quotes: dict | None = None,
         expiry: Optional[date] = None,
         pc_ratio: Optional[float] = None,
-        chain_quotes: dict | None = None,
         opening_range: bool = False,
         hist_range_fn=None,
         fired_today_fn=None,
@@ -452,16 +425,14 @@ class SignalDetector:
                                reason='NO_VALID_VOLUME_SIGNAL', dist=dist, atm=atm, low=atm_low)
                 continue
 
-            # ── 1DTE optional target-based OTM strike (roles stay frozen) ──────
+            # Trade the ATM confirm-side contract (nearest spot ≈ the level). The
+            # contract we price and trade is the one volume was detected on, so its
+            # strike, quote, and alert label stay consistent in every mode. No OTM
+            # target-shift — next-day (Tue/Thu) trades at the level just like 0DTE.
             day_mode      = 'NEXT_DAY' if next_day_mode else '0DTE'
             trade_data    = atm_data
-            traded_strike = strike
+            traded_strike = float(atm_key[0])
             target_level: Optional[float] = None
-            if next_day_mode and chain_quotes:
-                otm = _otm_target_contract(signal_type, confirm_type, close_price,
-                                           levels, chain_quotes, config.NEXT_DAY_TARGET_DEPTH)
-                if otm:
-                    target_level, traded_strike, trade_data = otm
 
             # ── §13 historical value percentile ───────────────────────────────
             hv_pctile = self._historical_value_pctile(
@@ -554,7 +525,11 @@ class SignalDetector:
         a_extreme = single_raw and near_175
         b_cluster = (clu['vol'] >= min_cluster_vol and clu['ratio'] >= cluster_ratio_min
                      and clu['active'] >= config.OPT_CLUSTER_ACTIVE_MIN and near_175)
+        # Stair-step also requires the absolute WindowVol5 floor — otherwise a
+        # quiet contract (tiny baseline) fires on ratios alone (e.g. 180 contracts
+        # over 5 bars). "Need absolute volume and ratio", per the §9 principle.
         c_stair   = (excitation >= excitation_min
+                     and clu['vol'] >= min_cluster_vol
                      and clu['ratio'] >= config.STAIRSTEP_WINDOW_RATIO_MIN
                      and clu['active'] >= config.STAIRSTEP_ACTIVE_MIN and near_200)
         return {
@@ -736,8 +711,9 @@ class SignalDetector:
         spot   = current_bar['close']
 
         # Exit targets — shifted one level out (skip the too-close nearest level).
+        # Roles are frozen (no flipping), so use the frozen SUPPORT/RESISTANCE types.
         exit1_price, exit2_price = compute_exit_targets(
-            signal_type, spot, levels, position_only=next_day_mode)
+            signal_type, spot, levels, position_only=False)
 
         bias = 'Call-side bias' if level_type == 'SUPPORT' else 'Put-side bias'
 
