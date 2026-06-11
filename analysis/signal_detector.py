@@ -10,6 +10,7 @@ Signal semantics
 
 A CALL/PUT alert fires when ALL hold (§17/§18):
   • spot is NEAR a same-side level                        (§4 proximity, binary)
+  • the entry is WITH the intraday trend vs VWAP          (§16 VWAP trend gate)
   • correct side is being watched                         (§5)
   • a valid volume signal exists                          (§8 = §9 OR §10 OR §11)
   • the contract is cheap / not chased                    (§12 contract-low)
@@ -269,6 +270,7 @@ class SignalDetector:
         opening_range: bool = False,
         hist_range_fn=None,
         fired_today_fn=None,
+        session_vwap: Optional[float] = None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -278,6 +280,10 @@ class SignalDetector:
         hist_range_fn : callable(occ) -> (low, high) | None for the §13 gate.
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
+        session_vwap  : volume-weighted average underlying price over the session,
+                        computed by the caller from full-session bars (the detector
+                        only sees the trailing slice). Drives the §16 trend gate;
+                        None disables it (early session / no volume).
         """
         if not bars:
             return []
@@ -376,6 +382,20 @@ class SignalDetector:
                 self._log_eval(symbol, label, strike, close_price, confirm_type,
                                reason='NOT_NEAR_LEVEL', dist=dist)
                 continue
+
+            # ── §16 VWAP trend gate — only trade WITH the intraday trend ──────
+            # BULLISH (call/support-bounce) needs spot at/above VWAP; BEARISH
+            # (put/resistance-fade) needs spot at/below it. No-op when VWAP is
+            # unavailable (early session / no volume).
+            if config.VWAP_GATE_ENABLED and session_vwap and session_vwap > 0:
+                buf = config.VWAP_GATE_BUFFER_PCT
+                aligned = (close_price >= session_vwap * (1 + buf)
+                           if signal_type == 'BULLISH'
+                           else close_price <= session_vwap * (1 - buf))
+                if not aligned:
+                    self._log_eval(symbol, label, strike, close_price, confirm_type,
+                                   reason='AGAINST_VWAP_TREND', dist=dist)
+                    continue
 
             # ── Identify ATM + 1-ITM confirm-side contracts ───────────────────
             ct_keys = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
