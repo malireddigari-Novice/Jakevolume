@@ -33,7 +33,10 @@ _DATA = 'https://data.alpaca.markets'
 _TRADE = ('https://paper-api.alpaca.markets' if config.ALPACA_PAPER
           else 'https://api.alpaca.markets')
 _STOCK_FEED = 'sip'        # full-market entitlement confirmed
-_OPT_FEED   = 'indicative'
+# OPRA (full) — NOT 'indicative': the indicative snapshot is stale intraday
+# (serves the prior session's dailyBar/minuteBar), so cumulative volume never
+# changes between polls and every per-minute delta reads 0 → no signals ever.
+_OPT_FEED   = 'opra'
 
 
 class AlpacaDataClient:
