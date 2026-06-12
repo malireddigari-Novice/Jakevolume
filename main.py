@@ -37,6 +37,7 @@ from data.market_utils import (
 from data.schwab_client import SchwabClient
 from data.databento_client import DatabentoClient
 from data.alpaca_client import AlpacaClient, occ_symbol
+from data.alpaca_data_client import AlpacaDataClient
 from output.sheets_logger import SheetsLogger
 from output.discord_notifier import (
     send_signal as discord_signal,
@@ -233,7 +234,7 @@ def intraday_check(
     detector: SignalDetector,
     monitor: PositioningMonitor,
     sheets: SheetsLogger,
-    schwab: Optional[SchwabClient] = None,
+    data_src=None,
     alpaca: Optional[AlpacaClient] = None,
 ) -> None:
     """
@@ -241,18 +242,20 @@ def intraday_check(
     fire desktop notifications, and update the positioning monitor.  Failures for
     individual symbols are logged without interrupting the remaining symbols.
 
-    If a SchwabClient is provided its real-time bid/ask prices are merged into
-    the option quotes so price_to_enter and price_to_exit are always populated.
+    `data_src` is the intraday market-data source (AlpacaDataClient in production;
+    any object exposing get_bars/get_quote/get_nearest_expiry/get_watched_contracts/
+    get_option_history_range/get_option_bars works). Its real-time bid/ask populate
+    price_to_enter / price_to_exit. Databento (`dbc`) is the fallback.
     """
     today = today_cst()
 
     for symbol in config.SYMBOLS:
         try:
-            # 1-min equity bars — Schwab primary, Databento fallback.
-            # Schwab path pulls the full session so cumulative volume is correct;
+            # 1-min equity bars — primary data source, Databento fallback.
+            # The primary pulls the full session so cumulative volume is correct;
             # the signal detector still sees only the trailing BARS_TO_FETCH slice.
-            if schwab:
-                session_bars = schwab.get_bars(symbol, count=config.SESSION_BARS)
+            if data_src:
+                session_bars = data_src.get_bars(symbol, count=config.SESSION_BARS)
                 bars = session_bars[-config.BARS_TO_FETCH:] if session_bars else []
             elif dbc:
                 bars = dbc.get_bars(symbol)
@@ -276,17 +279,17 @@ def intraday_check(
                 continue
 
             # Persist 7 fields/bar: OHLC, volume (per-min), spot_price, cum_volume.
-            # cum_volume is only valid on the Schwab full-session pull; the
+            # cum_volume is only valid on the full-session pull (data_src); the
             # Databento rolling buffer is partial → store NULL cum_volume.
-            db.save_bars(symbol, session_bars, full_session=bool(schwab))
+            db.save_bars(symbol, session_bars, full_session=bool(data_src))
 
             # ── Live spot from a real-time quote (freshest tick) ──
             # The last *completed* candle lags up to a minute; use the live last
             # price for the spot and fall back to the bar close only on failure.
             underlying_price = bars[-1]['close']
-            if schwab:
+            if data_src:
                 try:
-                    q = schwab.get_quote(symbol)
+                    q = data_src.get_quote(symbol)
                     if q and q.get('price'):
                         underlying_price = float(q['price'])
                 except Exception:
@@ -309,13 +312,13 @@ def intraday_check(
             option_quotes: dict = {}
             expiry = None
             try:
-                if schwab:
-                    expiry = schwab.get_nearest_expiry(symbol)
+                if data_src:
+                    expiry = data_src.get_nearest_expiry(symbol)
                 elif dbc:
                     expiry = dbc.get_nearest_expiry(symbol)
-                if schwab and expiry:
+                if data_src and expiry:
                     # n=3 so a genuine ATM + in-the-money strike pair is available
-                    option_quotes = schwab.get_watched_contracts(
+                    option_quotes = data_src.get_watched_contracts(
                         symbol, expiry, underlying_price, n=3
                     )
                     logger.debug(
@@ -330,9 +333,9 @@ def intraday_check(
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
             # Per-minute 1-min OHLCV for the 6 S/R level option contracts
-            if schwab and config.COLLECT_LEVEL_BARS and expiry:
+            if data_src and config.COLLECT_LEVEL_BARS and expiry:
                 try:
-                    _collect_level_bars(symbol, levels, expiry, today, schwab)
+                    _collect_level_bars(symbol, levels, expiry, today, data_src)
                 except Exception:
                     logger.warning("%s: level option-bar collection failed", symbol, exc_info=True)
 
@@ -340,9 +343,9 @@ def intraday_check(
             pc_ratio = db.get_today_pc_ratio(symbol, today)
 
             # §13 historical-value gate: let the detector fetch a contract's
-            # multi-day (low, high) on demand (Schwab daily candles), cached per day.
-            hist_range_fn = (schwab.get_option_history_range
-                             if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
+            # multi-day (low, high) on demand (daily option candles), cached per day.
+            hist_range_fn = (data_src.get_option_history_range
+                             if (data_src and config.HIST_LOW_ENTRY_GATE) else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
@@ -377,7 +380,7 @@ def intraday_check(
             logger.exception("Intraday check failed for %s", symbol)
 
 
-def _collect_level_bars(symbol, levels, expiry, level_date, schwab) -> None:
+def _collect_level_bars(symbol, levels, expiry, level_date, data_src) -> None:
     """
     Pull and persist 1-min OHLCV for each S/R level's option contract.
 
@@ -390,7 +393,7 @@ def _collect_level_bars(symbol, levels, expiry, level_date, schwab) -> None:
         strike      = float(lv['strike'])
         option_type = lv['option_type']
         occ         = occ_symbol(symbol, expiry, strike, option_type)
-        obars       = schwab.get_option_bars(occ, count=config.SESSION_BARS)
+        obars       = data_src.get_option_bars(occ, count=config.SESSION_BARS)
         for b in obars:
             rows.append({
                 'symbol':      symbol,
@@ -836,6 +839,20 @@ def main() -> None:
             "price_to_enter/exit will be None. Add credentials to .env."
         )
 
+    # Alpaca market data: the intraday signal data source (SIP stock feed + OPRA
+    # options, incl. option price-history Schwab lacks). The morning OI-level
+    # snapshot stays on Schwab because Alpaca exposes no live open interest.
+    adata: Optional[AlpacaDataClient] = None
+    if config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY:
+        try:
+            _ad = AlpacaDataClient()
+            adata = _ad if _ad.verify() else None
+        except Exception:
+            logger.warning("Alpaca data init failed — falling back to Databento/none", exc_info=True)
+            adata = None
+    if adata is None:
+        logger.warning("Alpaca data source unavailable — intraday will use Databento if configured")
+
     # Alpaca: auto-execute trades when ALPACA_ENABLED=true
     alpaca: Optional[AlpacaClient] = None
     if config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY:
@@ -901,7 +918,7 @@ def main() -> None:
 
             # Intraday signal scan — every minute during market hours
             if is_market_open(now):
-                intraday_check(dbc, detector, monitor, sheets, schwab=schwab, alpaca=alpaca)
+                intraday_check(dbc, detector, monitor, sheets, data_src=adata, alpaca=alpaca)
 
             # EOD liquidation — 14:55 CST, once per day
             if alpaca and config.ALPACA_ENABLED and is_eod_window(now) and eod_done != now.date():
