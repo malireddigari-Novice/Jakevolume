@@ -67,7 +67,7 @@ def _score_near_low(dist: Optional[float]) -> float:
 
 def _cluster_scores(win5: float, prior5m_windows: Sequence[float],
                     last5_vols: Sequence[float], median20: float) -> tuple[float, float, float, int]:
-    """Return (score_cluster, score_window_dom, window_dominance, active_bars5)."""
+    """Return (score_cluster, score_window_dom, window_dominance, active_bars5, window_ratio5)."""
     med5 = _stats.median(prior5m_windows) if prior5m_windows else 0.0
     max5 = max(prior5m_windows) if prior5m_windows else 0.0
     window_ratio5  = win5 / max(med5, 50.0)
@@ -80,7 +80,7 @@ def _cluster_scores(win5: float, prior5m_windows: Sequence[float],
     elif window_ratio5 >= 3.0 and active5 >= 3: sc = 0.70
     elif window_ratio5 >= 2.0 and active5 >= 2: sc = 0.40
     else: sc = 0.00
-    return sc, _step(window_dom, _WINDOW), window_dom, active5
+    return sc, _step(window_dom, _WINDOW), window_dom, active5, round(window_ratio5, 2)
 
 
 def compute_stickout(
@@ -100,8 +100,10 @@ def compute_stickout(
     # ── Hard noise floor (absolute) ────────────────────────────────────────────
     if current_vol < floor['cur'] and win5 < floor['win5']:
         return {'score': 0.0, 'valid': False, 'strong': False,
-                'reason': 'BELOW_VOLUME_FLOOR', 'right_tail_ok': False,
-                'components_available': 'floor'}
+                'reason': 'LOW_ABSOLUTE_VOLUME', 'block_reason': 'LOW_ABSOLUTE_VOLUME',
+                'right_tail_ok': False, 'components_available': 'floor',
+                'trigger_type': 'SINGLE_BAR', 'trigger_volume': current_vol,
+                'trigger_ratio': 0.0, 'window_ratio5': 0.0}
 
     p20 = list(prior_vols)[-20:]
     n_prior = len(p20)
@@ -124,7 +126,7 @@ def compute_stickout(
     s_pctile = _step(session_pctile, _PCTILE) if session_pctile is not None else None
     s_near   = _score_near_low(contract_low_distance)
 
-    s_cluster, s_windowdom, window_dom, active5 = _cluster_scores(
+    s_cluster, s_windowdom, window_dom, active5, window_ratio5 = _cluster_scores(
         win5, prior5m_windows, last5_vols, median20)
     cluster_stickout = 0.70 * s_cluster + 0.30 * s_windowdom
 
@@ -152,6 +154,29 @@ def compute_stickout(
     valid  = score >= VALID_MIN  and right_tail_ok and low_ok_valid
     strong = score >= STRONG_MIN and strong_tail   and low_ok_strong
 
+    # Which path drove the score → what to surface as the trigger (Discord display).
+    trigger_type   = 'SINGLE_BAR' if single >= cluster_final else 'FIVE_BAR_WINDOW'
+    trigger_volume = current_vol if trigger_type == 'SINGLE_BAR' else win5
+    trigger_ratio  = round(recent_ratio if trigger_type == 'SINGLE_BAR' else window_ratio5, 2)
+
+    # Granular blocked reason (spec vocabulary) — the single most salient deficiency.
+    if valid:
+        block_reason = 'OK'
+    elif not low_ok_valid:
+        block_reason = 'CONTRACT_TOO_HIGH'
+    elif not right_tail_ok:
+        block_reason = 'LOW_VISUAL_DOMINANCE'
+    elif s_recent <= 0.30:                       # RecentVolumeRatio < 3.0
+        block_reason = 'LOW_RATIO'
+    elif active5 < 3:
+        block_reason = 'NOT_ENOUGH_ACTIVE_BARS'
+    elif win5 < floor['win5']:
+        block_reason = 'LOW_WINDOW_VOLUME'
+    elif s_visual < 0.70:
+        block_reason = 'LOW_VISUAL_DOMINANCE'
+    else:
+        block_reason = 'LOW_SCORE'
+
     return {
         'score': round(score, 4),
         'valid': valid, 'strong': strong,
@@ -161,12 +186,14 @@ def compute_stickout(
         'session_pctile': (round(session_pctile, 1) if session_pctile is not None else None),
         's_pctile': s_pctile,
         'window_dom': round(window_dom, 2), 's_windowdom': s_windowdom,
+        'window_ratio5': window_ratio5,
         's_cluster': s_cluster, 'active5': active5,
         's_near': s_near, 'contract_low_distance': contract_low_distance,
         'baseline': round(baseline, 1), 'n_prior': n_prior,
         'components_available': ('full' if s_pctile is not None
                                  else f'no_pctile(prior={n_prior})'),
-        'reason': 'OK' if valid else ('LOW_SCORE' if score < VALID_MIN
-                                      else ('NOT_RIGHT_TAIL' if not right_tail_ok
-                                            else 'CONTRACT_TOO_HIGH')),
+        'trigger_type': trigger_type, 'trigger_volume': trigger_volume,
+        'trigger_ratio': trigger_ratio,
+        'block_reason': block_reason,
+        'reason': block_reason,
     }

@@ -109,8 +109,15 @@ def send_signal(sig: dict) -> None:
 
     spot      = sig.get('trigger_price')
     label     = sig.get('level_label', '')
-    atm_vol   = sig.get('atm_vol_1m')
-    atm_ratio = sig.get('atm_spike_ratio')
+    # Trigger volume/ratio from the VolumeStickoutScore (the actual trigger),
+    # falling back to the legacy 1-min fields if absent.
+    tv_type   = sig.get('trigger_volume_type')
+    trig_vol  = sig.get('trigger_volume')
+    trig_ratio = sig.get('trigger_ratio')
+    if trig_vol is None:
+        trig_vol, trig_ratio, tv_type = sig.get('atm_vol_1m'), sig.get('atm_spike_ratio'), 'SINGLE_BAR'
+    vol_label = "Volume 5m" if tv_type == 'FIVE_BAR_WINDOW' else "Volume"
+    ratio_label = "Ratio 5m" if tv_type == 'FIVE_BAR_WINDOW' else "Ratio"
     low_dist  = sig.get('low_dist')
 
     sig_time = sig.get('signal_time')
@@ -123,10 +130,10 @@ def send_signal(sig: dict) -> None:
     lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())
     if expiry_s:
         lines.append(f"Expiry: {expiry_s}")
-    if atm_vol is not None:
-        lines.append(f"Volume: {atm_vol:,}")
-    if atm_ratio:
-        lines.append(f"Ratio: {atm_ratio:.1f}x")
+    if trig_vol is not None:
+        lines.append(f"{vol_label}: {int(trig_vol):,}")
+    if trig_ratio:
+        lines.append(f"{ratio_label}: {trig_ratio:.1f}x")
     if low_dist is not None:
         lines.append(f"ContractLowDistance: {low_dist:.2f}")
 

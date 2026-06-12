@@ -12,8 +12,8 @@ def _mk(cur, prior, **kw):
 
 # 1) Hard floor: tiny volume blocked regardless of ratio (AMZN vol 43 example).
 r = _mk(43, [2, 1, 0, 3, 2, 1, 0, 0])
-assert not r['valid'] and r['reason'] == 'BELOW_VOLUME_FLOOR', r
-print("PASS  tiny volume (43) -> BELOW_VOLUME_FLOOR")
+assert not r['valid'] and r['reason'] == 'LOW_ABSOLUTE_VOLUME', r
+print("PASS  tiny volume (43) -> LOW_ABSOLUTE_VOLUME")
 
 # 2) MSFT vol 26 ratio 1.2x style -> blocked by floor.
 r = _mk(26, [20, 22, 18, 25, 21])
@@ -36,9 +36,9 @@ print(f"PASS  300 below recent max (right-tail fail) -> not valid (vdom={r['visu
 
 # 5) NVDA higher floor: 300 (would pass default) is still below NVDA floor when window thin.
 r = _mk(300, [5, 4, 6, 3], symbol='NVDA')   # cur 300<? no, 300>=250 floor 'cur' -> passes floor
-assert r['reason'] != 'BELOW_VOLUME_FLOOR'
+assert r['reason'] != 'LOW_ABSOLUTE_VOLUME'
 r2 = _mk(120, [2, 1, 0, 3], symbol='NVDA')  # 120<250 and win5<600 -> floor block
-assert not r2['valid'] and r2['reason'] == 'BELOW_VOLUME_FLOOR', r2
+assert not r2['valid'] and r2['reason'] == 'LOW_ABSOLUTE_VOLUME', r2
 print("PASS  NVDA floor (120) -> BELOW_VOLUME_FLOOR")
 
 print("\nAll volume-stickout unit checks passed.")

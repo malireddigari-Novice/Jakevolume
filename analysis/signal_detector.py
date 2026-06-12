@@ -425,8 +425,10 @@ class SignalDetector:
                 continue
 
             if not valid_volume:
+                # Surface the granular blocked reason from the VolumeStickoutScore.
+                br = atm.get('block_reason') or itm.get('block_reason') or 'LOW_SCORE'
                 self._log_eval(symbol, label, strike, close_price, confirm_type,
-                               reason='NO_VALID_VOLUME_SIGNAL', dist=dist, atm=atm, low=atm_low)
+                               reason=f'NO_VALID_VOLUME_SIGNAL:{br}', dist=dist, atm=atm, low=atm_low)
                 continue
 
             # Trade the ATM confirm-side contract (nearest spot ≈ the level). The
@@ -568,6 +570,10 @@ class SignalDetector:
             'A': a_extreme, 'B': b_cluster, 'C': c_stair,
             'score': st['score'], 'strong': st['strong'],
             'right_tail': st.get('right_tail_ok', False),
+            'block_reason': st.get('block_reason'),
+            'trigger_type': st.get('trigger_type'),
+            'trigger_volume': st.get('trigger_volume'),
+            'trigger_ratio': st.get('trigger_ratio'),
             'valid': st['valid'],
         }
 
@@ -802,6 +808,11 @@ class SignalDetector:
             'atm_vol_1m':       atm_delta,
             'atm_spike_ratio':  atm.get('spike_ratio', 0.0),
             'atm_vol_3m':       atm.get('vol', 0),
+            # VolumeStickoutScore trigger (what Discord shows: single-bar vs 5-bar window)
+            'trigger_volume_type': atm.get('trigger_type'),
+            'trigger_volume':      atm.get('trigger_volume'),
+            'trigger_ratio':       atm.get('trigger_ratio'),
+            'volume_score':        atm.get('score'),
             'itm_vol_1m':       itm_delta,
             'itm_spike_ratio':  itm.get('spike_ratio', 0.0),
             'itm_vol_3m':       itm.get('vol', 0),
