@@ -183,18 +183,6 @@ OPENING_RANGE_VOL_MULT       = float(os.getenv('OPENING_RANGE_VOL_MULT', '1.5'))
 OPENING_RANGE_CLUSTER_RATIO  = float(os.getenv('OPENING_RANGE_CLUSTER_RATIO', '4.0'))
 OPENING_RANGE_EXCITATION_MIN = float(os.getenv('OPENING_RANGE_EXCITATION_MIN', '0.80'))
 
-# §16 VWAP trend gate — only trade WITH the intraday trend. Block a BULLISH
-# (call / support-bounce) entry when spot is below session VWAP, and a BEARISH
-# (put / resistance-fade) entry when spot is above it. The backtest over
-# 2026-05-22..06-10 showed against-trend signals carry the bulk of the losers
-# (e.g. 5 of 6 on the 2026-06-10 −$2,589 day were below VWAP). session_vwap is
-# computed in main.py from the full session bars and passed into the detector;
-# when it is unavailable (early session / no volume) the gate is a no-op.
-VWAP_GATE_ENABLED    = os.getenv('VWAP_GATE_ENABLED', 'true').lower() == 'true'
-# Optional alignment buffer: require spot at least this fraction beyond VWAP to
-# count as aligned (0.0 = simple side check; 0.001 = spot must be 0.1% past VWAP).
-VWAP_GATE_BUFFER_PCT = float(os.getenv('VWAP_GATE_BUFFER_PCT', '0.0'))
-
 # Exit-target shift — the nearest opposite level is usually too close, so skip it:
 #   CALL entered at support    → Exit1 = R2, Exit2 = R3  (skip R1)
 #   PUT  entered at resistance → Exit1 = S2, Exit2 = S3  (skip S1)

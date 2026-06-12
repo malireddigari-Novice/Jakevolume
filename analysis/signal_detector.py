@@ -10,9 +10,8 @@ Signal semantics
 
 A CALL/PUT alert fires when ALL hold (§17/§18):
   • spot is NEAR a same-side level                        (§4 proximity, binary)
-  • the entry is WITH the intraday trend vs VWAP          (§16 VWAP trend gate)
   • correct side is being watched                         (§5)
-  • a valid volume signal exists                          (§8 = §9 OR §10 OR §11)
+  • a valid volume signal exists                          (VolumeStickoutScore >= 0.75)
   • the contract is cheap / not chased                    (§12 contract-low)
   • the contract is not historically rich                 (§13 historical percentile)
   • there is no short-cover risk                          (§14)
@@ -37,6 +36,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config
+from analysis.volume_stickout import compute_stickout
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -241,7 +241,10 @@ def compute_exit_targets(
 class SignalDetector:
 
     def __init__(self) -> None:
-        self._hist_maxlen = config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK
+        # Retain (close to) the full session per contract so the VolumeStickoutScore
+        # can compute its 20/60-bar baselines, session percentile and 5-min windows.
+        self._hist_maxlen = max(config.SESSION_BARS,
+                                config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK)
         # One alert per direction per ticker per day.
         self._fired_today:  dict[_FiredKey, bool] = {}
         self._prev_opt_vol: dict[_OptKey, int]    = {}
@@ -270,7 +273,6 @@ class SignalDetector:
         opening_range: bool = False,
         hist_range_fn=None,
         fired_today_fn=None,
-        session_vwap: Optional[float] = None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -280,10 +282,6 @@ class SignalDetector:
         hist_range_fn : callable(occ) -> (low, high) | None for the §13 gate.
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
-        session_vwap  : volume-weighted average underlying price over the session,
-                        computed by the caller from full-session bars (the detector
-                        only sees the trailing slice). Drives the §16 trend gate;
-                        None disables it (early session / no volume).
         """
         if not bars:
             return []
@@ -383,20 +381,6 @@ class SignalDetector:
                                reason='NOT_NEAR_LEVEL', dist=dist)
                 continue
 
-            # ── §16 VWAP trend gate — only trade WITH the intraday trend ──────
-            # BULLISH (call/support-bounce) needs spot at/above VWAP; BEARISH
-            # (put/resistance-fade) needs spot at/below it. No-op when VWAP is
-            # unavailable (early session / no volume).
-            if config.VWAP_GATE_ENABLED and session_vwap and session_vwap > 0:
-                buf = config.VWAP_GATE_BUFFER_PCT
-                aligned = (close_price >= session_vwap * (1 + buf)
-                           if signal_type == 'BULLISH'
-                           else close_price <= session_vwap * (1 - buf))
-                if not aligned:
-                    self._log_eval(symbol, label, strike, close_price, confirm_type,
-                                   reason='AGAINST_VWAP_TREND', dist=dist)
-                    continue
-
             # ── Identify ATM + 1-ITM confirm-side contracts ───────────────────
             ct_keys = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
             if not ct_keys:
@@ -415,7 +399,7 @@ class SignalDetector:
             atm_delta = vol_deltas.get(atm_key, 0)
             atm_okey: _OptKey = (symbol, atm_key[0], confirm_type)
             atm_low   = self._contract_low_dist(atm_okey, atm_data)
-            atm = self._eval_volume(list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
+            atm = self._eval_volume(symbol, list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
                                     min_single_vol, min_cluster_vol, cluster_ratio_min,
                                     excitation_min)
 
@@ -424,12 +408,12 @@ class SignalDetector:
                 itm_delta = vol_deltas.get(itm_key, 0)
                 itm_okey: _OptKey = (symbol, itm_key[0], confirm_type)
                 itm_low   = self._contract_low_dist(itm_okey, itm_data)
-                itm = self._eval_volume(list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
+                itm = self._eval_volume(symbol, list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
                                         min_single_vol, min_cluster_vol, cluster_ratio_min,
                                         excitation_min)
             else:
                 itm_data, itm_delta, itm_low = {}, 0, None
-                itm = self._eval_volume([], 0, None, min_single_vol, min_cluster_vol,
+                itm = self._eval_volume(symbol, [], 0, None, min_single_vol, min_cluster_vol,
                                         cluster_ratio_min, excitation_min)
 
             valid_volume = atm['valid'] or itm['valid']
@@ -522,10 +506,30 @@ class SignalDetector:
             fired.append(sig)
         return fired
 
-    # ── Per-contract volume evaluation (§9/§10/§11) ──────────────────────────
+    # ── Per-contract volume evaluation ────────────────────────────────────────
+
+    def _stickout(self, symbol: str, history: list[int], delta: int,
+                  low_dist: Optional[float]) -> dict:
+        """
+        VolumeStickoutScore for one contract (analysis.volume_stickout).
+
+        `history` is the per-minute volume deltas oldest→newest, with the current
+        bar (`delta`) as its last element. Prior windows exclude the current bar.
+        """
+        prior   = history[:-1] if history else []
+        win5    = sum(history[-5:]) if history else 0
+        last5   = history[-5:] if history else []
+        prior5m = [sum(history[i:i + 5]) for i in range(0, max(0, len(history) - 5))]
+        return compute_stickout(
+            current_vol=delta, prior_vols=prior, session_vols=prior,
+            win5=win5, last5_vols=last5, prior5m_windows=prior5m,
+            contract_low_distance=low_dist, symbol=symbol,
+            volatile_symbols=frozenset(config.VOLATILE_SYMBOLS),
+        )
 
     def _eval_volume(
         self,
+        symbol: str,
         history: list[int],
         delta: int,
         low_dist: Optional[float],
@@ -534,7 +538,12 @@ class SignalDetector:
         cluster_ratio_min: float,
         excitation_min: float,
     ) -> dict:
-        """Evaluate the three volume signals for one contract; returns metrics + A/B/C."""
+        """
+        Per-contract volume evaluation. Validity is decided by the VolumeStickoutScore
+        (score >= 0.75 + right-tail guard + contract-low backstop). The legacy §9/§10/§11
+        metrics and A/B/C are still computed for the MONITOR log and the flow-shape label,
+        but no longer gate the alert.
+        """
         single_raw, spike_ratio = _single_print(history, delta, min_single)
         clu        = _cluster_metrics(history)
         excitation = _excitation(clu['window'], clu['base_unit'])
@@ -545,19 +554,21 @@ class SignalDetector:
         a_extreme = single_raw and near_175
         b_cluster = (clu['vol'] >= min_cluster_vol and clu['ratio'] >= cluster_ratio_min
                      and clu['active'] >= config.OPT_CLUSTER_ACTIVE_MIN and near_175)
-        # Stair-step also requires the absolute WindowVol5 floor — otherwise a
-        # quiet contract (tiny baseline) fires on ratios alone (e.g. 180 contracts
-        # over 5 bars). "Need absolute volume and ratio", per the §9 principle.
         c_stair   = (excitation >= excitation_min
                      and clu['vol'] >= min_cluster_vol
                      and clu['ratio'] >= config.STAIRSTEP_WINDOW_RATIO_MIN
                      and clu['active'] >= config.STAIRSTEP_ACTIVE_MIN and near_200)
+
+        # Volume validity = VolumeStickoutScore decision (the provided spec).
+        st = self._stickout(symbol, history, delta, low_dist)
         return {
             'delta': delta, 'spike_ratio': spike_ratio,
             'vol': clu['vol'], 'ratio': clu['ratio'],
             'active': clu['active'], 'burst': clu['burst'], 'excitation': excitation,
             'A': a_extreme, 'B': b_cluster, 'C': c_stair,
-            'valid': a_extreme or b_cluster or c_stair,
+            'score': st['score'], 'strong': st['strong'],
+            'right_tail': st.get('right_tail_ok', False),
+            'valid': st['valid'],
         }
 
     # ── §13 historical value percentile ───────────────────────────────────────

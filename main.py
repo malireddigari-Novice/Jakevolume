@@ -228,22 +228,6 @@ def _print_mag7_briefing(sentiments: list[dict], now) -> None:
 
 # ── Intraday check (every minute during market hours) ────────────────────────
 
-def _session_vwap(session_bars: list[dict]) -> Optional[float]:
-    """
-    Volume-weighted average underlying price over the session bars, used for the
-    detector's §16 VWAP trend gate. Returns None when no volume is available
-    (early session / Databento partial buffer) so the gate degrades to a no-op.
-    """
-    num = den = 0.0
-    for b in session_bars or []:
-        vol = float(b.get('volume') or 0)
-        if vol <= 0:
-            continue
-        num += float(b['close']) * vol
-        den += vol
-    return (num / den) if den > 0 else None
-
-
 def intraday_check(
     dbc: DatabentoClient,
     detector: SignalDetector,
@@ -359,15 +343,10 @@ def intraday_check(
             # multi-day (low, high) on demand (Schwab daily candles), cached per day.
             hist_range_fn = (schwab.get_option_history_range
                              if (schwab and config.HIST_LOW_ENTRY_GATE) else None)
-            # Session VWAP from the full-session pull (the detector only receives
-            # the trailing slice) — drives the §16 VWAP trend gate.
-            session_vwap = _session_vwap(session_bars)
-
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
-                                     fired_today_fn=db.get_fired_directions_today,
-                                     session_vwap=session_vwap)
+                                     fired_today_fn=db.get_fired_directions_today)
 
             for sig in signals:
                 sig_id = db.save_signal(sig)
