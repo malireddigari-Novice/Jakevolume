@@ -20,6 +20,7 @@ import config
 from analysis.signal_detector import compute_exit_targets
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
+from output.discord_notifier import send_daily_review
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +99,9 @@ def _suggest(entry, opath):
 
 # ── main entry point ───────────────────────────────────────────────────────────
 
-def analyze_daily_signals(analysis_date: _date, data_src=None) -> int:
-    """Analyze all of analysis_date's signals → signal_analysis. Returns rows written."""
+def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> int:
+    """Analyze all of analysis_date's signals -> signal_analysis, then deliver the
+    recommendations to Discord (and Google Sheets if `sheets` is given). Returns rows written."""
     conn = _conn(); cur = conn.cursor()
     try:
         cur.execute("""SELECT id, symbol, signal_time, signal_type, traded_strike,
@@ -137,10 +139,14 @@ def analyze_daily_signals(analysis_date: _date, data_src=None) -> int:
 
             ei = next((i for i, b in enumerate(ob) if b[0] >= st), None)
             if ei is None or ei + 1 >= len(ob):
-                rows.append((sid, analysis_date, sym, st, styp, tstrike, otype, None,
-                             None, None, None, None, None, None, 'NO_DATA', None,
-                             'No intraday price path available for the traded contract.',
-                             source))
+                rows.append(dict(signal_id=sid, analysis_date=analysis_date, symbol=sym,
+                                 signal_time=st, signal_type=styp, traded_strike=tstrike,
+                                 option_type=otype, entry_price=None, mfe_pct=None, mae_pct=None,
+                                 peak_price=None, peak_time=None, trough_price=None,
+                                 rule_pnl_pct=None, suggested_action='NO_DATA',
+                                 suggested_pnl_pct=None,
+                                 suggestion='No intraday price path available for the traded contract.',
+                                 data_source=source))
                 continue
 
             opath = [(t, float(h), float(l), float(c)) for t, h, l, c in ob[ei:]]
@@ -169,11 +175,19 @@ def analyze_daily_signals(analysis_date: _date, data_src=None) -> int:
             rule_pnl = _current_rule(styp, entry, opath, ubymin, e1, e2)
 
             action, sug_pnl, text = _suggest(entry, opath)
-            rows.append((sid, analysis_date, sym, st, styp, tstrike, otype, round(entry, 4),
-                         round(mfe, 2), round(mae, 2), round(peak, 4), peak_time, round(trough, 4),
-                         round(rule_pnl, 2), action, round(sug_pnl, 2), text, source))
+            rows.append(dict(signal_id=sid, analysis_date=analysis_date, symbol=sym,
+                             signal_time=st, signal_type=styp, traded_strike=tstrike,
+                             option_type=otype, entry_price=round(entry, 4),
+                             mfe_pct=round(mfe, 2), mae_pct=round(mae, 2), peak_price=round(peak, 4),
+                             peak_time=peak_time, trough_price=round(trough, 4),
+                             rule_pnl_pct=round(rule_pnl, 2), suggested_action=action,
+                             suggested_pnl_pct=round(sug_pnl, 2), suggestion=text,
+                             data_source=source))
 
-        cur.execute("""CREATE TABLE IF NOT EXISTS signal_analysis (id BIGSERIAL PRIMARY KEY)""")  # no-op safety
+        _COLS = ('signal_id', 'analysis_date', 'symbol', 'signal_time', 'signal_type',
+                 'traded_strike', 'option_type', 'entry_price', 'mfe_pct', 'mae_pct',
+                 'peak_price', 'peak_time', 'trough_price', 'rule_pnl_pct', 'suggested_action',
+                 'suggested_pnl_pct', 'suggestion', 'data_source')
         sql = """
             INSERT INTO signal_analysis
                 (signal_id, analysis_date, symbol, signal_time, signal_type, traded_strike,
@@ -188,9 +202,20 @@ def analyze_daily_signals(analysis_date: _date, data_src=None) -> int:
                 suggested_pnl_pct=EXCLUDED.suggested_pnl_pct, suggestion=EXCLUDED.suggestion,
                 data_source=EXCLUDED.data_source, created_at=NOW()
         """
-        cur.executemany(sql, rows)
+        cur.executemany(sql, [tuple(r[c] for c in _COLS) for r in rows])
         conn.commit()
-        logger.info("Daily review %s: analyzed %d signals → signal_analysis", analysis_date, len(rows))
+        logger.info("Daily review %s: analyzed %d signals -> signal_analysis", analysis_date, len(rows))
+
+        # ── Deliver the recommendations (Discord + Google Sheets) ───────────────
+        try:
+            send_daily_review(rows, analysis_date)
+        except Exception:
+            logger.warning("Daily review: Discord delivery failed", exc_info=True)
+        if sheets is not None:
+            try:
+                sheets.log_daily_review(rows)
+            except Exception:
+                logger.warning("Daily review: Sheets logging failed", exc_info=True)
         return len(rows)
     finally:
         conn.close()

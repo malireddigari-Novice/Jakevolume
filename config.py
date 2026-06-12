@@ -306,4 +306,9 @@ SHEET_NAMES = {
     'morning_sentiment': 'Morning_Sentiment',
     'levels_comparison': 'Levels_Comparison',
     'paper_trades':      'Paper_Trades',
+    'review':            'Signal_Review',
 }
+
+# Set DISCORD_REVIEW_WEBHOOK_URL for the daily post-close review (falls back to the
+# morning briefing webhook, then the main signal webhook).
+DISCORD_REVIEW_WEBHOOK_URL = os.getenv('DISCORD_REVIEW_WEBHOOK_URL', '')

@@ -98,6 +98,12 @@ _HDR_PAPER_TRADES = [
     'Capital_Used', 'Order_ID',
 ]
 
+_HDR_SIGNAL_REVIEW = [
+    'Analysis_Date', 'Signal_Time', 'Symbol', 'Signal_Type', 'Strike', 'Type',
+    'Entry', 'MFE_%', 'MAE_%', 'Peak', 'Rule_PnL_%',
+    'Suggested_Action', 'Suggested_PnL_%', 'Recommendation',
+]
+
 _HEADERS = {
     config.SHEET_NAMES['daily_levels']:       _HDR_DAILY_LEVELS,
     config.SHEET_NAMES['signals']:            _HDR_SIGNALS,
@@ -105,6 +111,7 @@ _HEADERS = {
     config.SHEET_NAMES['morning_sentiment']:  _HDR_MORNING_SENTIMENT,
     config.SHEET_NAMES['levels_comparison']:  _HDR_LEVELS_COMPARISON,
     config.SHEET_NAMES['paper_trades']:       _HDR_PAPER_TRADES,
+    config.SHEET_NAMES['review']:             _HDR_SIGNAL_REVIEW,
 }
 
 
@@ -249,6 +256,22 @@ class SheetsLogger:
         logger.info(
             "Sheets: queued sentiment for %s => %s", sentiment['symbol'], sentiment['bias']
         )
+
+    def log_daily_review(self, rows: list) -> None:
+        """Enqueue one Signal_Review row per analyzed signal (daily post-close review)."""
+        for r in rows:
+            st = r.get('signal_time')
+            self._enqueue('review', [
+                str(r.get('analysis_date', '')),
+                st.strftime('%H:%M') if hasattr(st, 'strftime') else str(st or ''),
+                r.get('symbol', ''), r.get('signal_type', ''),
+                r.get('traded_strike', ''), r.get('option_type', ''),
+                r.get('entry_price', ''), r.get('mfe_pct', ''), r.get('mae_pct', ''),
+                r.get('peak_price', ''), r.get('rule_pnl_pct', ''),
+                r.get('suggested_action', ''), r.get('suggested_pnl_pct', ''),
+                r.get('suggestion', ''),
+            ])
+        logger.info("Sheets: queued %d daily-review rows", len(rows))
 
     def log_oi_snapshot(
         self,

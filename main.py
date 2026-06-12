@@ -933,7 +933,7 @@ def main() -> None:
             # (take-profit + stop move) per signal in the signal_analysis table.
             if review_done != now.date() and is_post_close(now):
                 try:
-                    analyze_daily_signals(now.date(), data_src=adata)
+                    analyze_daily_signals(now.date(), data_src=adata, sheets=sheets)
                 except Exception:
                     logger.warning("Daily signal review failed", exc_info=True)
                 review_done = now.date()

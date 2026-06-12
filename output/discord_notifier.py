@@ -213,6 +213,42 @@ def send_morning_briefing(results: list, now: datetime) -> None:
     logger.info("Discord: morning briefing sent (%d symbols)", len(results))
 
 
+def send_daily_review(rows: list, analysis_date) -> None:
+    """
+    Post the daily post-close signal review: one line per signal with the realized
+    peak (MFE), the current rule's P&L, and the suggested management + its outcome.
+    `rows` are the dicts built by analysis.daily_review.analyze_daily_signals().
+    """
+    url = (config.DISCORD_REVIEW_WEBHOOK_URL or config.DISCORD_MORNING_WEBHOOK_URL
+           or config.DISCORD_WEBHOOK_URL)
+    if not url or not rows:
+        return
+
+    header = f"{'SYM':<6} {'Dir':<4} {'MFE%':>7} {'Rule%':>7} {'Sugg%':>7}  Suggested action"
+    lines  = [header, "-" * len(header)]
+    for r in sorted(rows, key=lambda x: (x.get('mfe_pct') or -999), reverse=True):
+        mfe  = r.get('mfe_pct'); rule = r.get('rule_pnl_pct'); sug = r.get('suggested_pnl_pct')
+        lines.append(
+            f"{r.get('symbol',''):<6} {str(r.get('signal_type',''))[:4]:<4} "
+            f"{(f'{mfe:+.0f}' if mfe is not None else '  -'):>7} "
+            f"{(f'{rule:+.0f}' if rule is not None else '  -'):>7} "
+            f"{(f'{sug:+.0f}' if sug is not None else '  -'):>7}  "
+            f"{r.get('suggested_action','')}"
+        )
+    # Detail block: the full recommendation text per signal
+    notes = [f"- {r.get('symbol','')}: {r.get('suggestion','')}" for r in rows if r.get('suggestion')]
+
+    prefix = "**[SAMPLE]** " if config.SAMPLE_MODE else ""
+    title  = f"{prefix}**JAKEVOLUME DAILY REVIEW — {analysis_date}**  ({len(rows)} signals)"
+    table  = "\n".join(lines)
+    body   = "\n".join(notes)
+    content = f"{title}\n```\n{table}\n```\n{body}"
+    if len(content) > 1900:               # Discord 2000-char limit — drop the notes if long
+        content = f"{title}\n```\n{table}\n```"
+    _post(url, {"content": content})
+    logger.info("Discord: daily review sent (%d signals)", len(rows))
+
+
 # ── Trade execution alert ─────────────────────────────────────────────────────
 
 def send_trade_alert(order: dict, sig: dict, qty: int, spend: float) -> None:
