@@ -230,3 +230,32 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS stoploss_price    NUMERIC(12,4);  --
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS strike            NUMERIC(12,4);  -- option strike (for mark lookup)
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS option_type       VARCHAR(4);     -- CALL or PUT
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS expiry            DATE;           -- option expiry; NULL = 0DTE (close at EOD)
+
+-- ── Daily post-close signal review (15:00 CST) ─────────────────────────────────
+-- One row per signal per day: realized intraday excursions of the traded contract
+-- plus a SUGGESTED management action (e.g. take 30% + move stop to breakeven) and
+-- the % that suggestion would have captured. Written by analysis/daily_review.py.
+CREATE TABLE IF NOT EXISTS signal_analysis (
+    id                BIGSERIAL     PRIMARY KEY,
+    signal_id         BIGINT        REFERENCES signals(id),
+    analysis_date     DATE          NOT NULL,
+    symbol            VARCHAR(10)   NOT NULL,
+    signal_time       TIMESTAMPTZ   NOT NULL,
+    signal_type       VARCHAR(10)   NOT NULL,
+    traded_strike     NUMERIC(12,4),
+    option_type       VARCHAR(4),
+    entry_price       NUMERIC(12,4),
+    mfe_pct           NUMERIC(8,2),   -- max favorable excursion (peak gain %)
+    mae_pct           NUMERIC(8,2),   -- max adverse excursion (worst drawdown %)
+    peak_price        NUMERIC(12,4),
+    peak_time         TIMESTAMPTZ,
+    trough_price      NUMERIC(12,4),
+    rule_pnl_pct      NUMERIC(8,2),   -- outcome of the CURRENT live exit rule
+    suggested_action  VARCHAR(40),    -- e.g. TAKE_50@30_BE_TRAIL
+    suggested_pnl_pct NUMERIC(8,2),   -- % the suggested management would have captured
+    suggestion        TEXT,           -- human-readable management note
+    data_source       VARCHAR(12),    -- where the price path came from
+    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (signal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sig_analysis_date ON signal_analysis (analysis_date);

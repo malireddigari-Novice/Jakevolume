@@ -30,9 +30,11 @@ from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector, compute_exit_targets
+from analysis.daily_review import analyze_daily_signals
 from data.market_utils import (
     now_cst, today_cst,
     is_market_open, is_snapshot_window, is_past_snapshot, is_eod_window, is_opening_range,
+    is_post_close,
 )
 from data.schwab_client import SchwabClient
 from data.databento_client import DatabentoClient
@@ -884,8 +886,9 @@ def main() -> None:
 
     detector   = SignalDetector()
     monitor    = PositioningMonitor()
-    snap_done: date | None = None   # guard: run snapshot only once per day
-    eod_done:  date | None = None   # guard: run EOD liquidation only once per day
+    snap_done:   date | None = None   # guard: run snapshot only once per day
+    eod_done:    date | None = None   # guard: run EOD liquidation only once per day
+    review_done: date | None = None   # guard: run post-close signal review once per day
 
     logger.info(
         "Loop running. Snapshot @ %02d:%02d CST | Market hours 08:30–15:00 CST",
@@ -924,6 +927,16 @@ def main() -> None:
             if alpaca and config.ALPACA_ENABLED and is_eod_window(now) and eod_done != now.date():
                 eod_liquidate(alpaca, now, sheets)
                 eod_done = now.date()
+
+            # Daily signal review — 15:00 CST (right after close), once per day.
+            # Analyzes every signal today and stores a suggested management outcome
+            # (take-profit + stop move) per signal in the signal_analysis table.
+            if review_done != now.date() and is_post_close(now):
+                try:
+                    analyze_daily_signals(now.date(), data_src=adata)
+                except Exception:
+                    logger.warning("Daily signal review failed", exc_info=True)
+                review_done = now.date()
 
         except Exception:
             logger.exception("Unhandled error in main loop")

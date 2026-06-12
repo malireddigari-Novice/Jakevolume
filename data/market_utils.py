@@ -48,6 +48,16 @@ def is_market_open(dt: datetime = None) -> bool:
     return _MARKET_OPEN <= t < _MARKET_CLOSE
 
 
+def is_post_close(dt: datetime = None) -> bool:
+    """True on a weekday at/after market close (15:00 CST). Daily-review trigger;
+    the once-per-day guard in the loop ensures it runs a single time."""
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    return dt.time().replace(second=0, microsecond=0) >= _MARKET_CLOSE
+
+
 def is_warmup(dt: datetime = None) -> bool:
     """
     True during the first SIGNAL_WARMUP_MINUTES after open (08:30 CST).
