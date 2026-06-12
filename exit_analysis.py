@@ -50,6 +50,23 @@ def cur_rule(styp, entry, opath, ubymin, e1, e2):
     if held > 0: proc += held*opath[-1][3]
     return (proc-entry)/entry*100
 
+def cur_rule_premium(styp, entry, opath, ubymin, e1, e2, tp=0.50):
+    """Current rule + premium-spike exit1: exit1 also fires when the option mark gains
+    >= tp (sell half at that price, stop->BE), even if the underlying never reaches e1."""
+    stop, held, proc, e1done = 0.5*entry, 1.0, 0.0, False
+    for (t, h, l, c) in opath[1:]:
+        if held > 0 and l <= stop: proc += held*stop; held = 0; break
+        if not e1done and h >= entry*(1+tp):           # premium spike -> bank half at +tp
+            proc += 0.5*entry*(1+tp); held -= 0.5; e1done = True; stop = entry
+        u = ubymin.get(t.replace(second=0, microsecond=0))
+        if u:
+            uh, ul = u
+            def hit(x): return x is not None and ((uh >= x) if styp == 'BULLISH' else (ul <= x))
+            if not e1done and hit(e1): proc += 0.5*c; held -= 0.5; e1done = True; stop = entry
+            if e1done and held > 0 and hit(e2): proc += held*c; held = 0; break
+    if held > 0: proc += held*opath[-1][3]
+    return (proc-entry)/entry*100
+
 def opt_rule(entry, opath, stop_pct, tp_pct=None, trail_arm=None, trail_pct=None, be_after=None):
     """Full-position option-price rule."""
     stop = entry*(1-stop_pct); peak = entry
@@ -104,6 +121,8 @@ for sid, sym, st, styp, k, ot, espot in sigs:
     rows.append({
         'mfe': mfe, 'mae': mae,
         'CURRENT':   cur_rule(styp, entry, op, ubymin, e1, e2),
+        'CUR+PREM50': cur_rule_premium(styp, entry, op, ubymin, e1, e2, tp=0.50),
+        'CUR+PREM75': cur_rule_premium(styp, entry, op, ubymin, e1, e2, tp=0.75),
         'NEAR_EXITS': cur_rule(styp, entry, op, ubymin, e1n, e2n),
         'STOP35':    opt_rule(entry, op, 0.35),
         'TP100_S50': opt_rule(entry, op, 0.50, tp_pct=1.00),
@@ -125,7 +144,7 @@ print(f"  MAE (avg worst drawdown):      {sum(r['mae'] for r in rows)/n:+.1f}%  
       f"median {sorted(r['mae'] for r in rows)[n//2]:+.1f}%")
 print(f"\n  {'RULE':12} {'avgP&L%':>8} {'medP&L%':>8} {'win%':>6} {'$@1k total':>11}")
 print("  " + "-"*52)
-for rule in ['CURRENT', 'NEAR_EXITS', 'STOP35', 'TP100_S50', 'TRAIL',
+for rule in ['CURRENT', 'CUR+PREM50', 'CUR+PREM75', 'NEAR_EXITS', 'STOP35', 'TP100_S50', 'TRAIL',
              'LADDER_50_100', 'LADDER_RUN', 'LADDER_3', 'EOD_S50', 'CHIP_RUN', 'CEILING']:
     vals = [r[rule] for r in rows]
     avg = sum(vals)/n

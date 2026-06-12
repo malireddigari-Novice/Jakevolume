@@ -190,6 +190,14 @@ OPENING_RANGE_EXCITATION_MIN = float(os.getenv('OPENING_RANGE_EXCITATION_MIN', '
 # shift, drop any target still within EXIT_MIN_ROOM_PCT of the entry spot.
 EXIT_MIN_ROOM_PCT = float(os.getenv('EXIT_MIN_ROOM_PCT', '0.0025'))   # 0.25%
 
+# Premium take-profit — rescue "stopped-out runners". Exit1 (sell half + stop→
+# breakeven) also fires when the OPTION mark gains >= PREMIUM_TP_GAIN_PCT, even if
+# the underlying never reaches the exit-1 S/R level. Banks the option spike a runner
+# would otherwise give back to the −50% stop. The other half still rides to exit2
+# at the far level. Tune the threshold; daily_review quantifies the effect.
+PREMIUM_TP_ENABLED  = os.getenv('PREMIUM_TP_ENABLED', 'true').lower() == 'true'
+PREMIUM_TP_GAIN_PCT = float(os.getenv('PREMIUM_TP_GAIN_PCT', '0.50'))   # +50% option mark
+
 # ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
 CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
 CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2
