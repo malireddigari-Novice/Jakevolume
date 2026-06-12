@@ -11,7 +11,7 @@ Signal semantics
 A CALL/PUT alert fires when ALL hold (§17/§18):
   • spot is NEAR a same-side level                        (§4 proximity, binary)
   • correct side is being watched                         (§5)
-  • a valid volume signal exists                          (VolumeStickoutScore >= 0.75)
+  • a valid volume signal exists  (ValidVolumeSignal = SingleBar OR Cluster OR StairStep)
   • the contract is cheap / not chased                    (§12 contract-low)
   • the contract is not historically rich                 (§13 historical percentile)
   • there is no short-cover risk                          (§14)
@@ -31,12 +31,12 @@ Removed for V1 (§1): dynamic S/R flipping, spread filter, target-room filter,
 confidence tiers, WATCH/upgrade alerts, volume-shape labels in Discord.
 """
 import logging
+import statistics
 from collections import defaultdict, deque
 from datetime import date, datetime
 from typing import Optional
 
 import config
-from analysis.volume_stickout import compute_stickout
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -508,26 +508,7 @@ class SignalDetector:
             fired.append(sig)
         return fired
 
-    # ── Per-contract volume evaluation ────────────────────────────────────────
-
-    def _stickout(self, symbol: str, history: list[int], delta: int,
-                  low_dist: Optional[float]) -> dict:
-        """
-        VolumeStickoutScore for one contract (analysis.volume_stickout).
-
-        `history` is the per-minute volume deltas oldest→newest, with the current
-        bar (`delta`) as its last element. Prior windows exclude the current bar.
-        """
-        prior   = history[:-1] if history else []
-        win5    = sum(history[-5:]) if history else 0
-        last5   = history[-5:] if history else []
-        prior5m = [sum(history[i:i + 5]) for i in range(0, max(0, len(history) - 5))]
-        return compute_stickout(
-            current_vol=delta, prior_vols=prior, session_vols=prior,
-            win5=win5, last5_vols=last5, prior5m_windows=prior5m,
-            contract_low_distance=low_dist, symbol=symbol,
-            volatile_symbols=frozenset(config.VOLATILE_SYMBOLS),
-        )
+    # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
 
     def _eval_volume(
         self,
@@ -541,40 +522,90 @@ class SignalDetector:
         excitation_min: float,
     ) -> dict:
         """
-        Per-contract volume evaluation. Validity is decided by the VolumeStickoutScore
-        (score >= 0.75 + right-tail guard + contract-low backstop). The legacy §9/§10/§11
-        metrics and A/B/C are still computed for the MONITOR log and the flow-shape label,
-        but no longer gate the alert.
+        ValidVolumeSignal = SingleBarValid OR ClusterValid OR StairStepValid, with the
+        explicit thresholds from the entry-volume spec. Real abnormal volume is the
+        trigger; contract-low is only a qualifier. Volume that does not visually stand
+        out → not valid (no alert).
+
+        `history` is per-minute volume deltas oldest→newest, current bar (`delta`) last.
+        `excitation_min` carries the opening-range tightening for the stair-step rule.
         """
-        single_raw, spike_ratio = _single_print(history, delta, min_single)
+        volatile  = symbol in config.VOLATILE_SYMBOLS
+        vol_floor = 250 if volatile else 100      # single-bar current-volume floor
+        win_floor = 600 if volatile else 300      # 5-bar window floor
+
+        # ── Single-bar inputs (median-robust baseline + visual dominance) ─────
+        prior20  = history[-21:-1] if len(history) > 1 else []
+        prior10  = history[-11:-1] if len(history) > 1 else []
+        median20 = statistics.median(prior20) if prior20 else 0.0
+        max20    = max(prior20) if prior20 else 0.0
+        avg10    = (sum(prior10) / len(prior10)) if prior10 else 0.0
+        baseline = max(avg10, median20, 10.0)
+        vol_ratio   = delta / baseline
+        visual_dom  = delta / max(max20, 1.0)
+
+        # ── 5-bar window / cluster inputs (median of prior rolling windows) ───
+        last5 = history[-5:]
+        win5  = sum(last5)
+        prior_windows = [sum(history[i:i + 5]) for i in range(0, max(0, len(history) - 5))][-20:]
+        med_win = statistics.median(prior_windows) if prior_windows else 0.0
+        max_win = max(prior_windows) if prior_windows else 0.0
+        win_ratio5  = win5 / max(med_win, 50.0)
+        cluster_dom = win5 / max(max_win, 1.0)
+        active5 = sum(1 for v in last5 if v >= max(median20 * 2.0, 50.0))
+
         clu        = _cluster_metrics(history)
         excitation = _excitation(clu['window'], clu['base_unit'])
 
-        near_175 = (low_dist is None or low_dist <= config.NEAR_LOW_MAX_DIST)
-        near_200 = (low_dist is None or low_dist <= config.STAIRSTEP_LOW_DIST_MAX)
+        near_175 = (low_dist is None or low_dist <= 1.75)
+        near_200 = (low_dist is None or low_dist <= 2.00)
 
-        a_extreme = single_raw and near_175
-        b_cluster = (clu['vol'] >= min_cluster_vol and clu['ratio'] >= cluster_ratio_min
-                     and clu['active'] >= config.OPT_CLUSTER_ACTIVE_MIN and near_175)
-        c_stair   = (excitation >= excitation_min
-                     and clu['vol'] >= min_cluster_vol
-                     and clu['ratio'] >= config.STAIRSTEP_WINDOW_RATIO_MIN
-                     and clu['active'] >= config.STAIRSTEP_ACTIVE_MIN and near_200)
+        # ── The three valid-volume rules ──────────────────────────────────────
+        single_valid = (delta >= vol_floor and vol_ratio >= 8.0
+                        and delta >= 0.75 * max20 and near_175)
+        cluster_valid = (win5 >= win_floor and win_ratio5 >= 3.0 and active5 >= 3
+                        and cluster_dom >= 0.75 and near_175)
+        stair_valid = (win5 >= win_floor and active5 >= 3 and excitation >= excitation_min
+                       and win_ratio5 >= 2.5 and near_200)
+        valid = single_valid or cluster_valid or stair_valid
 
-        # Volume validity = VolumeStickoutScore decision (the provided spec).
-        st = self._stickout(symbol, history, delta, low_dist)
+        # ── Trigger fields (Discord shows the actual trigger, not raw 1-min) ──
+        if single_valid:
+            trig_type, trig_vol, trig_ratio = 'SINGLE_BAR', delta, vol_ratio
+        elif cluster_valid or stair_valid:
+            trig_type, trig_vol, trig_ratio = 'FIVE_BAR_WINDOW', win5, win_ratio5
+        else:
+            trig_type, trig_vol, trig_ratio = 'SINGLE_BAR', delta, vol_ratio
+
+        # ── Granular blocked reason ───────────────────────────────────────────
+        if valid:
+            block_reason = 'OK'
+        elif delta < vol_floor and win5 < win_floor:
+            block_reason = 'LOW_ABSOLUTE_VOLUME'
+        elif win5 < win_floor:                         # only the single-bar path is viable
+            block_reason = ('LOW_RATIO' if vol_ratio < 8.0
+                            else 'LOW_VISUAL_DOMINANCE' if visual_dom < 0.75
+                            else 'LOW_WINDOW_VOLUME')
+        elif active5 < 3:
+            block_reason = 'NOT_ENOUGH_ACTIVE_BARS'
+        elif win_ratio5 < 2.5:
+            block_reason = 'LOW_RATIO'
+        elif cluster_dom < 0.75:
+            block_reason = 'LOW_VISUAL_DOMINANCE'
+        else:
+            block_reason = 'LOW_WINDOW_VOLUME'
+
         return {
-            'delta': delta, 'spike_ratio': spike_ratio,
-            'vol': clu['vol'], 'ratio': clu['ratio'],
-            'active': clu['active'], 'burst': clu['burst'], 'excitation': excitation,
-            'A': a_extreme, 'B': b_cluster, 'C': c_stair,
-            'score': st['score'], 'strong': st['strong'],
-            'right_tail': st.get('right_tail_ok', False),
-            'block_reason': st.get('block_reason'),
-            'trigger_type': st.get('trigger_type'),
-            'trigger_volume': st.get('trigger_volume'),
-            'trigger_ratio': st.get('trigger_ratio'),
-            'valid': st['valid'],
+            'delta': delta, 'spike_ratio': round(vol_ratio, 2),
+            'vol': win5, 'ratio': round(win_ratio5, 2),
+            'active': active5, 'burst': clu['burst'], 'excitation': excitation,
+            'visual_dom': round(visual_dom, 2), 'cluster_dom': round(cluster_dom, 2),
+            'A': single_valid, 'B': cluster_valid, 'C': stair_valid,
+            'strong': single_valid and (cluster_valid or stair_valid),
+            'block_reason': block_reason,
+            'trigger_type': trig_type, 'trigger_volume': trig_vol,
+            'trigger_ratio': round(trig_ratio, 2),
+            'valid': valid,
         }
 
     # ── §13 historical value percentile ───────────────────────────────────────
@@ -808,11 +839,10 @@ class SignalDetector:
             'atm_vol_1m':       atm_delta,
             'atm_spike_ratio':  atm.get('spike_ratio', 0.0),
             'atm_vol_3m':       atm.get('vol', 0),
-            # VolumeStickoutScore trigger (what Discord shows: single-bar vs 5-bar window)
+            # Volume trigger (what Discord shows: single-bar vs 5-bar window)
             'trigger_volume_type': atm.get('trigger_type'),
             'trigger_volume':      atm.get('trigger_volume'),
             'trigger_ratio':       atm.get('trigger_ratio'),
-            'volume_score':        atm.get('score'),
             'itm_vol_1m':       itm_delta,
             'itm_spike_ratio':  itm.get('spike_ratio', 0.0),
             'itm_vol_3m':       itm.get('vol', 0),
