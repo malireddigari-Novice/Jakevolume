@@ -594,65 +594,49 @@ def check_exits(
             logger.debug("%s: no position held (entry unfilled?) — skipping exits", occ)
             continue
 
-        # ── Current option mark (shared by stoploss + premium take-profit) ───
-        current_mark = None
-        strike   = trade.get('strike')
-        opt_type = trade.get('option_type')
-        if option_quotes and strike and opt_type:
-            q = option_quotes.get((float(strike), opt_type))
-            if q:
-                current_mark = q.get('mark') or q.get('ask') or None
-
         # ── Stoploss check (option mark vs stored stoploss_price) ────────────
         stoploss_price = trade.get('stoploss_price')
-        if stoploss_price is not None and current_mark is not None:
-            if current_mark <= float(stoploss_price):
-                remaining_qty = trade['exit2_qty'] if trade['exit1_filled'] else trade['qty']
-                logger.info(
-                    "Stoploss triggered  %s  mark=%.2f  stop=%.2f  qty=%d",
-                    occ, current_mark, float(stoploss_price), remaining_qty,
-                )
-                order = alpaca.close_position_qty(occ, remaining_qty)
-                if order:
-                    db.mark_trade_stopped(trade['id'], now)
-                    label = f"Stoploss ${float(stoploss_price):.2f}"
-                    sheets.log_trade_exit(order, dict(trade), label, underlying_price)
-                continue  # skip exit target checks for this trade
+        if stoploss_price is not None and option_quotes:
+            strike   = trade.get('strike')
+            opt_type = trade.get('option_type')
+            if strike and opt_type:
+                quote = option_quotes.get((float(strike), opt_type))
+                if quote:
+                    current_mark = quote.get('mark') or quote.get('ask') or 0
+                    if current_mark and current_mark <= float(stoploss_price):
+                        remaining_qty = trade['exit2_qty'] if trade['exit1_filled'] else trade['qty']
+                        logger.info(
+                            "Stoploss triggered  %s  mark=%.2f  stop=%.2f  qty=%d",
+                            occ, current_mark, float(stoploss_price), remaining_qty,
+                        )
+                        order = alpaca.close_position_qty(occ, remaining_qty)
+                        if order:
+                            db.mark_trade_stopped(trade['id'], now)
+                            label = f"Stoploss ${float(stoploss_price):.2f}"
+                            sheets.log_trade_exit(order, dict(trade), label, underlying_price)
+                        continue  # skip exit target checks for this trade
 
-        # ── Exit 1 — underlying reaches the level OR the option premium spikes ─
-        # The premium trigger rescues "stopped-out runners": a contract whose mark
-        # spikes (e.g. +50%) but whose underlying never reaches the exit level —
-        # bank half into the spike and move the stop to breakeven, instead of riding
-        # it back down to the −50% stop.
+        # ── Exit 1 ───────────────────────────────────────────────────────────
         if not trade['exit1_filled'] and trade.get('exit1_underlying'):
-            target   = float(trade['exit1_underlying'])
-            entry_px = float(trade['limit_price'])
-            underlying_hit = (
+            target = float(trade['exit1_underlying'])
+            hit = (
                 (sig_type == 'BULLISH' and underlying_price >= target) or
                 (sig_type == 'BEARISH' and underlying_price <= target)
             )
-            premium_hit = (
-                config.PREMIUM_TP_ENABLED and current_mark is not None and entry_px > 0
-                and current_mark >= entry_px * (1 + config.PREMIUM_TP_GAIN_PCT)
-            )
-            if underlying_hit or premium_hit:
+            if hit:
                 r1_label = 'R1' if sig_type == 'BULLISH' else 'S1'
                 r2_label = 'R2' if sig_type == 'BULLISH' else 'S2'
-                via_premium = premium_hit and not underlying_hit
-                trig = (f"premium +{config.PREMIUM_TP_GAIN_PCT*100:.0f}%" if via_premium else "level")
                 logger.info(
-                    "Exit1 triggered (%s)  %s  spot=%.2f  mark=%s  target=%.2f  qty=%d",
-                    trig, occ, underlying_price,
-                    f"{current_mark:.2f}" if current_mark else "n/a", target, trade['exit1_qty'],
+                    "Exit1 triggered  %s  spot=%.2f  target=%.2f  qty=%d",
+                    occ, underlying_price, target, trade['exit1_qty'],
                 )
                 order = alpaca.close_position_qty(occ, trade['exit1_qty'])
                 if order:
                     db.mark_exit1_filled(trade['id'], now)
-                    new_stop = entry_px
+                    new_stop = float(trade['limit_price'])
                     db.update_stoploss(trade['id'], new_stop)
                     stop_str = f"${new_stop:.2f}" if new_stop >= 1 else f"{int(new_stop * 100)}¢"
-                    src_lbl  = (f"+{config.PREMIUM_TP_GAIN_PCT*100:.0f}% premium" if via_premium else r1_label)
-                    label    = f"Exit 1/2 @ {src_lbl}  |  Stop → {stop_str} (breakeven)"
+                    label    = f"Exit 1/2 @ {r1_label}  |  Stop → {stop_str} (breakeven)"
                     sheets.log_trade_exit(order, dict(trade), label, underlying_price)
 
                     # Opposite-side volume validation — may trigger early exit2
