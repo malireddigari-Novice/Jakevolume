@@ -113,6 +113,23 @@ class AlpacaDataClient:
                 return {'price': (float(bp) + float(ap)) / 2}
         return {'price': None}
 
+    def get_quote_mid(self, symbol: str) -> Optional[float]:
+        """
+        Current bid/ask MIDPOINT (SIP) — the freshest pre-market spot proxy, used to
+        anchor the 08:20 S/R levels and sentiment. The quote mid always reflects the
+        live market, unlike a last-trade which can be a stale pre-market print.
+        Falls back to the latest trade, then None.
+        """
+        q = self._get(_DATA, f"/v2/stocks/{symbol}/quotes/latest", {'feed': _STOCK_FEED})
+        if q and q.get('quote'):
+            bp, ap = q['quote'].get('bp'), q['quote'].get('ap')
+            if bp and ap and float(bp) > 0 and float(ap) > 0:
+                return (float(bp) + float(ap)) / 2
+        t = self._get(_DATA, f"/v2/stocks/{symbol}/trades/latest", {'feed': _STOCK_FEED})
+        if t and t.get('trade') and t['trade'].get('p'):
+            return float(t['trade']['p'])
+        return None
+
     # ── expiry discovery ──────────────────────────────────────────────────────────
 
     def get_nearest_expiry(self, symbol: str) -> Optional[date]:

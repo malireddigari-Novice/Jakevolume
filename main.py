@@ -78,9 +78,11 @@ logger = logging.getLogger('jakevolume.main')
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
 
-def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
+def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> None:
     """
-    Run the daily 08:20 CST setup using Schwab for option chains, quotes, and prices.
+    Run the daily 08:20 CST setup. Option chains/OI come from Schwab (Alpaca has no
+    live OI); the SPOT anchor for S/R levels + sentiment prefers the Alpaca SIP quote
+    mid (freshest pre-market price), falling back to Schwab, then prev close.
     """
     now   = now_cst()
     today = today_cst()
@@ -92,10 +94,27 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger) -> None:
         try:
             prev_close = schwab.get_prev_close(symbol)
 
-            quote    = schwab.get_quote(symbol)
-            pm_price = quote['price'] or prev_close
+            # 8:20 SPOT anchor — prefer the Alpaca SIP bid/ask mid (freshest pre-market
+            # price), then the Schwab quote, then prev_close as a last resort. Using the
+            # quote mid avoids silently anchoring to a stale last-trade / yesterday's close.
+            pm_price, src = None, None
+            if adata is not None:
+                try:
+                    pm_price = adata.get_quote_mid(symbol)
+                    src = 'alpaca-mid'
+                except Exception:
+                    pm_price = None
+            if not pm_price:
+                try:
+                    pm_price = schwab.get_quote(symbol).get('price')
+                    src = 'schwab'
+                except Exception:
+                    pm_price = None
+            if not pm_price:
+                pm_price, src = prev_close, 'prev_close(fallback)'
 
-            logger.info("%s: prev_close=%.4f  pm_price=%.4f", symbol, prev_close, pm_price)
+            logger.info("%s: prev_close=%.4f  spot=%.4f  (anchor=%s)",
+                        symbol, prev_close, pm_price, src)
 
             chain  = schwab.get_option_chain(symbol)
             expiry = chain['expiry']
@@ -914,7 +933,7 @@ def main() -> None:
                             now.date(),
                         )
                     else:
-                        morning_snapshot(schwab, sheets)
+                        morning_snapshot(schwab, sheets, adata)
                 else:
                     logger.warning("Schwab not available — morning snapshot skipped")
                 snap_done = now.date()
