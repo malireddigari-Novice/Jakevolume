@@ -259,3 +259,31 @@ CREATE TABLE IF NOT EXISTS signal_analysis (
     UNIQUE (signal_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sig_analysis_date ON signal_analysis (analysis_date);
+
+-- ── Flow Leadership Reversals ──────────────────────────────────────────────────
+-- One row each time the reversal engine flips an open position's flow story: the
+-- position exited, plus the HYPOTHETICAL opposite entry (contract + mark) so the
+-- reversal's value can be measured later (paper-track; auto-flip off in V1).
+CREATE TABLE IF NOT EXISTS flow_reversals (
+    id                BIGSERIAL     PRIMARY KEY,
+    symbol            VARCHAR(10)   NOT NULL,
+    detected_at       TIMESTAMPTZ   NOT NULL,
+    trade_id          BIGINT        REFERENCES trades(id),
+    from_side         VARCHAR(4)    NOT NULL,   -- the side being exited (CALL/PUT)
+    to_side           VARCHAR(4)    NOT NULL,   -- the opposite side now leading
+    spot              NUMERIC(12,4),
+    exit_occ          VARCHAR(30),
+    exit_price        NUMERIC(12,4),            -- mark of the exited position contract
+    same_leadership   NUMERIC(6,3),
+    opp_leadership    NUMERIC(6,3),
+    leadership_diff   NUMERIC(6,3),
+    opp_burst         NUMERIC(8,2),
+    opp_share         NUMERIC(8,3),
+    hypo_occ          VARCHAR(30),              -- hypothetical opposite entry contract
+    hypo_strike       NUMERIC(12,4),
+    hypo_entry_price  NUMERIC(12,4),            -- opposite contract mark at reversal
+    flipped           BOOLEAN       NOT NULL DEFAULT FALSE,  -- auto-flip opened the opp trade
+    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_flow_reversals_sym_date
+    ON flow_reversals (symbol, detected_at);

@@ -213,6 +213,35 @@ def send_morning_briefing(results: list, now: datetime) -> None:
     logger.info("Discord: morning briefing sent (%d symbols)", len(results))
 
 
+def send_reversal_alert(rev: dict) -> None:
+    """
+    Flow-leadership reversal: the opposite side took control while the position's side
+    faded. Posts the exit + the hypothetical opposite entry (V1 paper-tracks it).
+    `rev` keys: symbol, from_side, to_side, spot, exit_occ, exit_price, hypo_occ,
+    hypo_entry_price, opp_leadership, same_leadership, opp_burst, opp_share, flipped.
+    """
+    url = config.DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    flipped = rev.get('flipped')
+    title = f"🔄 **FLOW REVERSAL — {rev['symbol']} {rev['from_side']} → {rev['to_side']}**"
+    lines = [
+        title,
+        f"Opposite-side flow took control; exiting {rev['from_side']} side.",
+        f"Spot: {rev.get('spot')}",
+        f"Exited: {rev.get('exit_occ')} @ {rev.get('exit_price')}",
+        f"Leadership: {rev['to_side']} {rev.get('opp_leadership')} vs "
+        f"{rev['from_side']} {rev.get('same_leadership')}  "
+        f"(opp burst {rev.get('opp_burst')}x / share {rev.get('opp_share')})",
+        (f"➡️ Flipped to {rev.get('hypo_occ')} @ {rev.get('hypo_entry_price')}" if flipped
+         else f"Hypothetical {rev['to_side']} entry (paper-tracked): "
+              f"{rev.get('hypo_occ')} @ {rev.get('hypo_entry_price')}"),
+    ]
+    _post(url, {"content": "\n".join(str(x) for x in lines)})
+    logger.info("Discord: reversal alert sent  %s %s->%s",
+                rev['symbol'], rev['from_side'], rev['to_side'])
+
+
 def send_daily_review(rows: list, analysis_date) -> None:
     """
     Post the daily post-close signal review: one line per signal with the realized

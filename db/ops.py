@@ -407,6 +407,30 @@ def save_morning_sentiment(
         _put(conn)
 
 
+def save_flow_reversal(r: dict) -> Optional[int]:
+    """Insert a flow-reversal event (position exited + hypothetical opposite entry)."""
+    sql = """
+        INSERT INTO flow_reversals
+            (symbol, detected_at, trade_id, from_side, to_side, spot, exit_occ, exit_price,
+             same_leadership, opp_leadership, leadership_diff, opp_burst, opp_share,
+             hypo_occ, hypo_strike, hypo_entry_price, flipped)
+        VALUES (%(symbol)s, %(detected_at)s, %(trade_id)s, %(from_side)s, %(to_side)s,
+                %(spot)s, %(exit_occ)s, %(exit_price)s, %(same_leadership)s,
+                %(opp_leadership)s, %(leadership_diff)s, %(opp_burst)s, %(opp_share)s,
+                %(hypo_occ)s, %(hypo_strike)s, %(hypo_entry_price)s, %(flipped)s)
+        RETURNING id
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, r)
+            rid = cur.fetchone()[0]
+        conn.commit()
+        return rid
+    finally:
+        _put(conn)
+
+
 def get_today_pc_ratio(symbol: str, snap_date: date) -> Optional[float]:
     """Return today's P/C ratio for a symbol, or None if not yet computed."""
     sql = """

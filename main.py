@@ -31,6 +31,8 @@ from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector, compute_exit_targets
 from analysis.daily_review import analyze_daily_signals
+from analysis.flow_reversal import FlowReversalEngine, volume_event
+from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
     is_market_open, is_snapshot_window, is_past_snapshot, is_eod_window, is_opening_range,
@@ -74,6 +76,9 @@ def _setup_logging() -> None:
 
 
 logger = logging.getLogger('jakevolume.main')
+
+# Per-symbol flow-leadership reversal engine (spec §19), shared across polls.
+_reversal_engine = FlowReversalEngine()
 
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
@@ -579,6 +584,51 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         sheets.log_trade_entry(order, sig, qty, spend)
 
 
+def _handle_reversal(trade, occ, symbol, spot, rev, alpaca, now, sheets, option_quotes) -> None:
+    """
+    Confirmed flow-leadership reversal: exit the position, alert, and record the
+    HYPOTHETICAL opposite entry. V1 paper-tracks only — auto-flip stays off
+    (config.FLOW_REVERSAL_AUTO_FLIP) until tested.
+    """
+    pos_type  = trade['option_type']
+    remaining = trade['exit2_qty'] if trade.get('exit1_filled') else trade['qty']
+    exit_q     = option_quotes.get((float(trade['strike']), pos_type)) if trade.get('strike') else None
+    exit_price = (exit_q or {}).get('mark')
+
+    order = alpaca.close_position_qty(occ, remaining)
+    if order:
+        db.mark_trade_stopped(trade['id'], now)
+        sheets.log_trade_exit(order, dict(trade), f"FLOW REVERSAL -> {rev['opp_type']}", spot)
+
+    best        = rev.get('opp_best')
+    hypo_strike = best['strike'] if best else None
+    hypo_price  = best.get('mark') if best else None
+    hypo_occ    = (occ_symbol(symbol, trade.get('expiry') or today_cst(), hypo_strike, rev['opp_type'])
+                   if hypo_strike else None)
+
+    revrow = dict(
+        symbol=symbol, detected_at=now, trade_id=trade['id'],
+        from_side=pos_type, to_side=rev['opp_type'], spot=round(float(spot), 4),
+        exit_occ=occ, exit_price=exit_price,
+        same_leadership=rev['same_leadership'], opp_leadership=rev['opp_leadership'],
+        leadership_diff=rev['leadership_diff'],
+        opp_burst=(best['ev']['burst'] if best else None),
+        opp_share=(best['ev']['share'] if best else None),
+        hypo_occ=hypo_occ, hypo_strike=hypo_strike, hypo_entry_price=hypo_price,
+        flipped=False,
+    )
+    try:
+        db.save_flow_reversal(revrow)
+    except Exception:
+        logger.warning("save_flow_reversal failed", exc_info=True)
+    try:
+        send_reversal_alert(revrow)
+    except Exception:
+        logger.warning("reversal alert failed", exc_info=True)
+    logger.info("FLOW REVERSAL %s %s->%s: exited %s @ %s, hypothetical %s @ %s",
+                symbol, pos_type, rev['opp_type'], occ, exit_price, hypo_occ, hypo_price)
+
+
 def check_exits(
     symbol: str,
     underlying_price: float,
@@ -599,6 +649,9 @@ def check_exits(
                     volume validates at the exit1 level in a subsequent bar.
     """
     trades = db.get_open_trades(symbol)
+    if not trades:
+        _reversal_engine.reset(symbol)        # fresh state for the next position
+        return
     for trade in trades:
         sig_type = trade.get('signal_type', '')
         occ      = trade['occ_symbol']
@@ -612,6 +665,31 @@ def check_exits(
         if alpaca.position_qty(occ) <= 0:
             logger.debug("%s: no position held (entry unfilled?) — skipping exits", occ)
             continue
+
+        # ── Flow-leadership reversal (spec §19) — opposite side took control? ─
+        if config.FLOW_REVERSAL_ENABLED and option_quotes and trade.get('option_type'):
+            pos_type = trade['option_type']
+            same_events, opp_events = [], []
+            for (k, ot), q in option_quotes.items():
+                item = {
+                    'strike': k,
+                    'ev': volume_event(list(detector._opt_vol_hist.get((symbol, k, ot), []))),
+                    'low_dist': detector._contract_low_dist((symbol, k, ot), q),
+                    'mark': q.get('mark'),
+                }
+                (same_events if ot == pos_type else opp_events).append(item)
+            rev = _reversal_engine.evaluate(symbol, pos_type, same_events, opp_events, now)
+            if rev['state'] != 'ACTIVE':
+                logger.info("REVERSAL %-17s %s  same_lead=%.2f opp_lead=%.2f diff=%.2f "
+                            "fading=%s streak=%d window=%s",
+                            rev['state'], occ, rev['same_leadership'], rev['opp_leadership'],
+                            rev['leadership_diff'], rev['same_fading'], rev['opp_streak'],
+                            rev['window_ok'])
+            if rev['reversal_confirmed']:
+                _handle_reversal(trade, occ, symbol, underlying_price, rev,
+                                 alpaca, now, sheets, option_quotes)
+                _reversal_engine.reset(symbol)
+                continue
 
         # ── Stoploss check (option mark vs stored stoploss_price) ────────────
         stoploss_price = trade.get('stoploss_price')

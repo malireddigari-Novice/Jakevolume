@@ -198,6 +198,26 @@ CS_THRESHOLD_RANK3 = float(os.getenv('CS_THRESHOLD_RANK3', '0.65'))  # S3/R3
 # Step 9: Spread filter — block if (ask-bid)/mid > 50%
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.50'))
 
+# ── Flow Leadership Reversal Engine (V1) ──────────────────────────────────────
+# After a position opens, watch the OPPOSITE side; if it produces a concentrated
+# volume event (burst out of a quiet background, contract near its low) while the
+# same side fades, exit the position + alert. V1 does NOT auto-open the opposite
+# trade — it closes the current (paper) position, alerts, and records the
+# hypothetical opposite entry for measurement (spec §14/§19).
+FLOW_REVERSAL_ENABLED   = os.getenv('FLOW_REVERSAL_ENABLED', 'true').lower() == 'true'
+FLOW_REVERSAL_AUTO_FLIP = os.getenv('FLOW_REVERSAL_AUTO_FLIP', 'false').lower() == 'true'
+REVERSAL_BURST_RATIO    = float(os.getenv('REVERSAL_BURST_RATIO', '3.0'))   # EventAvg / PreEventVol
+REVERSAL_EVENT_SHARE    = float(os.getenv('REVERSAL_EVENT_SHARE', '0.40'))  # 5-bar / 20-bar volume
+REVERSAL_ACTIVE_BARS    = int(os.getenv('REVERSAL_ACTIVE_BARS', '2'))       # bars >= 2x PreEventVol
+REVERSAL_NEAR_LOW_MAX   = float(os.getenv('REVERSAL_NEAR_LOW_MAX', '1.75')) # contract-low qualifier
+REVERSAL_WINDOW_MIN     = int(os.getenv('REVERSAL_WINDOW_MIN', '15'))       # flow-transition window
+REVERSAL_FADE_WINDOW_MIN= int(os.getenv('REVERSAL_FADE_WINDOW_MIN', '10'))  # same-side fade lookback
+REVERSAL_FADE_RATIO     = float(os.getenv('REVERSAL_FADE_RATIO', '0.50'))   # vol <= 0.5x peak = fading
+REVERSAL_DOMINANT_BURST = float(os.getenv('REVERSAL_DOMINANT_BURST', '5.0'))
+REVERSAL_DOMINANT_SHARE = float(os.getenv('REVERSAL_DOMINANT_SHARE', '0.60'))
+REVERSAL_LEADERSHIP_MIN = float(os.getenv('REVERSAL_LEADERSHIP_MIN', '0.75'))  # opp leadership floor
+REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) # opp - same
+
 # Step 10: Target room thresholds (nearest opposing level distance from spot)
 TARGET_ROOM_HIGH = float(os.getenv('TARGET_ROOM_HIGH', '0.0075'))  # score 1.00 (≥0.75%)
 TARGET_ROOM_MID  = float(os.getenv('TARGET_ROOM_MID',  '0.0050'))  # score 0.70 (≥0.50%)
