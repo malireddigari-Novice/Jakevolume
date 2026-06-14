@@ -431,6 +431,58 @@ def save_flow_reversal(r: dict) -> Optional[int]:
         _put(conn)
 
 
+def save_research_finding(f: dict) -> Optional[int]:
+    """Insert a Claude research finding/hypothesis into the journal (§30/§49)."""
+    from psycopg2.extras import Json
+    row = dict(f)
+    for k in ('supporting_metrics_json', 'proposed_change_json', 'backtest_request_json'):
+        if isinstance(row.get(k), (dict, list)):
+            row[k] = Json(row[k])
+    for k in ('session_date', 'category', 'observation', 'evidence_ids',
+              'supporting_metrics_json', 'proposed_change_json', 'expected_benefit',
+              'possible_cost', 'backtest_request_json', 'confidence'):
+        row.setdefault(k, None)
+    row.setdefault('status', 'PROPOSED')
+    sql = """
+        INSERT INTO research_findings
+            (session_date, category, observation, evidence_ids, supporting_metrics_json,
+             proposed_change_json, expected_benefit, possible_cost, backtest_request_json,
+             confidence, status)
+        VALUES (%(session_date)s, %(category)s, %(observation)s, %(evidence_ids)s,
+                %(supporting_metrics_json)s, %(proposed_change_json)s, %(expected_benefit)s,
+                %(possible_cost)s, %(backtest_request_json)s, %(confidence)s, %(status)s)
+        RETURNING finding_id
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, row)
+            fid = cur.fetchone()[0]
+        conn.commit()
+        return fid
+    finally:
+        _put(conn)
+
+
+def get_research_findings(status: Optional[str] = None, limit: int = 50) -> list:
+    """Read journal findings (most recent first), optionally filtered by status."""
+    sql = ("SELECT finding_id, session_date, category, observation, confidence, status, created_at "
+           "FROM research_findings")
+    params: list = []
+    if status:
+        sql += " WHERE status = %s"
+        params.append(status)
+    sql += " ORDER BY created_at DESC LIMIT %s"
+    params.append(limit)
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    finally:
+        _put(conn)
+
+
 def get_today_pc_ratio(symbol: str, snap_date: date) -> Optional[float]:
     """Return today's P/C ratio for a symbol, or None if not yet computed."""
     sql = """

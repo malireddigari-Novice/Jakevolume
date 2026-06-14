@@ -287,3 +287,51 @@ CREATE TABLE IF NOT EXISTS flow_reversals (
 );
 CREATE INDEX IF NOT EXISTS idx_flow_reversals_sym_date
     ON flow_reversals (symbol, detected_at);
+
+-- ── Objective outcome labels per signal (§20-§24) ──────────────────────────────
+-- Python-computed, label-free outcomes for every fired signal: forward returns,
+-- excursions, level-reach flags, and the EntrySuccess / FalsePositive labels. The
+-- raw returns are stored regardless of the label so labels can be redefined later.
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    signal_id            BIGINT       PRIMARY KEY REFERENCES signals(id),
+    session_date         DATE         NOT NULL,
+    symbol               VARCHAR(10),
+    entry_price          NUMERIC(12,4),
+    return_5m            NUMERIC(8,2),
+    return_15m           NUMERIC(8,2),
+    return_30m           NUMERIC(8,2),
+    return_60m           NUMERIC(8,2),
+    return_eod           NUMERIC(8,2),
+    mfe_pct              NUMERIC(8,2),
+    mae_pct              NUMERIC(8,2),
+    reached_50pct        BOOLEAN,
+    reached_100pct       BOOLEAN,
+    reached_200pct       BOOLEAN,
+    entry_success        BOOLEAN,     -- +50% before -35% within 30m
+    strong_entry_success BOOLEAN,     -- +100% before -35% within 60m
+    false_positive       BOOLEAN,     -- fails +25% AND hits -35% within 30m
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_signal_outcomes_date ON signal_outcomes (session_date);
+
+-- ── Claude research journal (§30/§49) ──────────────────────────────────────────
+-- Home for Claude's structured findings/hypotheses. Claude proposes; humans approve;
+-- backtests validate. No write access to production from here — this is the journal.
+CREATE TABLE IF NOT EXISTS research_findings (
+    finding_id              BIGSERIAL    PRIMARY KEY,
+    session_date            DATE,
+    category                VARCHAR(40),
+    observation             TEXT,
+    evidence_ids            TEXT,
+    supporting_metrics_json JSONB,
+    proposed_change_json    JSONB,
+    expected_benefit        TEXT,
+    possible_cost           TEXT,
+    backtest_request_json   JSONB,
+    confidence              NUMERIC(4,2),
+    status                  VARCHAR(16)  NOT NULL DEFAULT 'PROPOSED',
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    reviewed_at             TIMESTAMPTZ,
+    reviewed_by             VARCHAR(40)
+);
+CREATE INDEX IF NOT EXISTS idx_research_findings_status ON research_findings (status);

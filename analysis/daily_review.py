@@ -13,7 +13,7 @@ Price path source: option_level_bars (DB) first; if absent and a data_src is giv
 levels come from price_bars / oi_levels; expiry from option_chain_snapshots.
 """
 import logging
-from datetime import date as _date
+from datetime import date as _date, timedelta
 
 import psycopg2
 import config
@@ -97,6 +97,48 @@ def _suggest(entry, opath):
     return action, pnl, text
 
 
+def _outcome_labels(signal_time, opath: list) -> dict:
+    """
+    Objective outcome labels (spec §20-§24) from the traded contract's path after entry.
+    opath: [(bar_time, high, low, close), ...] starting at the entry bar. Python computes
+    these — not the label, the raw outcomes — so labels can be redefined later.
+    """
+    entry = float(opath[0][3])
+    fwd = opath[1:]
+
+    def ret_at(mins):
+        cutoff = signal_time + timedelta(minutes=mins)
+        after = [b for b in fwd if b[0] >= cutoff]
+        c = float(after[0][3]) if after else float(opath[-1][3])
+        return round((c / entry - 1) * 100, 2)
+
+    def first_touch(up, dn, mins):
+        """Which threshold is hit first within `mins`: 'up', 'down', or None (stop wins ties)."""
+        cutoff = signal_time + timedelta(minutes=mins)
+        for (t, h, l, c) in fwd:
+            if t > cutoff:
+                break
+            if float(l) <= entry * (1 - dn):
+                return 'down'
+            if float(h) >= entry * (1 + up):
+                return 'up'
+        return None
+
+    highs = [float(b[1]) for b in fwd]; lows = [float(b[2]) for b in fwd]
+    mfe = (max(highs) / entry - 1) * 100 if highs else 0.0
+    mae = (min(lows) / entry - 1) * 100 if lows else 0.0
+    return dict(
+        entry_price=round(entry, 4),
+        return_5m=ret_at(5), return_15m=ret_at(15), return_30m=ret_at(30),
+        return_60m=ret_at(60), return_eod=round((float(opath[-1][3]) / entry - 1) * 100, 2),
+        mfe_pct=round(mfe, 2), mae_pct=round(mae, 2),
+        reached_50pct=mfe >= 50, reached_100pct=mfe >= 100, reached_200pct=mfe >= 200,
+        entry_success=(first_touch(0.50, 0.35, 30) == 'up'),
+        strong_entry_success=(first_touch(1.00, 0.35, 60) == 'up'),
+        false_positive=(first_touch(0.25, 0.35, 30) == 'down'),
+    )
+
+
 # ── main entry point ───────────────────────────────────────────────────────────
 
 def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> int:
@@ -118,6 +160,7 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
         expiry_map = {s: e for s, e in cur.fetchall()}
 
         rows = []
+        outcome_rows = []
         for sid, sym, st, styp, tstrike, otype, espot, lprice in sigs:
             tstrike = float(tstrike) if tstrike is not None else None
             if tstrike is None or otype is None:
@@ -174,6 +217,14 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
             e1, e2 = compute_exit_targets(styp, float(espot), levels) if levels else (None, None)
             rule_pnl = _current_rule(styp, entry, opath, ubymin, e1, e2)
 
+            # Objective outcome labels (§20-§24)
+            lab = _outcome_labels(st, opath)
+            outcome_rows.append((sid, analysis_date, sym, lab['entry_price'],
+                                 lab['return_5m'], lab['return_15m'], lab['return_30m'],
+                                 lab['return_60m'], lab['return_eod'], lab['mfe_pct'], lab['mae_pct'],
+                                 lab['reached_50pct'], lab['reached_100pct'], lab['reached_200pct'],
+                                 lab['entry_success'], lab['strong_entry_success'], lab['false_positive']))
+
             action, sug_pnl, text = _suggest(entry, opath)
             rows.append(dict(signal_id=sid, analysis_date=analysis_date, symbol=sym,
                              signal_time=st, signal_type=styp, traded_strike=tstrike,
@@ -203,8 +254,28 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
                 data_source=EXCLUDED.data_source, created_at=NOW()
         """
         cur.executemany(sql, [tuple(r[c] for c in _COLS) for r in rows])
+
+        # Objective outcome labels (§20-§24) -> signal_outcomes
+        if outcome_rows:
+            cur.executemany("""
+                INSERT INTO signal_outcomes
+                    (signal_id, session_date, symbol, entry_price, return_5m, return_15m,
+                     return_30m, return_60m, return_eod, mfe_pct, mae_pct, reached_50pct,
+                     reached_100pct, reached_200pct, entry_success, strong_entry_success,
+                     false_positive)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    return_5m=EXCLUDED.return_5m, return_15m=EXCLUDED.return_15m,
+                    return_30m=EXCLUDED.return_30m, return_60m=EXCLUDED.return_60m,
+                    return_eod=EXCLUDED.return_eod, mfe_pct=EXCLUDED.mfe_pct, mae_pct=EXCLUDED.mae_pct,
+                    reached_50pct=EXCLUDED.reached_50pct, reached_100pct=EXCLUDED.reached_100pct,
+                    reached_200pct=EXCLUDED.reached_200pct, entry_success=EXCLUDED.entry_success,
+                    strong_entry_success=EXCLUDED.strong_entry_success,
+                    false_positive=EXCLUDED.false_positive, created_at=NOW()
+            """, outcome_rows)
         conn.commit()
-        logger.info("Daily review %s: analyzed %d signals -> signal_analysis", analysis_date, len(rows))
+        logger.info("Daily review %s: analyzed %d signals -> signal_analysis (+%d outcome labels)",
+                    analysis_date, len(rows), len(outcome_rows))
 
         # ── Deliver the recommendations (Discord + Google Sheets) ───────────────
         try:
