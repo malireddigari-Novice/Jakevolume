@@ -584,11 +584,96 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         sheets.log_trade_entry(order, sig, qty, spend)
 
 
+_reversal_counts: dict = {}   # (symbol, date) -> flips today (anti-churn cap)
+
+
+def _reversal_under_cap(symbol, now) -> bool:
+    key = (symbol, now.date())
+    return _reversal_counts.get(key, 0) < config.REVERSAL_MAX_PER_DAY
+
+
+def _flip_entry(symbol, rev, spot, expiry, alpaca, sheets, now, option_quotes):
+    """
+    Open the opposite-side paper trade with its own R2/R3 (calls) or S2/S3 (puts)
+    targets — the recursive 'story change' flip. Builds a synthetic reversal signal,
+    persists it, routes it through _execute_trade (same targets/qty/order/exit path),
+    and emits the entry alert. Returns True if an order was placed.
+    """
+    opp_type   = rev['opp_type']                          # 'CALL' | 'PUT'
+    new_type   = 'BULLISH' if opp_type == 'CALL' else 'BEARISH'
+    best       = rev.get('opp_best')
+    if not best or best.get('strike') is None:
+        return False
+    strike = float(best['strike'])
+    q      = option_quotes.get((strike, opp_type)) or {}
+    price  = q.get('ask') or q.get('mark')
+    if not price:
+        return False
+    expiry = expiry or today_cst()
+
+    levels = db.get_today_levels(symbol, today_cst())
+    e1, e2 = compute_exit_targets(new_type, spot, levels)
+    if e1 is None:
+        logger.info("Reversal flip %s %s: no exit targets — skipping flip entry", symbol, opp_type)
+        return False
+
+    # Nearest originating level for the alert's "Level" line.
+    if new_type == 'BULLISH':
+        cand = sorted([l for l in levels if l['level_type'] == 'SUPPORT' and float(l['strike']) <= spot],
+                      key=lambda l: spot - float(l['strike']))
+        lvl_type = 'SUPPORT'
+    else:
+        cand = sorted([l for l in levels if l['level_type'] == 'RESISTANCE' and float(l['strike']) >= spot],
+                      key=lambda l: float(l['strike']) - spot)
+        lvl_type = 'RESISTANCE'
+    lvl   = cand[0] if cand else None
+    label = (('S' if new_type == 'BULLISH' else 'R') + str(lvl['rank'])) if lvl else ''
+    evb   = best.get('ev') or {}
+
+    sig = {
+        'symbol': symbol, 'signal_time': now, 'signal_type': new_type,
+        'bias': 'Call-side bias' if new_type == 'BULLISH' else 'Put-side bias',
+        'level_type': lvl_type, 'level_price': float(lvl['strike']) if lvl else strike,
+        'level_label': label, 'trigger_price': round(float(spot), 4),
+        'option_type': opp_type, 'opt_mark': q.get('mark'), 'opt_bid': q.get('bid'),
+        'opt_ask': q.get('ask'), 'price_to_enter': round(price, 2),
+        'price_to_exit': round(price * 2, 2), 'prox_score': 1.0,
+        'cluster_strength': None, 'strong_cluster': False,
+        'flow_shape': 'REVERSAL', 'signal_shape': 'REVERSAL', 'confidence': 'REVERSAL',
+        'upgrade': False, 'cluster_active_bars': None, 'cluster_burst_bars': None,
+        'day_mode': '0DTE', 'traded_strike': strike, 'target_level': None,
+        'atm_vol_1m': None, 'atm_spike_ratio': None, 'atm_vol_3m': None,
+        'itm_vol_1m': None, 'itm_spike_ratio': None, 'itm_vol_3m': None,
+        'spread_pct': None, 'low_dist': best.get('low_dist'), 'room_score': None,
+        'room_pct': None, 'pc_ratio': None, 'pc_conviction': None, 'option_hl_flag': None,
+        'opt_vol_delta': None, 'avg_volume_20': None, 'spike_volume': None,
+        'consecutive_spikes': None, 'expiry': expiry, 'exit1_price': e1, 'exit2_price': e2,
+        # Discord trigger display (sourced from the opposite-side event that flipped us)
+        'trigger_volume_type': 'FIVE_BAR_WINDOW', 'trigger_volume': evb.get('event_vol'),
+        'trigger_ratio': evb.get('burst'),
+    }
+    try:
+        sig_id = db.save_signal(sig)
+    except Exception:
+        logger.warning("Reversal flip: save_signal failed", exc_info=True)
+        sig_id = None
+    before = db.count_open_trades()
+    _execute_trade(sig, sig_id, alpaca, sheets)
+    placed = db.count_open_trades() > before
+    if placed:
+        _notify_signal(sig)                                # new entry alert (with targets)
+        _reversal_counts[(symbol, now.date())] = _reversal_counts.get((symbol, now.date()), 0) + 1
+        logger.info("Reversal FLIP entry: %s %s @ %.2f  targets %s/%s",
+                    symbol, opp_type, price, e1, e2)
+    return placed
+
+
 def _handle_reversal(trade, occ, symbol, spot, rev, alpaca, now, sheets, option_quotes) -> None:
     """
-    Confirmed flow-leadership reversal: exit the position, alert, and record the
-    HYPOTHETICAL opposite entry. V1 paper-tracks only — auto-flip stays off
-    (config.FLOW_REVERSAL_AUTO_FLIP) until tested.
+    Confirmed flow-leadership reversal (spec §8): exit the current position, then —
+    if FLOW_REVERSAL_AUTO_FLIP — OPEN the opposite paper trade with its own R2/R3 or
+    S2/S3 targets (recursive story change). Always records the reversal + the
+    opposite (hypothetical-or-real) entry in flow_reversals and alerts Discord.
     """
     pos_type  = trade['option_type']
     remaining = trade['exit2_qty'] if trade.get('exit1_filled') else trade['qty']
@@ -606,6 +691,17 @@ def _handle_reversal(trade, occ, symbol, spot, rev, alpaca, now, sheets, option_
     hypo_occ    = (occ_symbol(symbol, trade.get('expiry') or today_cst(), hypo_strike, rev['opp_type'])
                    if hypo_strike else None)
 
+    # Story change → open the opposite side with its own targets (else exit+alert only).
+    flipped = False
+    if config.FLOW_REVERSAL_AUTO_FLIP and _reversal_under_cap(symbol, now):
+        try:
+            flipped = _flip_entry(symbol, rev, spot, trade.get('expiry'), alpaca, sheets, now, option_quotes)
+        except Exception:
+            logger.warning("reversal flip-entry failed", exc_info=True)
+    elif config.FLOW_REVERSAL_AUTO_FLIP:
+        logger.info("Reversal %s: per-day flip cap reached (%d) — exit+alert only",
+                    symbol, config.REVERSAL_MAX_PER_DAY)
+
     revrow = dict(
         symbol=symbol, detected_at=now, trade_id=trade['id'],
         from_side=pos_type, to_side=rev['opp_type'], spot=round(float(spot), 4),
@@ -615,7 +711,7 @@ def _handle_reversal(trade, occ, symbol, spot, rev, alpaca, now, sheets, option_
         opp_burst=(best['ev']['burst'] if best else None),
         opp_share=(best['ev']['share'] if best else None),
         hypo_occ=hypo_occ, hypo_strike=hypo_strike, hypo_entry_price=hypo_price,
-        flipped=False,
+        flipped=bool(flipped),
     )
     try:
         db.save_flow_reversal(revrow)
@@ -625,8 +721,9 @@ def _handle_reversal(trade, occ, symbol, spot, rev, alpaca, now, sheets, option_
         send_reversal_alert(revrow)
     except Exception:
         logger.warning("reversal alert failed", exc_info=True)
-    logger.info("FLOW REVERSAL %s %s->%s: exited %s @ %s, hypothetical %s @ %s",
-                symbol, pos_type, rev['opp_type'], occ, exit_price, hypo_occ, hypo_price)
+    logger.info("FLOW REVERSAL %s %s->%s: exited %s @ %s, %s %s @ %s",
+                symbol, pos_type, rev['opp_type'], occ, exit_price,
+                'FLIPPED to' if flipped else 'hypothetical', hypo_occ, hypo_price)
 
 
 def check_exits(

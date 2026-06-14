@@ -205,7 +205,11 @@ MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.50'))
 # trade — it closes the current (paper) position, alerts, and records the
 # hypothetical opposite entry for measurement (spec §14/§19).
 FLOW_REVERSAL_ENABLED   = os.getenv('FLOW_REVERSAL_ENABLED', 'true').lower() == 'true'
-FLOW_REVERSAL_AUTO_FLIP = os.getenv('FLOW_REVERSAL_AUTO_FLIP', 'false').lower() == 'true'
+# Auto-flip: on a confirmed reversal, OPEN the opposite paper trade with its own
+# R2/R3 (calls) or S2/S3 (puts) targets and keep monitoring (recursive). Default ON
+# per the targeted-entries spec; set false to revert to exit+alert only (no flip).
+FLOW_REVERSAL_AUTO_FLIP = os.getenv('FLOW_REVERSAL_AUTO_FLIP', 'true').lower() == 'true'
+REVERSAL_MAX_PER_DAY    = int(os.getenv('REVERSAL_MAX_PER_DAY', '3'))  # per-symbol flip cap (anti-churn)
 REVERSAL_BURST_RATIO    = float(os.getenv('REVERSAL_BURST_RATIO', '3.0'))   # EventAvg / PreEventVol
 REVERSAL_EVENT_SHARE    = float(os.getenv('REVERSAL_EVENT_SHARE', '0.40'))  # 5-bar / 20-bar volume
 REVERSAL_ACTIVE_BARS    = int(os.getenv('REVERSAL_ACTIVE_BARS', '2'))       # bars >= 2x PreEventVol
