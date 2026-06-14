@@ -4,7 +4,36 @@ End-to-end logic of the <span style="color:#1a7f37">**Simplified V1**</span> Mag
 broken into small sequential steps. Times are CST.
 
 > **Legend:** <span style="color:#1a7f37">green = added / changed in V1</span> ·
-> <span style="color:#d1242f">~~red strikethrough = removed in V1~~</span> · black = unchanged.
+> <span style="color:#d1242f">~~red strikethrough = removed in V1~~</span> · black = unchanged ·
+> 🔵 **[Jun-2026]** = post-V1 change (see summary).
+
+---
+
+## 0. Post-V1 updates (June 2026) — current live state
+
+🔵 The system since V1 has these material changes (details in the sections noted):
+
+1. **Intraday data source → Alpaca SIP/OPRA** (§C15, §C19). The live bot uses the
+   **Alpaca** market-data client (full SIP stock feed + OPRA options, real per-minute
+   option volume, and option price-history). **Schwab is kept only for the morning OI
+   snapshot** because Alpaca exposes no live open interest. Databento remains a fallback.
+2. **Volume gate rewritten → the 3-rule ENTRY VOLUME GATE FIX** (§D4). `ValidVolumeSignal
+   = SingleBarValid OR ClusterValid OR StairStepValid` with explicit thresholds
+   (median-robust baseline, visual/cluster dominance, lowered absolute floors), and
+   **granular blocked reasons**. (A `VolumeStickoutScore` 0–1 variant was built and
+   backtested but **not** wired as the gate — it tested anti-predictive; it remains for
+   research only. A VWAP trend-gate and a premium take-profit were also tried and
+   **reverted**.)
+3. **Spot-anchored morning analysis** (§B6, §B9). The 08:20 anchor is the Alpaca SIP
+   **bid/ask mid** (freshest pre-market spot) → Schwab → prev_close; and the sentiment
+   P/C band now centers on **spot**, not prev close.
+4. **Flow Leadership Reversal Engine + auto-flip** (§L). While a position is open, the
+   opposite side is monitored; a confirmed leadership change exits the position and
+   **opens the opposite paper trade with its own R2/R3 or S2/S3 targets** (recursive).
+5. **Post-close daily review + objective outcome labels + research journal** (§M). At
+   15:00 every signal is labeled (return grid, MFE/MAE, EntrySuccess/FalsePositive) and
+   a suggested management is recorded; delivered to Discord + Google Sheets.
+6. **Discord card shows the trigger volume** (single-bar vs 5-bar window) (§J).
 
 ---
 
@@ -113,15 +142,16 @@ For **each symbol**:
 
 ---
 
-## G. <span style="color:#1a7f37">Exit targets — skip-the-nearest shift</span>
+## G. 🔵 **[Jun-2026] Exit targets — full ladder, skip-only-if-too-close**
 
-58. <span style="color:#1a7f37">**[CHANGED] The nearest opposing level is usually too close**, so skip it:</span>
-    - <span style="color:#1a7f37">**CALL at support** → Exit1 = 2nd resistance (**R2**), Exit2 = 3rd (**R3**); skip R1.</span>
-    - <span style="color:#1a7f37">**PUT at resistance** → Exit1 = 2nd support (**S2**), Exit2 = 3rd (**S3**); skip S1.</span>
-    - <span style="color:#d1242f">~~(Old: Exit1 = nearest opposing level (R1/S1), Exit2 = next.)~~</span>
-59. <span style="color:#1a7f37">**Fallbacks:** only 2 opposing levels → Exit2 = null; only 1 → use the nearest (R1/S1).</span>
-60. <span style="color:#1a7f37">**Min-room safety** — drop any shifted target within `EXIT_MIN_ROOM_PCT` (0.25%) of the entry spot and advance to the next farther level.</span>
-61. <span style="color:#1a7f37">These exits are shown on the Discord card (`Exit 1/2 @ … / Exit rest @ …`) and used by the exit state machine.</span>
+58. 🔵 **[CHANGED] The exit ladder is ALL levels the trade moves into — not only the opposing side — and a level is skipped *only when it is too close to the entry*** (we no longer always skip the nearest). A CALL climbs up through every level above the entry; a PUT falls through every level below it:
+    - **Call entered ~S3:** ladder = S2, S1, R1, R2, R3. If S2 has room → Exit1=S2, Exit2=S1. If S2 is too close → Exit1=S1, Exit2=R1.
+    - **Call ~S2** (S1 too close) → Exit1=R1, Exit2=R2. **Call ~S1** (R1 too close) → Exit1=R2, Exit2=R3.
+    - **Mirror for PUTs** entered at R3/R2/R1 (ladder falls R2,R1,S1,S2,S3 …).
+    - <span style="color:#d1242f">~~(V1: always skip the nearest opposing level, use 2nd/3rd opposing only — ignored same-side levels above the entry.)~~</span>
+59. **Too close** = within `EXIT_MIN_ROOM_PCT` (0.25%) of the entry spot. Exit1/Exit2 = the first two ladder levels that clear it. Goal: don't sell the first half too soon, and capture the meat of the move.
+60. **Fallbacks:** if every level is too close, keep the raw nearest two; only one level on the move side → Exit2 = null.
+61. These exits are shown on the Discord card and drive the exit state machine. **Trade-quality is logged** in `signal_outcomes`: `entry_vs_lod` (entry ÷ the contract's low *up to entry* — 1.0 = bought the low, >1 = chased) and `pct_peak_captured` (current-rule P&L as a % of the peak/MFE — "are we capturing ~80% of the move?").
 
 ---
 

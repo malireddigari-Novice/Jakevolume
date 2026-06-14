@@ -205,34 +205,42 @@ def compute_exit_targets(
     position_only: bool = False,
 ) -> tuple[Optional[float], Optional[float]]:
     """
-    Exit-target-shift rule. The nearest opposing level is usually too close to
-    give the trade room, so skip it and use the 2nd/3rd opposing levels:
+    Exit-target ladder — take the NEXT levels the trade moves into, skipping a level
+    only when it is too close to the entry (not always skipping the nearest).
 
-      CALL at support    (BULLISH) → Exit1 = 2nd resistance, Exit2 = 3rd
-      PUT  at resistance (BEARISH) → Exit1 = 2nd support,    Exit2 = 3rd
+    The ladder is ALL level strikes on the move side, not only the opposing side: a
+    CALL climbs up through every level above the entry, a PUT falls through every level
+    below it. So a call entered at S3 targets S2, then S1, then R1, R2, R3 in order;
+    a put entered at R3 targets R2, R1, S1, S2, S3.
 
-    Fallbacks: when only one opposing level exists, use it (R1/S1). When only two
-    exist, Exit2 is None. After the shift, any candidate still within
-    EXIT_MIN_ROOM_PCT of spot is dropped (skip to the next farther level).
+    Exit1 / Exit2 = the first two ladder levels that clear EXIT_MIN_ROOM_PCT of room from
+    the entry. A level within that distance is skipped (it would sell the first half too
+    soon); a level with room is KEPT (we no longer blindly skip the nearest). Examples:
+
+      Call entered ~S3:  S2 too close → Exit1 = S1, Exit2 = R1.
+      Call entered ~S2:  S1 too close → Exit1 = R1, Exit2 = R2.
+      Call entered ~S1:  R1 too close → Exit1 = R2, Exit2 = R3.
+      (mirror for puts entered at R3 / R2 / R1)
+      If the next level has room, it is used as-is (no skip).
+
+    Fallbacks: if every level is too close, keep the raw nearest two; only one level on
+    the move side → Exit2 is None. `position_only` is retained for call-site compatibility
+    (the ladder always spans all levels regardless).
 
     Returns (exit1, exit2) as underlying price levels, either may be None.
     """
-    above, below = _opposing_strikes(levels, spot, position_only)
     if signal_type == 'BULLISH':
-        opp  = sorted(above)                       # nearest resistance first
-        room = lambda lv: (lv - spot) / spot if spot > 0 else 0.0
+        ladder = sorted(float(l['strike']) for l in levels if float(l['strike']) > spot)
+        room   = lambda lv: (lv - spot) / spot if spot > 0 else 0.0
     else:
-        opp  = sorted(below, reverse=True)         # nearest support first
-        room = lambda lv: (spot - lv) / spot if spot > 0 else 0.0
+        ladder = sorted((float(l['strike']) for l in levels if float(l['strike']) < spot),
+                        reverse=True)
+        room   = lambda lv: (spot - lv) / spot if spot > 0 else 0.0
 
-    if not opp:
+    if not ladder:
         return None, None
-    if len(opp) == 1:
-        return opp[0], None                        # only the nearest → fallback to R1/S1
-
-    candidates = opp[1:]                            # skip the nearest (R1/S1)
-    spaced = [lv for lv in candidates if room(lv) >= config.EXIT_MIN_ROOM_PCT]
-    chosen = spaced if spaced else candidates       # keep the shifted set if all too close
+    spaced = [lv for lv in ladder if room(lv) >= config.EXIT_MIN_ROOM_PCT]
+    chosen = spaced if spaced else ladder            # all too close → keep the raw nearest
     return chosen[0], (chosen[1] if len(chosen) > 1 else None)
 
 

@@ -310,9 +310,15 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     entry_success        BOOLEAN,     -- +50% before -35% within 30m
     strong_entry_success BOOLEAN,     -- +100% before -35% within 60m
     false_positive       BOOLEAN,     -- fails +25% AND hits -35% within 30m
+    contract_lod         NUMERIC(12,4),  -- traded contract's intraday low-of-day
+    entry_vs_lod         NUMERIC(8,3),   -- entry / LOD (1.0 = bought the exact low; >1 = chased)
+    pct_peak_captured    NUMERIC(8,1),   -- current-rule P&L as a % of the peak move (MFE)
     created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_date ON signal_outcomes (session_date);
+ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS contract_lod      NUMERIC(12,4);
+ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS entry_vs_lod      NUMERIC(8,3);
+ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS pct_peak_captured NUMERIC(8,1);
 
 -- ── Claude research journal (§30/§49) ──────────────────────────────────────────
 -- Home for Claude's structured findings/hypotheses. Claude proposes; humans approve;

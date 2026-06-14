@@ -217,13 +217,21 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
             e1, e2 = compute_exit_targets(styp, float(espot), levels) if levels else (None, None)
             rule_pnl = _current_rule(styp, entry, opath, ubymin, e1, e2)
 
-            # Objective outcome labels (§20-§24)
+            # Objective outcome labels (§20-§24) + trade-quality metrics
             lab = _outcome_labels(st, opath)
+            # Low UP TO entry (not the whole day — 0DTE decays to ~0, which would be
+            # meaningless): how chased the entry was vs the best price available then.
+            contract_lod = min((float(b[2]) for b in ob[:ei + 1]), default=entry)
+            entry_vs_lod = round(entry / max(contract_lod, 0.01), 3)        # 1.0 = bought the low
+            # % of the peak move the current rule captured — only meaningful when a real
+            # peak existed (>=25%); negative = we lost while a move was there.
+            pct_peak = round(rule_pnl / mfe * 100, 1) if mfe >= 25 else None
             outcome_rows.append((sid, analysis_date, sym, lab['entry_price'],
                                  lab['return_5m'], lab['return_15m'], lab['return_30m'],
                                  lab['return_60m'], lab['return_eod'], lab['mfe_pct'], lab['mae_pct'],
                                  lab['reached_50pct'], lab['reached_100pct'], lab['reached_200pct'],
-                                 lab['entry_success'], lab['strong_entry_success'], lab['false_positive']))
+                                 lab['entry_success'], lab['strong_entry_success'], lab['false_positive'],
+                                 round(contract_lod, 4), entry_vs_lod, pct_peak))
 
             action, sug_pnl, text = _suggest(entry, opath)
             rows.append(dict(signal_id=sid, analysis_date=analysis_date, symbol=sym,
@@ -262,8 +270,8 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
                     (signal_id, session_date, symbol, entry_price, return_5m, return_15m,
                      return_30m, return_60m, return_eod, mfe_pct, mae_pct, reached_50pct,
                      reached_100pct, reached_200pct, entry_success, strong_entry_success,
-                     false_positive)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     false_positive, contract_lod, entry_vs_lod, pct_peak_captured)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (signal_id) DO UPDATE SET
                     return_5m=EXCLUDED.return_5m, return_15m=EXCLUDED.return_15m,
                     return_30m=EXCLUDED.return_30m, return_60m=EXCLUDED.return_60m,
@@ -271,7 +279,9 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
                     reached_50pct=EXCLUDED.reached_50pct, reached_100pct=EXCLUDED.reached_100pct,
                     reached_200pct=EXCLUDED.reached_200pct, entry_success=EXCLUDED.entry_success,
                     strong_entry_success=EXCLUDED.strong_entry_success,
-                    false_positive=EXCLUDED.false_positive, created_at=NOW()
+                    false_positive=EXCLUDED.false_positive, contract_lod=EXCLUDED.contract_lod,
+                    entry_vs_lod=EXCLUDED.entry_vs_lod, pct_peak_captured=EXCLUDED.pct_peak_captured,
+                    created_at=NOW()
             """, outcome_rows)
         conn.commit()
         logger.info("Daily review %s: analyzed %d signals -> signal_analysis (+%d outcome labels)",
