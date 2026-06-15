@@ -267,6 +267,9 @@ class SignalDetector:
         # §14 prior major volume events per contract key → [(volume, price), …].
         self._major_events: dict[str, list[tuple[int, float]]] = defaultdict(list)
         self._history_date: Optional[date] = None
+        # §73 per-poll candidate-evaluation log (every level, blocked or passed) — the
+        # caller persists `last_candidates` to signal_candidates after each check().
+        self.last_candidates: list[dict] = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -291,6 +294,7 @@ class SignalDetector:
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
         """
+        self.last_candidates = []          # §73 — reset per poll
         if not bars:
             return []
 
@@ -494,6 +498,8 @@ class SignalDetector:
                 trade_data=trade_data, traded_strike=traded_strike, target_level=target_level,
             )
             candidates.append(signal)
+            self._record_candidate(symbol, label, strike, close_price, confirm_type,
+                                   reason='PASSED', dist=dist, atm=atm, low=atm_low)
 
         if not candidates:
             return []
@@ -514,6 +520,11 @@ class SignalDetector:
                 continue
             self._fired_today[(symbol, st)] = True
             fired.append(sig)
+        # §73 — mark the candidate evals that actually produced an alert.
+        fired_labels = {s['level_label'] for s in fired}
+        for ev in self.last_candidates:
+            if ev['alert_fired'] is False and ev['level_label'] in fired_labels and ev['blocked_reason'] == 'PASSED':
+                ev['alert_fired'] = True
         return fired
 
     # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
@@ -738,7 +749,7 @@ class SignalDetector:
     def _log_eval(self, symbol, label, strike, spot, confirm_type, *,
                   reason: str, dist: float, atm: dict = None,
                   low: Optional[float] = None, hv: Optional[float] = None) -> None:
-        """§21 per-level evaluation log with the blocked reason."""
+        """§21 per-level evaluation log with the blocked reason (+ §73 candidate record)."""
         a = atm or {}
         logger.info(
             "MONITOR  %s %s@%.2f  spot=%.2f  dist=%.3f%%  %s  "
@@ -750,6 +761,31 @@ class SignalDetector:
             f"{hv:.2f}" if hv is not None else "n/a",
             reason,
         )
+        self._record_candidate(symbol, label, strike, spot, confirm_type,
+                               reason=reason, dist=dist, atm=atm, low=low, hv=hv)
+
+    def _record_candidate(self, symbol, label, strike, spot, confirm_type, *,
+                          reason, dist, atm=None, low=None, hv=None) -> None:
+        """§73 — append one candidate-evaluation record (blocked OR passed) for the caller
+        to persist to signal_candidates. Booleans are derived from the blocked reason."""
+        a = atm or {}
+        base = reason.split(':', 1)[0]                       # strip the granular suffix
+        near = base != 'NOT_NEAR_LEVEL'
+        self.last_candidates.append({
+            'symbol': symbol, 'candidate_side': confirm_type, 'level_label': label,
+            'strike': float(strike), 'spot': round(float(spot), 4),
+            'dist_pct': round(dist * 100, 4), 'near_level': near,
+            'contract_low_distance': (round(low, 4) if low is not None else None),
+            'contract_near_low': (low is None or low <= config.NEAR_LOW_MAX_DIST),
+            'valid_volume_event': not base.startswith('NO_VALID_VOLUME') and near,
+            'already_alerted': base == 'ALREADY_ALERTED_TODAY',
+            'alert_fired': False,
+            'signal_type': 'BULLISH' if confirm_type == 'CALL' else 'BEARISH',
+            'blocked_reason': reason[:48],
+            'hv_pctile': hv,
+            'atm_vol_1m': a.get('delta'), 'win_vol': a.get('vol'),
+            'active_bars': a.get('active'),
+        })
 
     def _build_signal(
         self,
