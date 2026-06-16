@@ -104,6 +104,26 @@ class AlpacaClient:
             logger.warning("Alpaca: could not fetch position for %s: %s", occ, exc)
             return 0
 
+    def position_unrealized_pl(self, occ: str) -> Optional[float]:
+        """
+        Unrealized P&L (dollars) for an open option position, None if no position.
+
+        Used by EOD logic to decide profit-vs-loss: a position in profit is banked,
+        a strong loser with expiry life left may be held overnight. Returns None on
+        404 (no position) or any error so callers can fall back to closing.
+        """
+        try:
+            r = requests.get(
+                f"{self._base}/v2/positions/{occ}", headers=self._headers, timeout=10
+            )
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return float(r.json().get('unrealized_pl', 0))
+        except Exception as exc:
+            logger.warning("Alpaca: could not fetch P&L for %s: %s", occ, exc)
+            return None
+
     # ── Position sizing ───────────────────────────────────────────────────────
 
     def calculate_qty(self, limit_price: float) -> tuple[int, float]:

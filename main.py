@@ -576,7 +576,7 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
             'exit2_underlying':  exit2_underlying,
             'exit1_qty':         exit1_qty,
             'exit2_qty':         exit2_qty,
-            'stoploss_price':    round(price * 0.5, 4),
+            'stoploss_price':    None,   # no 50% premium stop at entry — it whipsawed us out of winners (0DTE premium noise). Stop arms to breakeven only after Exit 1.
             'strike':            strike,
             'option_type':       option_type,
             'expiry':            expiry,
@@ -901,13 +901,36 @@ def check_exits(
                         )
 
 
+def _eod_should_hold(trade: dict, alpaca: AlpacaClient) -> bool:
+    """
+    Decide whether a next-day-expiry ('Wednesday') position is carried overnight
+    instead of closed at EOD.
+
+    Rule: take profit, hold strong losers. A position in profit (or flat) is
+    banked even if it never hit its R/S target. A position at a LOSS is held for
+    another day ONLY if the originating signal was strong — confidence HIGH AND
+    strong_cluster. Weak losers are cut. ('No reversal' is implicit: a trade that
+    reversed is already closed, so anything still open here never reversed.)
+
+    Returns False (→ close) when P&L is unknown, so we never hold on bad data.
+    """
+    occ = trade['occ_symbol']
+    pl  = alpaca.position_unrealized_pl(occ)
+    if pl is None or pl >= 0:
+        return False                                    # profit/flat → bank it; unknown → close
+    meta = db.get_signal_strength(trade.get('signal_id'))
+    return meta.get('confidence') == 'HIGH' and meta.get('strong_cluster') is True
+
+
 def eod_liquidate(alpaca: AlpacaClient, now: datetime, sheets: SheetsLogger) -> None:
     """
     Close positions at 14:55 CST.
 
-    0DTE (expiry == today or None) is always closed. Next-day+ positions are also
-    closed when EOD_CLOSE_NEXT_DAY is set (default: keep EOD close, no overnight
-    hold); otherwise they're left open for the next session.
+    0DTE (expiry == today or None) is always closed — it expires today. Next-day+
+    ('Wednesday') expiry positions follow the take-profit / hold-strong-losers
+    rule (see _eod_should_hold): banked if in profit, held overnight if a strong
+    loser, cut if a weak loser. When EOD_CLOSE_NEXT_DAY is off, every next-day
+    position is held overnight regardless (legacy behavior).
     """
     today = today_cst()
     logger.info("EOD liquidation starting at %s", now.strftime('%H:%M CST'))
@@ -918,15 +941,26 @@ def eod_liquidate(alpaca: AlpacaClient, now: datetime, sheets: SheetsLogger) -> 
     for trade in open_trades:
         expiry = trade.get('expiry')
         # expiry stored as date; if None treat as 0DTE (legacy rows)
-        if expiry is not None and expiry > today and not config.EOD_CLOSE_NEXT_DAY:
-            logger.info(
-                "EOD: skipping %s — expiry %s is next-day+ (EOD_CLOSE_NEXT_DAY off)",
-                trade['occ_symbol'], expiry,
-            )
-            skipped += 1
-            continue
+        is_next_day = expiry is not None and expiry > today
+        if is_next_day:
+            if not config.EOD_CLOSE_NEXT_DAY:
+                logger.info(
+                    "EOD: skipping %s — expiry %s is next-day+ (EOD_CLOSE_NEXT_DAY off)",
+                    trade['occ_symbol'], expiry,
+                )
+                skipped += 1
+                continue
+            # Wednesday-expiry: bank profits, hold strong losers another day.
+            if _eod_should_hold(trade, alpaca):
+                logger.info(
+                    "EOD: HOLDING %s overnight — losing but strong (HIGH + strong_cluster); "
+                    "expiry %s still has life",
+                    trade['occ_symbol'], expiry,
+                )
+                skipped += 1
+                continue
 
-        # 0DTE — close the remaining qty
+        # Close the remaining qty: 0DTE, a next-day winner (bank it), or a weak loser (cut it).
         remaining_qty = 0
         if not trade['exit1_filled']:
             remaining_qty = trade['qty']

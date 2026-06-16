@@ -627,6 +627,30 @@ def get_active_clusters(symbol: str) -> list:
         _put(conn)
 
 
+def get_signal_strength(signal_id: int) -> dict:
+    """
+    Return {'confidence': str, 'strong_cluster': bool} for one signal.
+
+    Used by EOD logic to decide whether a losing, next-day-expiry position is
+    strong enough to hold overnight. Returns {} on missing row or any error so
+    the caller defaults to closing.
+    """
+    sql = "SELECT confidence, strong_cluster FROM signals WHERE id = %s"
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (signal_id,))
+            row = cur.fetchone()
+        if not row:
+            return {}
+        return {'confidence': row[0], 'strong_cluster': bool(row[1])}
+    except Exception as exc:
+        logger.warning("get_signal_strength(%s) failed: %s", signal_id, exc)
+        return {}
+    finally:
+        _put(conn)
+
+
 def get_open_trades(symbol: str = None) -> list:
     """
     Return all trades that still have unfilled exits (for exit monitoring).
