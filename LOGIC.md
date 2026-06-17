@@ -35,6 +35,22 @@ broken into small sequential steps. Times are CST.
    a suggested management is recorded; delivered to Discord + Google Sheets.
 6. **Discord card shows the trigger volume** (single-bar vs 5-bar window) (§J).
 
+### 🔵 June 16, 2026 — execution & learning fixes (in simple steps)
+
+A backtest of one day's signals showed the right direction was picked (puts ran +31% to +196% favorable) yet every trade still lost −50%. The loss was in the mechanics, not the signal. These changes fix the mechanics and keep the learning data honest:
+
+1. **Removed the 50% stop-loss** (§H). Before: every trade carried a stop at half the entry premium, set the moment it opened. Problem: 0DTE option premium is noisy (bid/ask, theta, vega), so the stop kept firing on noise *before* the trade worked — it whipsawed us out of winners. Now: **no stop at entry**; a breakeven stop arms **only after the first profit target (Exit 1) fills**.
+
+2. **Smart end-of-day for Wednesday (next-day) expiry** (§I). 0DTE positions still always close at 14:55. For positions that expire *later* (still have life): if it's **in profit → bank it**; if it's **losing but the signal was strong** (`confidence HIGH` + `strong_cluster`, no reversal) → **hold it overnight** to give it another day; if it's **losing and weak → cut it**. Winners no longer get dumped early; strong losers get a second chance; weak losers are cut.
+
+3. **Mobile-friendly morning briefing** (§B/§J). The old briefing was one wide text table that wrapped and scrambled the S1/S2/S3 · R1/R2/R3 labels on a phone. Now it's **one Discord embed per symbol**: bias-colored border, previous close / expiry / put-call, then **stacked Support and Resistance lists** with each rank label next to its price. Levels stay in **OI-rank order** (not re-sorted by price).
+
+4. **Aligned the nightly simulation to the new rule** (§M). The post-close review re-labels every signal with "what the live exit rule would have made" (`rule_pnl_pct`), which feeds the Monte-Carlo risk numbers. It was still simulating the deleted 50% stop, so it stamped −50% on trades that actually worked. Now the simulators (`daily_review`, the research backtests) model **no stop + breakeven-after-Exit-1 + ride to EOD** — so the learning labels match reality.
+
+5. **Previous-day historic-low fallback for the §13 gate** (§D5). The §13 "is this option historically expensive?" gate needs the contract's historical low/high. Schwab serves no option price-history, so the gate was silently doing nothing. Now, when no live history exists, the detector **fetches the contract's previous session's low/high from the database** (`option_level_bars`) and uses that — a 0DTE strike falls back to **yesterday's same-strike** contract.
+
+6. **Daily-review safety + a bug fix** (§M). (a) Fixed a latent bug that silently broke the `signal_volume_analytics` write on every review (`execute_values` had too many `%s` placeholders). (b) Added a **guard**: a re-run that can't rebuild a trade's price path (e.g. an expired 0DTE contract the broker no longer serves) **no longer overwrites already-computed metrics with NULLs** — prior results are kept.
+
 ---
 
 ## A. Scheduling & startup
@@ -61,7 +77,7 @@ For **each symbol** <span style="color:#d1242f">~~(9 symbols incl. SPY, QQQ)~~</
 10. **Top-OI snapshot** — 2 highest-OI call & put strikes near ATM (reference).
 11. **Persist to Postgres** — chain snapshot, the 6 OI levels, morning sentiment.
 12. **Log to Google Sheets** — daily levels, OI snapshot, sentiment, comparison row.
-13. **Print + send the briefing** — console table + Discord morning message.
+13. **Print + send the briefing** — console table + Discord morning message. 🔵 **[Jun-16 CHANGED] The Discord briefing is now mobile-friendly: one embed per symbol** (bias-colored border) with **stacked Support/Resistance fields** — each level labelled beside its value (`S1: $295.00`), kept in **OI-rank order** (never silently price-sorted). Replaces the old wide monospaced code-block table that wrapped and detached labels on mobile. Overnight OI buildup rides along as a compact trailing embed.
 14. **Retention prune** — keep the most recent **10 trading days** of 1-min data.
 
 ---
@@ -118,6 +134,7 @@ For **each symbol**:
 46. **Chased** — ATM `low_dist > 2.50` → block `CONTRACT_CHASED`.
 47. No valid volume → block `NO_VALID_VOLUME_SIGNAL`.
 48. <span style="color:#1a7f37">**[CHANGED] §13 Historical value percentile** — on the contract you'd buy: `pctile = (mark − HistLow)/(HistHigh − HistLow)` over the multi-day window (Schwab daily candles, cached/day). `pctile > 0.60` → block `HISTORICAL_VALUE_TOO_HIGH`. 0DTE has no history → gate skipped. <span style="color:#d1242f">~~(Old: `mark/hist_low ≤ 1.25`, and a failure only downgraded to WATCH.)~~</span></span>
+    - 🔵 **[Jun-16 NEW] Previous-session fallback** — when no live multi-day history exists (Schwab serves no option price-history, so the gate was a silent no-op), the detector falls back to the contract's **previous session's `(low, high)`** from `option_level_bars` (`db.get_option_prev_range`), so the gate can still evaluate. Matched by strike + type (not expiry), so a 0DTE contract uses **yesterday's same-strike** contract. Cached per contract/day.
 49. <span style="color:#1a7f37">**[NEW] §14 Short-cover risk** — store prior *major* volume events per contract. If the current major event has `VolumeSimilarity ∈ [0.70, 1.50]` vs a prior event **and** `CurrentPrice/PriorPrice ≤ 0.50` (similar size, much cheaper now → shorts covering), block `SHORT_COVER_RISK`.</span>
 50. **§19 Already alerted** this direction today → block `ALREADY_ALERTED_TODAY`.
 
@@ -159,8 +176,8 @@ For **each symbol**:
 
 62. Strike = `traded_strike`; entry = the contract's ask. **Skip** if no price/expiry, at `MAX_OPEN_POSITIONS` (atomic via `max(alpaca count, DB open count)`), or portfolio too small for 1 contract.
 63. <span style="color:#1a7f37">**[NEW] Entry-fill guard** — before managing exits, confirm Alpaca actually holds the contract (`position_qty(occ) > 0`); an unfilled limit entry never triggers phantom "uncovered" exit orders.</span>
-64. Quantity split half/half; **stop-loss = 50% of entry** (set at entry).
-65. **Stop-loss first** — mark ≤ stop → close remaining qty.
+64. Quantity split half/half. 🔵 **[Jun-16 CHANGED] No stop-loss at entry.** <span style="color:#d1242f">~~stop-loss = 50% of entry~~</span> — the 50% premium stop was removed because 0DTE premium noise (bid/ask + theta + vega) whipsawed it out of correct trades before the thesis played out. A breakeven stop is armed **only after Exit 1** fills.
+65. <span style="color:#d1242f">~~Stop-loss first — mark ≤ stop → close remaining qty.~~</span> 🔵 **[Jun-16]** Until Exit 1 fills there is no stop; the position rides to a target or to EOD.
 66. **Exit 1** — underlying reaches the **shifted** Exit1 (R2/S2): sell half, raise stop to breakeven; opposite-side cluster at target → close remainder early.
 67. **Exit 2** — underlying reaches the **shifted** Exit2 (R3/S3), or the early opposite-side trigger: sell the remainder.
 
@@ -168,7 +185,12 @@ For **each symbol**:
 
 ## I. EOD liquidation — 14:55 CST
 
-68. Close all 0DTE positions. With `EOD_CLOSE_NEXT_DAY=true`, next-day positions are also closed — no overnight hold.
+68. **0DTE positions** (expire today) are always closed.
+69. 🔵 **[Jun-16 NEW] Smart EOD for Wednesday (next-day) expiry positions** — these still have life left, so instead of always flattening:
+    - **In profit** → close and bank it (even if it never hit the R/S target).
+    - **At a loss + strong** (`confidence = HIGH` **AND** `strong_cluster`, and no reversal) → **hold overnight**, any loss size, to give it the remaining day.
+    - **At a loss + weak** → close (cut it).
+    - Profit/loss is read live from Alpaca (`position_unrealized_pl`); unknown P&L → close (never hold on bad data). With `EOD_CLOSE_NEXT_DAY=false` the legacy "hold all next-day" behavior still applies.
 
 ---
 
@@ -199,7 +221,7 @@ For **each symbol**:
 
 - **"1-minute volume" is an approximation** — a quote-delta sampled each poll, robust to strike rotation but cadence-sensitive.
 - **Stop-loss is a soft, poll-based mark check** (50% hardcoded), not a resting broker order.
-- <span style="color:#1a7f37">**§13 and §14 are data-dependent** (Schwab daily candles / intraday event history) — worth watching the `MONITOR … → <REASON>` logs early to confirm they gate rather than over-block.</span>
+- <span style="color:#1a7f37">**§13 and §14 are data-dependent** (Schwab daily candles / intraday event history) — worth watching the `MONITOR … → <REASON>` logs early to confirm they gate rather than over-block.</span> 🔵 **[Jun-16]** §13 no longer goes fully dark without live history — it falls back to the previous session's option low/high from the DB (see §D5.48).
 
 ---
 
