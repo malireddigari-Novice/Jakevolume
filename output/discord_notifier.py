@@ -322,6 +322,49 @@ def send_reversal_alert(rev: dict) -> None:
                 rev['symbol'], rev['from_side'], rev['to_side'])
 
 
+def send_research_finding(finding: dict, session_date, finding_id=None) -> None:
+    """
+    Post a Claude-generated research finding to Discord (§83).
+    `finding` is the parsed JSON dict from the nightly pipeline.
+    """
+    url = (config.DISCORD_RESEARCH_WEBHOOK_URL
+           or config.DISCORD_REVIEW_WEBHOOK_URL
+           or config.DISCORD_MORNING_WEBHOOK_URL
+           or config.DISCORD_WEBHOOK_URL)
+    if not url:
+        return
+
+    category   = finding.get('category', 'UNKNOWN')
+    obs        = finding.get('observation', '')
+    expected   = finding.get('expected_benefit', '')
+    cost       = finding.get('possible_cost', '')
+    conf       = finding.get('confidence')
+    conf_str   = f"{conf:.0%}" if conf is not None else "?"
+    fid_str    = f" #{finding_id}" if finding_id else ""
+    prefix     = "**[SAMPLE]** " if config.SAMPLE_MODE else ""
+
+    proposed   = finding.get('proposed_change_json') or {}
+    param      = proposed.get('parameter', '')
+    cur_val    = proposed.get('current_value', '')
+    new_val    = proposed.get('proposed_value', '')
+    change_str = f"`{param}`: {cur_val} → {new_val}" if param else "(see details)"
+
+    lines = [
+        f"{prefix}**JAKEVOLUME NIGHTLY RESEARCH — {session_date}{fid_str}**",
+        f"**Category:** {category}  |  **Confidence:** {conf_str}",
+        f"**Observation:** {obs}",
+        f"**Proposed change:** {change_str}",
+        f"**Expected benefit:** {expected}",
+        f"**Possible cost:** {cost}",
+    ]
+    ev_ids = finding.get('evidence_ids', '')
+    if ev_ids:
+        lines.append(f"**Evidence signal IDs:** {ev_ids}")
+
+    _post(url, {"content": "\n".join(lines)})
+    logger.info("Discord: research finding sent (category=%s conf=%s)", category, conf_str)
+
+
 def send_daily_review(rows: list, analysis_date) -> None:
     """
     Post the daily post-close signal review: one line per signal with the realized

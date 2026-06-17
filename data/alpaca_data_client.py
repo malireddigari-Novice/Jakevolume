@@ -184,17 +184,26 @@ class AlpacaDataClient:
             q  = s.get('latestQuote') or {}
             db = s.get('dailyBar') or {}
             tr = s.get('latestTrade') or {}
+            g  = s.get('greeks') or {}
             bid, ask = q.get('bp'), q.get('ap')
             mark = ((float(bid) + float(ask)) / 2) if (bid and ask) else (
                 float(tr['p']) if tr.get('p') else None)
+            # Alpaca returns impliedVolatility as a decimal (e.g. 0.324 = 32.4%)
+            raw_iv = s.get('impliedVolatility')
             parsed[(strike, ot)] = {
-                'bid': float(bid) if bid else None,
-                'ask': float(ask) if ask else None,
-                'mark': mark,
-                'volume': int(db.get('v', 0) or 0),          # cumulative day volume
+                'bid':          float(bid) if bid else None,
+                'ask':          float(ask) if ask else None,
+                'mark':         mark,
+                'volume':       int(db.get('v', 0) or 0),   # cumulative day volume
                 'open_interest': 0,                          # not available from Alpaca
-                'day_high': float(db['h']) if db.get('h') else None,
-                'day_low':  float(db['l']) if db.get('l') else None,
+                'day_high':     float(db['h']) if db.get('h') else None,
+                'day_low':      float(db['l']) if db.get('l') else None,
+                'delta':        g.get('delta'),
+                'gamma':        g.get('gamma'),
+                'theta':        g.get('theta'),
+                'vega':         g.get('vega'),
+                'rho':          g.get('rho'),
+                'implied_vol':  float(raw_iv) if raw_iv is not None else None,
             }
 
         result: dict = {}

@@ -84,13 +84,20 @@ def save_option_chain(
             c.get('ask'),
             c.get('mark'),
             underlying_price,
+            c.get('delta'),
+            c.get('gamma'),
+            c.get('vega'),
+            c.get('theta'),
+            c.get('rho'),
+            c.get('implied_vol'),
         )
         for c in contracts
     ]
     sql = """
         INSERT INTO option_chain_snapshots
             (symbol, snap_date, snap_time, expiry_date, strike, option_type,
-             open_interest, volume, bid, ask, mark, underlying_price)
+             open_interest, volume, bid, ask, mark, underlying_price,
+             delta, gamma, vega, theta, rho, implied_vol)
         VALUES %s
         ON CONFLICT DO NOTHING
     """
@@ -100,6 +107,58 @@ def save_option_chain(
             execute_values(cur, sql, rows)
         conn.commit()
         logger.debug("Saved %d option chain rows for %s", len(rows), symbol)
+    finally:
+        _put(conn)
+
+
+def reconcile_oi_changes(symbol: str, snap_date: date) -> int:
+    """
+    For each row in today's option_chain_snapshots, look up yesterday's OI for the
+    same (symbol, expiry_date, strike, option_type) and compute:
+        prev_open_interest = yesterday's OI
+        oi_change          = today_oi - yesterday_oi
+        oi_change_pct      = oi_change / max(yesterday_oi, 1)
+        volume_to_oi       = today_volume / max(yesterday_oi, 1)
+
+    Run once per morning after save_option_chain completes.  Rows with no prior-day
+    match (new strikes, first run) are left with NULL oi_change columns.
+    Returns the number of rows updated.
+    """
+    sql = """
+        UPDATE option_chain_snapshots AS t
+        SET
+            prev_open_interest = y.open_interest,
+            oi_change          = t.open_interest - y.open_interest,
+            oi_change_pct      = ROUND(
+                (t.open_interest - y.open_interest)::numeric
+                / GREATEST(y.open_interest, 1), 4
+            ),
+            volume_to_oi       = ROUND(
+                t.volume::numeric / GREATEST(y.open_interest, 1), 4
+            )
+        FROM (
+            SELECT DISTINCT ON (symbol, expiry_date, strike, option_type)
+                symbol, expiry_date, strike, option_type, open_interest
+            FROM option_chain_snapshots
+            WHERE symbol    = %s
+              AND snap_date = %s - INTERVAL '1 day'
+            ORDER BY symbol, expiry_date, strike, option_type, snap_time DESC
+        ) y
+        WHERE t.symbol      = %s
+          AND t.snap_date   = %s
+          AND y.symbol      = t.symbol
+          AND y.expiry_date = t.expiry_date
+          AND y.strike      = t.strike
+          AND y.option_type = t.option_type
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, snap_date, symbol, snap_date))
+            count = cur.rowcount
+        conn.commit()
+        logger.info("OI change reconciled: %s %s — %d rows updated", symbol, snap_date, count)
+        return count
     finally:
         _put(conn)
 
@@ -236,20 +295,31 @@ def save_option_level_bars(rows: list) -> None:
             r['symbol'], r['level_date'], r['level_type'], r['rank'], r['strike'],
             r['option_type'], r['expiry'], r['occ_symbol'], r['bar_time'],
             r['open'], r['high'], r['low'], r['close'], r['volume'],
+            r.get('cum_option_volume'),
+            r.get('implied_vol'), r.get('delta'), r.get('gamma'),
+            r.get('vega'), r.get('theta'), r.get('rho'),
         )
         for r in rows
     ]
     sql = """
         INSERT INTO option_level_bars
             (symbol, level_date, level_type, rank, strike, option_type, expiry,
-             occ_symbol, bar_time, open, high, low, close, volume)
+             occ_symbol, bar_time, open, high, low, close, volume,
+             cum_option_volume, implied_vol, delta, gamma, vega, theta, rho)
         VALUES %s
         ON CONFLICT (occ_symbol, bar_time) DO UPDATE SET
-            open   = EXCLUDED.open,
-            high   = EXCLUDED.high,
-            low    = EXCLUDED.low,
-            close  = EXCLUDED.close,
-            volume = EXCLUDED.volume
+            open              = EXCLUDED.open,
+            high              = EXCLUDED.high,
+            low               = EXCLUDED.low,
+            close             = EXCLUDED.close,
+            volume            = EXCLUDED.volume,
+            cum_option_volume = EXCLUDED.cum_option_volume,
+            implied_vol = COALESCE(EXCLUDED.implied_vol, option_level_bars.implied_vol),
+            delta       = COALESCE(EXCLUDED.delta,       option_level_bars.delta),
+            gamma       = COALESCE(EXCLUDED.gamma,       option_level_bars.gamma),
+            vega        = COALESCE(EXCLUDED.vega,        option_level_bars.vega),
+            theta       = COALESCE(EXCLUDED.theta,       option_level_bars.theta),
+            rho         = COALESCE(EXCLUDED.rho,         option_level_bars.rho)
     """
     conn = _get()
     try:
@@ -309,12 +379,20 @@ def prune_old_bars(keep_days: int = 10) -> dict:
             )
             olb = cur.rowcount
 
+            cur.execute(
+                "DELETE FROM signal_candidates WHERE session_date < %s",
+                (cutoff,),
+            )
+            sc = cur.rowcount
+
         conn.commit()
         logger.info(
-            "prune_old_bars: kept %d trading days (>= %s); deleted price_bars=%d, option_level_bars=%d",
-            keep_days, cutoff, pb, olb,
+            "prune_old_bars: kept %d trading days (>= %s); deleted price_bars=%d, "
+            "option_level_bars=%d, signal_candidates=%d",
+            keep_days, cutoff, pb, olb, sc,
         )
-        return {'cutoff': cutoff, 'price_bars': pb, 'option_level_bars': olb}
+        return {'cutoff': cutoff, 'price_bars': pb, 'option_level_bars': olb,
+                'signal_candidates': sc}
     finally:
         _put(conn)
 
@@ -431,6 +509,36 @@ def save_flow_reversal(r: dict) -> Optional[int]:
         _put(conn)
 
 
+def save_signal_candidates(rows: list, ts, session_date) -> None:
+    """Bulk-insert per-poll candidate evaluations (§73). `rows` are dicts from
+    SignalDetector.last_candidates; ts/session_date stamp the whole batch."""
+    if not rows:
+        return
+    from psycopg2.extras import execute_values
+    values = [(
+        ts, session_date, r['symbol'], r['candidate_side'], r['level_label'],
+        r['strike'], r['spot'], r['dist_pct'], r['near_level'],
+        r['contract_low_distance'], r['contract_near_low'], r['valid_volume_event'],
+        r['already_alerted'], r['alert_fired'], r['signal_type'], r['blocked_reason'],
+        r.get('hv_pctile'), r['atm_vol_1m'], r['win_vol'], r['active_bars'],
+    ) for r in rows]
+    sql = """
+        INSERT INTO signal_candidates
+            (ts, session_date, symbol, candidate_side, level_label, strike, spot, dist_pct,
+             near_level, contract_low_distance, contract_near_low, valid_volume_event,
+             already_alerted, alert_fired, signal_type, blocked_reason, hv_pctile,
+             atm_vol_1m, win_vol, active_bars)
+        VALUES %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_research_finding(f: dict) -> Optional[int]:
     """Insert a Claude research finding/hypothesis into the journal (§30/§49)."""
     from psycopg2.extras import Json
@@ -479,6 +587,271 @@ def get_research_findings(status: Optional[str] = None, limit: int = 50) -> list
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
+    finally:
+        _put(conn)
+
+
+def get_oi_changes_today(symbol: str, snap_date: date) -> dict:
+    """
+    Return {(strike_float, option_type): {'oi_change': int, 'oi_change_pct': float}}
+    for all contracts in today's option_chain_snapshots that have a non-NULL oi_change.
+    Used by compute_secondary_watchlist's OI_BUILDUP tier after reconcile_oi_changes.
+    Returns {} on any error (e.g. first session with no prior-day data).
+    """
+    sql = """
+        SELECT DISTINCT ON (strike, option_type)
+            strike, option_type, oi_change, oi_change_pct
+        FROM option_chain_snapshots
+        WHERE symbol = %s AND snap_date = %s
+          AND oi_change IS NOT NULL
+        ORDER BY strike, option_type, snap_time DESC
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, snap_date))
+            return {
+                (float(r[0]), r[1]): {
+                    'oi_change':     int(r[2]),
+                    'oi_change_pct': float(r[3]) if r[3] is not None else None,
+                }
+                for r in cur.fetchall()
+            }
+    except Exception:
+        logger.warning("get_oi_changes_today failed for %s %s", symbol, snap_date, exc_info=True)
+        return {}
+    finally:
+        _put(conn)
+
+
+def save_secondary_oi_levels(
+    symbol: str,
+    level_date: date,
+    computed_at: datetime,
+    levels: list,
+) -> None:
+    """Upsert secondary OI watchlist rows (EXTENDED_RANK, OUTER_WALL, OI_BUILDUP)."""
+    if not levels:
+        return
+    rows = [
+        (
+            symbol,
+            level_date,
+            lv['watchlist_tier'],
+            float(lv['strike']),
+            lv['option_type'],
+            lv.get('open_interest'),
+            lv.get('oi_change'),
+            lv.get('oi_change_pct'),
+            lv.get('distance_pct'),
+            lv.get('band_rank'),
+            lv.get('expiry'),
+            computed_at,
+        )
+        for lv in levels
+    ]
+    sql = """
+        INSERT INTO secondary_oi_levels
+            (symbol, level_date, watchlist_tier, strike, option_type,
+             open_interest, oi_change, oi_change_pct, distance_pct, band_rank,
+             expiry, computed_at)
+        VALUES %s
+        ON CONFLICT (symbol, level_date, watchlist_tier, strike, option_type) DO UPDATE SET
+            open_interest = EXCLUDED.open_interest,
+            oi_change     = EXCLUDED.oi_change,
+            oi_change_pct = EXCLUDED.oi_change_pct,
+            distance_pct  = EXCLUDED.distance_pct,
+            band_rank     = EXCLUDED.band_rank,
+            expiry        = EXCLUDED.expiry,
+            computed_at   = EXCLUDED.computed_at
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, rows)
+        conn.commit()
+        logger.info("Saved %d secondary OI levels for %s", len(rows), symbol)
+    finally:
+        _put(conn)
+
+
+def get_secondary_oi_levels(symbol: str, level_date: date) -> list:
+    """Return all secondary OI watchlist rows for a symbol on the given date."""
+    sql = """
+        SELECT watchlist_tier, strike, option_type, open_interest,
+               oi_change, oi_change_pct, distance_pct, band_rank, expiry
+        FROM   secondary_oi_levels
+        WHERE  symbol = %s AND level_date = %s
+        ORDER  BY watchlist_tier, band_rank
+    """
+    conn = _get()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (symbol, level_date))
+            return cur.fetchall()
+    finally:
+        _put(conn)
+
+
+def reconcile_prior_oi_events(symbol: str, today: date) -> int:
+    """
+    §37 Next-day intent reconciliation: update yesterday's oi_events with the
+    confirmed overnight OI change now visible in today's option_chain_snapshots.
+
+    Sets confirmed_oi_change, reconciled_intent (CONFIRMED_OPENING /
+    CONFIRMED_CLOSING / NO_CHANGE), prediction_correct, and reconciled_at.
+    Only processes rows where reconciled_at IS NULL.
+    Returns the number of rows updated.
+    """
+    sql = """
+        UPDATE oi_events e
+        SET
+            confirmed_oi_change     = s.oi_change,
+            confirmed_oi_change_pct = s.oi_change_pct,
+            reconciled_intent = CASE
+                WHEN s.oi_change > 0  THEN 'CONFIRMED_OPENING'
+                WHEN s.oi_change < 0  THEN 'CONFIRMED_CLOSING'
+                ELSE 'NO_CHANGE'
+            END,
+            prediction_correct = CASE
+                WHEN e.live_intent ILIKE 'OPENING_%%' AND s.oi_change > 0  THEN TRUE
+                WHEN e.live_intent ILIKE 'CLOSING_%%' AND s.oi_change < 0  THEN TRUE
+                WHEN e.live_intent = 'MIXED_OR_UNKNOWN'                     THEN NULL
+                ELSE FALSE
+            END,
+            reconciled_at = NOW()
+        FROM (
+            SELECT DISTINCT ON (strike, option_type)
+                strike, option_type, oi_change, oi_change_pct
+            FROM option_chain_snapshots
+            WHERE symbol = %s AND snap_date = %s AND oi_change IS NOT NULL
+            ORDER BY strike, option_type, snap_time DESC
+        ) s
+        WHERE e.symbol      = %s
+          AND e.session_date = (%s::date - INTERVAL '1 day')::date
+          AND e.strike      = s.strike
+          AND e.option_type = s.option_type
+          AND e.reconciled_at IS NULL
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, today, symbol, today))
+            count = cur.rowcount
+        conn.commit()
+        if count:
+            logger.info("OI event reconciliation: %s %s — %d rows updated", symbol, today, count)
+        return count
+    finally:
+        _put(conn)
+
+
+def save_volume_leadership(
+    symbol: str,
+    bar_time,
+    session_date: date,
+    spot: float,
+    scores: dict,
+) -> None:
+    """Upsert per-minute call/put leadership row for §41 (every poll, all symbols)."""
+    sql = """
+        INSERT INTO volume_leadership
+            (symbol, bar_time, session_date, call_leadership, put_leadership,
+             leadership_diff, dominant_side, call_vol_5m, put_vol_5m, spot)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (symbol, bar_time) DO UPDATE SET
+            call_leadership = EXCLUDED.call_leadership,
+            put_leadership  = EXCLUDED.put_leadership,
+            leadership_diff = EXCLUDED.leadership_diff,
+            dominant_side   = EXCLUDED.dominant_side,
+            call_vol_5m     = EXCLUDED.call_vol_5m,
+            put_vol_5m      = EXCLUDED.put_vol_5m,
+            spot            = EXCLUDED.spot
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                symbol, bar_time, session_date,
+                scores.get('call_leadership'), scores.get('put_leadership'),
+                scores.get('leadership_diff'), scores.get('dominant_side'),
+                scores.get('call_vol_5m'), scores.get('put_vol_5m'),
+                round(float(spot), 4),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_signal_volume_analytics(rows: list) -> None:
+    """Bulk upsert §26-§29/§31 volume analytics per signal (one row per signal_id)."""
+    if not rows:
+        return
+    _COLS = (
+        'signal_id', 'session_date', 'symbol',
+        'vol_2m', 'vol_3m', 'vol_5m', 'vol_10m', 'vol_15m', 'vol_30m',
+        'ratio_2m', 'ratio_5m', 'ratio_10m', 'ratio_15m', 'ratio_30m',
+        'volume_shape', 'shape_hhi', 'burst_ratio', 'staircase_score',
+        'normalized_entropy',
+        'atm_vol_share', 'itm_vol_share', 'otm_vol_share',
+        'strike_volume_center', 'center_vs_spot',
+        'vol_center_change', 'vol_migration_direction',
+    )
+    ph = ','.join(['%s'] * len(_COLS))
+    values = [tuple(r.get(c) for c in _COLS) for r in rows]
+    sql = f"""
+        INSERT INTO signal_volume_analytics ({','.join(_COLS)})
+        VALUES ({ph})
+        ON CONFLICT (signal_id) DO UPDATE SET
+            vol_2m=EXCLUDED.vol_2m, vol_3m=EXCLUDED.vol_3m, vol_5m=EXCLUDED.vol_5m,
+            vol_10m=EXCLUDED.vol_10m, vol_15m=EXCLUDED.vol_15m, vol_30m=EXCLUDED.vol_30m,
+            ratio_2m=EXCLUDED.ratio_2m, ratio_5m=EXCLUDED.ratio_5m,
+            ratio_10m=EXCLUDED.ratio_10m, ratio_15m=EXCLUDED.ratio_15m,
+            ratio_30m=EXCLUDED.ratio_30m, volume_shape=EXCLUDED.volume_shape,
+            shape_hhi=EXCLUDED.shape_hhi, burst_ratio=EXCLUDED.burst_ratio,
+            staircase_score=EXCLUDED.staircase_score,
+            normalized_entropy=EXCLUDED.normalized_entropy,
+            atm_vol_share=EXCLUDED.atm_vol_share, itm_vol_share=EXCLUDED.itm_vol_share,
+            otm_vol_share=EXCLUDED.otm_vol_share,
+            strike_volume_center=EXCLUDED.strike_volume_center,
+            center_vs_spot=EXCLUDED.center_vs_spot,
+            vol_center_change=EXCLUDED.vol_center_change,
+            vol_migration_direction=EXCLUDED.vol_migration_direction
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+        logger.info("Saved %d signal_volume_analytics rows", len(rows))
+    finally:
+        _put(conn)
+
+
+def save_volume_events(rows: list) -> None:
+    """Bulk insert §32 volume event archive rows (idempotent — caller deletes first on re-run)."""
+    if not rows:
+        return
+    _COLS = (
+        'symbol', 'session_date', 'event_time', 'occ_symbol',
+        'strike', 'option_type', 'expiry', 'event_type',
+        'trigger_volume', 'trigger_ratio', 'mark_at_event', 'low_dist',
+        'volume_shape', 'normalized_entropy',
+        'led_to_signal', 'signal_id',
+        'return_5m', 'return_15m', 'return_30m', 'mfe_pct', 'mae_pct',
+    )
+    ph = ','.join(['%s'] * len(_COLS))
+    values = [tuple(r.get(c) for c in _COLS) for r in rows]
+    sql = f"""
+        INSERT INTO volume_events ({','.join(_COLS)})
+        VALUES ({ph})
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+        logger.info("Saved %d volume_events rows", len(rows))
     finally:
         _put(conn)
 
@@ -865,5 +1238,126 @@ def get_last_signal_time(
             cur.execute(sql, (symbol, level_type, level_price, level_price))
             row = cur.fetchone()
         return row[0] if row else None
+    finally:
+        _put(conn)
+
+
+# ── Phase 6: Statistical Research Toolkit (§74-§77) ─────────────────────────
+
+def save_permutation_test(
+    session_date,
+    symbol: Optional[str],
+    test_name: str,
+    result: dict,
+) -> None:
+    """§74 Upsert a permutation test result (unique on session_date + test_name + symbol)."""
+    sql = """
+        INSERT INTO research_permutation_tests
+            (session_date, symbol, test_name, metric,
+             n_observed, n_control, n_permutations,
+             observed_metric, null_mean, null_std,
+             p_value, effect_size, percentile_rank,
+             ci_lower, ci_upper, significant)
+        VALUES
+            (%s, %s, %s, %s,
+             %s, %s, %s,
+             %s, %s, %s,
+             %s, %s, %s,
+             %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                session_date, symbol, test_name, result.get('metric'),
+                result.get('n_observed'), result.get('n_control'),
+                result.get('n_permutations'),
+                result.get('observed_metric'), result.get('null_mean'),
+                result.get('null_std'), result.get('p_value'),
+                result.get('effect_size'), result.get('percentile_rank'),
+                result.get('ci_lower'), result.get('ci_upper'),
+                result.get('significant'),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_monte_carlo_result(
+    session_date,
+    symbol: Optional[str],
+    result: dict,
+) -> None:
+    """§75 Insert a Monte Carlo simulation result."""
+    sql = """
+        INSERT INTO research_monte_carlo
+            (session_date, symbol,
+             n_trades, n_simulations, starting_capital,
+             expected_return, median_return,
+             probability_of_loss, probability_of_ruin, target_hit_probability,
+             max_drawdown_p5, max_drawdown_p50, max_drawdown_p95,
+             ci_lower_95, ci_upper_95)
+        VALUES
+            (%s, %s,
+             %s, %s, %s,
+             %s, %s,
+             %s, %s, %s,
+             %s, %s, %s,
+             %s, %s)
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                session_date, symbol,
+                result.get('n_trades'), result.get('n_simulations'),
+                result.get('starting_capital'),
+                result.get('expected_return'), result.get('median_return'),
+                result.get('probability_of_loss'), result.get('probability_of_ruin'),
+                result.get('target_hit_probability'),
+                result.get('max_drawdown_p5'), result.get('max_drawdown_p50'),
+                result.get('max_drawdown_p95'),
+                result.get('ci_lower_95'), result.get('ci_upper_95'),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_change_points(
+    session_date,
+    symbol: str,
+    option_side: str,
+    result: dict,
+    pen: float,
+) -> None:
+    """§77 Insert a change-point detection result."""
+    import json as _json
+    sql = """
+        INSERT INTO research_change_points
+            (session_date, symbol, option_side,
+             n_bars, n_breakpoints, breakpoint_indices,
+             pre_regime_mean, post_regime_mean, regime_change_ratio,
+             concentrated_event_detected, model_used, pen)
+        VALUES
+            (%s, %s, %s,
+             %s, %s, %s::jsonb,
+             %s, %s, %s,
+             %s, %s, %s)
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                session_date, symbol, option_side,
+                result.get('n_bars'), result.get('n_breakpoints'),
+                _json.dumps(result.get('breakpoint_indices', [])),
+                result.get('pre_regime_mean'), result.get('post_regime_mean'),
+                result.get('regime_change_ratio'),
+                result.get('concentrated_event_detected'),
+                result.get('model_used'), pen,
+            ))
+        conn.commit()
     finally:
         _put(conn)

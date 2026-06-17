@@ -35,6 +35,12 @@ SIGNAL_WARMUP_MINUTES = int(os.getenv('SIGNAL_WARMUP_MINUTES', '5'))
 ATM_RANGE_PCT  = float(os.getenv('ATM_RANGE_PCT', '0.05'))   # 5 %
 TOP_N_LEVELS   = int(os.getenv('TOP_N_LEVELS', '3'))          # 3 S + 3 R
 
+# §11-§16 Secondary OI Watchlist — three tiers beyond the primary S1-R3 levels.
+SECONDARY_WATCHLIST_TOP_N  = int(os.getenv('SECONDARY_WATCHLIST_TOP_N',  '5'))    # extra ranks per side (S4-S8, R4-R8)
+SECONDARY_OUTER_BAND_PCT   = float(os.getenv('SECONDARY_OUTER_BAND_PCT', '0.10')) # outer wall band ±10%
+SECONDARY_OUTER_TOP_N      = int(os.getenv('SECONDARY_OUTER_TOP_N',      '3'))    # top-N outer-wall per side
+SECONDARY_OI_BUILDUP_TOP_N = int(os.getenv('SECONDARY_OI_BUILDUP_TOP_N', '5'))   # top-N by overnight oi_change
+
 # ── Signal detection ──────────────────────────────────────────────────────────
 # Minimum minutes between signals on the same level (cooldown)
 SIGNAL_COOLDOWN_MINUTES      = int(os.getenv('SIGNAL_COOLDOWN_MINUTES', '30'))
@@ -315,7 +321,7 @@ ALPACA_SECRET_KEY   = os.getenv('ALPACA_SECRET_KEY', '')
 ALPACA_PAPER        = os.getenv('ALPACA_PAPER',   'true').lower()  == 'true'
 ALPACA_ENABLED      = os.getenv('ALPACA_ENABLED', 'false').lower() == 'true'
 TRADE_PCT           = float(os.getenv('TRADE_PCT', '0.01'))   # 1 % of portfolio value per trade
-MAX_OPEN_POSITIONS  = int(os.getenv('MAX_OPEN_POSITIONS', '3'))
+MAX_OPEN_POSITIONS  = int(os.getenv('MAX_OPEN_POSITIONS', '8'))
 FLIP_ENABLED        = os.getenv('FLIP_ENABLED', 'false').lower() == 'true'
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -336,3 +342,13 @@ SHEET_NAMES = {
 # Set DISCORD_REVIEW_WEBHOOK_URL for the daily post-close review (falls back to the
 # morning briefing webhook, then the main signal webhook).
 DISCORD_REVIEW_WEBHOOK_URL = os.getenv('DISCORD_REVIEW_WEBHOOK_URL', '')
+
+# ── Claude Nightly Pipeline (§81-§83) ─────────────────────────────────────────
+# Anthropic API key — get one at console.anthropic.com.
+# Leave blank to disable the nightly research pipeline entirely.
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+# Model used for the nightly research analysis. Haiku is fast and cheap; upgrade
+# to claude-sonnet-4-6 for deeper analysis on high-signal days.
+NIGHTLY_PIPELINE_MODEL = os.getenv('NIGHTLY_PIPELINE_MODEL', 'claude-haiku-4-5-20251001')
+# Webhook for Claude's nightly research notes (falls back to review → morning → main).
+DISCORD_RESEARCH_WEBHOOK_URL = os.getenv('DISCORD_RESEARCH_WEBHOOK_URL', '')

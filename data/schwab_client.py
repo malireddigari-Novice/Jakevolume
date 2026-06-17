@@ -555,6 +555,9 @@ def _normalize_chain(data: dict) -> Optional[dict]:
                 if not contracts:
                     continue
                 c = contracts[0]
+                # Schwab returns IV as a percentage (e.g. 32.4 for 32.4%); store as decimal.
+                raw_iv = c.get('volatility')
+                iv = (float(raw_iv) / 100.0) if raw_iv is not None else None
                 bucket[exp_date].append({
                     'strike':        float(strike_str),
                     'expiry':        exp_date,
@@ -563,6 +566,12 @@ def _normalize_chain(data: dict) -> Optional[dict]:
                     'bid':           c.get('bid'),
                     'ask':           c.get('ask'),
                     'mark':          c.get('mark'),
+                    'delta':         c.get('delta'),
+                    'gamma':         c.get('gamma'),
+                    'theta':         c.get('theta'),
+                    'vega':          c.get('vega'),
+                    'rho':           c.get('rho'),
+                    'implied_vol':   iv,
                 })
 
     shared = sorted(set(calls_by_exp) & set(puts_by_exp))
@@ -601,13 +610,20 @@ def _parse_chain(data: dict, include_oi: bool = False) -> dict:
                     continue
                 c      = contracts[0]
                 strike = float(strike_str)
+                raw_iv = c.get('volatility')
                 entry  = {
-                    'bid':      c.get('bid'),
-                    'ask':      c.get('ask'),
-                    'mark':     c.get('mark'),
-                    'volume':   int(c.get('totalVolume', 0) or 0),
-                    'day_high': c.get('highPrice') or c.get('high'),
-                    'day_low':  c.get('lowPrice')  or c.get('low'),
+                    'bid':        c.get('bid'),
+                    'ask':        c.get('ask'),
+                    'mark':       c.get('mark'),
+                    'volume':     int(c.get('totalVolume', 0) or 0),
+                    'day_high':   c.get('highPrice') or c.get('high'),
+                    'day_low':    c.get('lowPrice')  or c.get('low'),
+                    'delta':      c.get('delta'),
+                    'gamma':      c.get('gamma'),
+                    'theta':      c.get('theta'),
+                    'vega':       c.get('vega'),
+                    'rho':        c.get('rho'),
+                    'implied_vol': (float(raw_iv) / 100.0) if raw_iv is not None else None,
                 }
                 if include_oi:
                     entry['open_interest'] = int(c.get('openInterest', 0) or 0)
