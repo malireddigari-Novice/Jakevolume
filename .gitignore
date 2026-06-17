@@ -14,7 +14,11 @@ venv/
 
 # Logs
 *.log
+*.err
 startup.log
+
+# Backups (incl. expired token backups — sensitive)
+*.bak
 
 # Single-instance lock (runtime)
 *.lock
