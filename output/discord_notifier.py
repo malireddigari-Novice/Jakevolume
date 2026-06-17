@@ -160,57 +160,137 @@ def send_signal(sig: dict) -> None:
 
 # ── Morning briefing ──────────────────────────────────────────────────────────
 
-def send_morning_briefing(results: list, now: datetime) -> None:
+# Bias → embed border color. A quick visual cue only; the bias is always printed
+# as text in the title too, so readability never depends on color.
+_BIAS_COLORS = {
+    'STRONGLY BULLISH': 0x1A7F37,   # green
+    'BULLISH':          0x2DA44E,   # lighter green
+    'NEUTRAL':          0x6E7781,   # gray
+    'BEARISH':          0xBC6B00,   # muted orange
+    'STRONGLY BEARISH': 0xCF222E,   # red
+}
+
+
+def _bias_color(bias: str) -> int:
+    """Embed border color for a sentiment bias; gray (NEUTRAL) by default."""
+    return _BIAS_COLORS.get((bias or '').upper().strip(), 0x6E7781)
+
+
+def _fmt_expiry(expiry) -> str:
+    """Format an expiry as 'Jun 17'; tolerate date/datetime, str, or None."""
+    if expiry is None:
+        return 'n/a'
+    if hasattr(expiry, 'strftime'):
+        return expiry.strftime('%b %d')
+    return str(expiry)
+
+
+def _level_lines(levels: list, prefix: str) -> str:
     """
-    Send the 8:20 AM morning briefing as a single Discord message.
+    Stacked rank-labelled lines ('S1: $295.00') in OI-rank order — rank 1 first.
+
+    Levels are NOT re-sorted by price: the ranks reflect OI strength, so the
+    values may not be numerically ordered. That is expected; preserve the rank.
+    """
+    ranked = sorted(levels, key=lambda lv: lv.get('rank', 99))
+    if not ranked:
+        return '—'
+    return "\n".join(
+        f"{prefix}{i}: ${lv['strike']:.2f}" for i, lv in enumerate(ranked[:3], start=1)
+    )
+
+
+def _build_symbol_embed(r: dict, footer: dict) -> dict:
+    """One mobile-first embed per symbol: bias-colored border, stacked S/R fields."""
+    s    = r['sentiment']
+    bias = s.get('bias', 'NEUTRAL')
+    prev = r.get('prev_close')
+    pc   = s.get('pc_ratio')
+    prev_str = f"${prev:.2f}" if prev is not None else 'n/a'
+    pc_str   = f"{pc:.3f}" if pc is not None else 'n/a'
+    return {
+        'title': f"{r['symbol']} — {bias}",
+        'color': _bias_color(bias),
+        'description': (
+            f"**Previous Close:** {prev_str}\n"
+            f"**Expiry:** {_fmt_expiry(r.get('expiry'))}\n"
+            f"**Put/Call OI:** {pc_str}"
+        ),
+        'fields': [
+            {'name': 'Support Levels',
+             'value': _level_lines(r.get('supports', []), 'S'),
+             'inline': False},      # stacked (not side-by-side) for mobile width
+            {'name': 'Resistance Levels',
+             'value': _level_lines(r.get('resistances', []), 'R'),
+             'inline': False},
+        ],
+        'footer': footer,
+    }
+
+
+def send_morning_briefing(results: list, now: datetime, oi_buildup: list | None = None) -> None:
+    """
+    Send the 8:20 AM morning briefing to Discord as one mobile-first embed per
+    symbol — bias-colored border, stacked Support/Resistance fields with rank
+    labels beside each value — instead of a wide monospaced table that wraps and
+    detaches labels on mobile.
 
     `results` is the list built in run_morning_snapshot.py / morning_snapshot():
     each item has keys: symbol, prev_close, pm_price, expiry, supports,
-    resistances, sentiment.
+    resistances, sentiment (which carries bias + pc_ratio).
     """
     url = config.DISCORD_MORNING_WEBHOOK_URL or config.DISCORD_WEBHOOK_URL
-    if not url:
+    if not url or not results:
         return
 
-    header = (
-        f"{'SYM':<6}  {'Prev':>8}  {'Bias':<18}  "
-        f"{'P/C':>5}  {'S1':>7}  {'S2':>7}  {'S3':>7}  "
-        f"{'R1':>7}  {'R2':>7}  {'R3':>7}  Expiry"
+    prefix   = "**[SAMPLE]** " if config.SAMPLE_MODE else ""
+    time_str = now.strftime('%I:%M %p').lstrip('0')        # "08:20 AM" → "8:20 AM"
+    header   = (
+        f"{prefix}**JAKEVOLUME MORNING BRIEFING**\n"
+        f"{now.strftime('%B %d, %Y')} — {time_str} CST\n"
+        f"Market universe: " + " · ".join(r['symbol'] for r in results)
     )
-    divider = "-" * len(header)
+    footer = {'text': f"Jakevolume Morning Briefing · {time_str} CST"}
 
-    rows = [header, divider]
+    embeds = []
     for r in results:
-        s   = r['sentiment']
-        sup = r['supports']
-        res = r['resistances']
+        try:
+            embeds.append(_build_symbol_embed(r, footer))
+        except Exception:
+            logger.warning("Discord: failed to build briefing embed for %s",
+                           r.get('symbol'), exc_info=True)
 
-        s1 = f"{sup[0]['strike']:.1f}" if len(sup) > 0 else '  -  '
-        s2 = f"{sup[1]['strike']:.1f}" if len(sup) > 1 else '  -  '
-        s3 = f"{sup[2]['strike']:.1f}" if len(sup) > 2 else '  -  '
-        r1 = f"{res[0]['strike']:.1f}" if len(res) > 0 else '  -  '
-        r2 = f"{res[1]['strike']:.1f}" if len(res) > 1 else '  -  '
-        r3 = f"{res[2]['strike']:.1f}" if len(res) > 2 else '  -  '
+    # Optional overnight OI buildup as a compact trailing embed.
+    if oi_buildup:
+        bu_lines = []
+        for b in oi_buildup:
+            ch    = b.get('oi_change', 0) or 0
+            pct   = b.get('oi_change_pct')
+            pcts  = f" ({pct:+.0%})" if pct is not None else ""
+            dist  = b.get('distance_pct')
+            dists = f" · dist {dist:+.1%}" if dist is not None else ""
+            bu_lines.append(
+                f"{b['symbol']} {b['option_type']} ${b['strike']:.0f} · +{ch:,} OI{pcts}{dists}"
+            )
+        embeds.append({
+            'title': 'OI Buildup (overnight)',
+            'color': 0x6E7781,
+            'description': "\n".join(bu_lines) or '—',
+            'footer': footer,
+        })
 
-        rows.append(
-            f"{r['symbol']:<6}  "
-            f"{r['prev_close']:>8.2f}  "
-            f"{s['bias']:<18}  "
-            f"{s['pc_ratio']:>5.3f}  "
-            f"{s1:>7}  {s2:>7}  {s3:>7}  "
-            f"{r1:>7}  {r2:>7}  {r3:>7}  "
-            f"{r['expiry']}"
-        )
+    # Discord allows up to 10 embeds per webhook message; chunk to stay safe
+    # (MAG-7 = 7 symbols, so this is normally a single call). The header content
+    # rides on the first message only.
+    first = True
+    for i in range(0, len(embeds), 10):
+        payload = {'embeds': embeds[i:i + 10]}
+        if first:
+            payload['content'] = header
+            first = False
+        _post(url, payload)
 
-    table = "\n".join(rows)
-    prefix = "**[SAMPLE]** " if config.SAMPLE_MODE else ""
-    title = f"{prefix}**JAKEVOLUME MORNING BRIEFING — {now.strftime('%Y-%m-%d %H:%M CST')}**"
-
-    # Discord has a 2000-char message limit; the table fits comfortably in a code block.
-    content = f"{title}\n```\n{table}\n```"
-
-    _post(url, {"content": content})
-    logger.info("Discord: morning briefing sent (%d symbols)", len(results))
+    logger.info("Discord: morning briefing sent (%d symbols, embed format)", len(results))
 
 
 def send_reversal_alert(rev: dict) -> None:
