@@ -189,6 +189,17 @@ def analyze_daily_signals(analysis_date: _date, data_src=None, sheets=None) -> i
 
             ei = next((i for i, b in enumerate(ob) if b[0] >= st), None)
             if ei is None or ei + 1 >= len(ob):
+                # Guard: never overwrite an existing good row with NO_DATA NULLs.
+                # A re-run that can't reconstruct the traded contract's path (e.g.
+                # an expired 0DTE contract Alpaca no longer serves) must not destroy
+                # the metrics a prior run already computed.
+                cur.execute("SELECT 1 FROM signal_analysis "
+                            "WHERE signal_id=%s AND entry_price IS NOT NULL", (sid,))
+                if cur.fetchone():
+                    logger.info("Daily review %s: no path for signal %s this run — "
+                                "keeping existing metrics (not overwriting with NO_DATA)",
+                                analysis_date, sid)
+                    continue
                 rows.append(dict(signal_id=sid, analysis_date=analysis_date, symbol=sym,
                                  signal_time=st, signal_type=styp, traded_strike=tstrike,
                                  option_type=otype, entry_price=None, mfe_pct=None, mae_pct=None,
