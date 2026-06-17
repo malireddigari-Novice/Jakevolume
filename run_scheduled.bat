@@ -9,6 +9,9 @@ set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
 set TRADE_END_MIN=15
 
+REM --- Log housekeeping: rotate if over 10 MB, keeping one .old backup ---
+if exist "%LOG%" for %%A in ("%LOG%") do if %%~zA GTR 10485760 move /Y "%LOG%" "%LOG%.old" >nul
+
 echo [%DATE% %TIME%] ===== Jakevolume watchdog started ===== >> %LOG%
 
 :WATCHDOG_LOOP

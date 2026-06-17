@@ -18,6 +18,7 @@ Usage
 """
 import argparse
 import logging
+import logging.handlers
 import sys
 import time
 from datetime import date, datetime
@@ -69,7 +70,13 @@ def _setup_logging() -> None:
         format=fmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('jakevolume.log', encoding='utf-8'),
+            # Rotating file log: cap at ~10 MB × 5 backups (~60 MB total) so
+            # jakevolume.log never grows unbounded. An already-oversized file
+            # rolls over on the first write after restart.
+            logging.handlers.RotatingFileHandler(
+                'jakevolume.log', maxBytes=10 * 1024 * 1024, backupCount=5,
+                encoding='utf-8',
+            ),
         ],
     )
     # Reduce noise from third-party libs
