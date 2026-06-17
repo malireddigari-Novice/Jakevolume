@@ -264,6 +264,9 @@ class SignalDetector:
         # §13 multi-day (low, high) per OCC, fetched once per contract per day.
         self._opt_hist_range: dict[str, Optional[tuple[float, float]]] = {}
         self._hist_range_fn = None
+        # Fallback when no live multi-day history exists (Schwab serves no option
+        # price-history): the contract's previous-session (low, high) from the DB.
+        self._prev_range_fn = None
         # §14 prior major volume events per contract key → [(volume, price), …].
         self._major_events: dict[str, list[tuple[int, float]]] = defaultdict(list)
         self._history_date: Optional[date] = None
@@ -284,6 +287,7 @@ class SignalDetector:
         opening_range: bool = False,
         hist_range_fn=None,
         fired_today_fn=None,
+        prev_range_fn=None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -293,6 +297,9 @@ class SignalDetector:
         hist_range_fn : callable(occ) -> (low, high) | None for the §13 gate.
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
+        prev_range_fn : callable(symbol, strike, opt_type, before_date) -> (low, high) | None.
+                        §13 fallback: the contract's previous-session (low, high) from the DB,
+                        used when hist_range_fn yields nothing (no live option price-history).
         """
         self.last_candidates = []          # §73 — reset per poll
         if not bars:
@@ -303,6 +310,7 @@ class SignalDetector:
         today       = current['bar_time'].date()
         bar_time    = current['bar_time']
         self._hist_range_fn = hist_range_fn
+        self._prev_range_fn = prev_range_fn
 
         # Keep 1DTE expiry handling (target-strike pricing); roles stay frozen.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -637,18 +645,28 @@ class SignalDetector:
         (mark - HistLow) / (HistHigh - HistLow) over the multi-day window, or None
         when not evaluable (no fn, no expiry, no mark, or no prior history → 0DTE).
         """
-        if self._hist_range_fn is None or expiry is None:
+        if expiry is None:
             return None
         mark = data.get('mark')
         if not mark or mark <= 0:
             return None
         occ = occ_symbol(symbol, expiry, strike, opt_type)
         if occ not in self._opt_hist_range:
-            try:
-                self._opt_hist_range[occ] = self._hist_range_fn(occ)
-            except Exception as exc:
-                logger.warning("hist_range_fn failed for %s: %s", occ, exc)
-                self._opt_hist_range[occ] = None
+            rng = None
+            if self._hist_range_fn is not None:
+                try:
+                    rng = self._hist_range_fn(occ)
+                except Exception as exc:
+                    logger.warning("hist_range_fn failed for %s: %s", occ, exc)
+            # Fallback: no live multi-day history → previous session's (low, high).
+            if not rng and self._prev_range_fn is not None:
+                try:
+                    rng = self._prev_range_fn(symbol, strike, opt_type, self._history_date)
+                    if rng:
+                        logger.debug("§13 hist-range fallback for %s → prev-session %s", occ, rng)
+                except Exception as exc:
+                    logger.warning("prev_range_fn failed for %s: %s", occ, exc)
+            self._opt_hist_range[occ] = rng
         rng = self._opt_hist_range.get(occ)
         if not rng:
             return None

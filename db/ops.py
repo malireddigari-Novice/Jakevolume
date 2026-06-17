@@ -627,6 +627,42 @@ def get_active_clusters(symbol: str) -> list:
         _put(conn)
 
 
+def get_option_prev_range(symbol: str, strike, option_type: str, before_date):
+    """
+    A contract's previous-session (low, high) from option_level_bars.
+
+    Returns (min_low, max_high) over the most recent level_date < before_date that
+    has bars for (symbol, strike, option_type), or None if there are none. Used as
+    the §13 historical-value fallback when no live multi-day option price-history
+    exists (Schwab serves none) — i.e. fetch the previous day's historic low/high.
+    """
+    sql = """
+        SELECT MIN(low), MAX(high)
+        FROM   option_level_bars
+        WHERE  symbol = %s AND strike = %s AND option_type = %s AND low > 0
+          AND  level_date = (
+                   SELECT MAX(level_date) FROM option_level_bars
+                   WHERE  symbol = %s AND strike = %s AND option_type = %s
+                     AND  level_date < %s AND low > 0
+               )
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, strike, option_type,
+                              symbol, strike, option_type, before_date))
+            row = cur.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None
+        return (float(row[0]), float(row[1]))
+    except Exception as exc:
+        logger.warning("get_option_prev_range(%s %s %s) failed: %s",
+                       symbol, strike, option_type, exc)
+        return None
+    finally:
+        _put(conn)
+
+
 def get_signal_strength(signal_id: int) -> dict:
     """
     Return {'confidence': str, 'strong_cluster': bool} for one signal.
