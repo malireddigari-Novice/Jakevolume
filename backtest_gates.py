@@ -7,12 +7,14 @@ the traded contract's real 1-min price path:
 
   entry      : traded contract (signals.traded_strike, option_type), close of the
                bar at/after signal_time  (matches observed fills within ~1c)
-  stoploss   : option mark <= 0.5 * entry  (main.py:550) → close remaining at stop
+  stoploss   : none at entry — the -50% premium stop was removed (0DTE premium
+               noise whipsawed it out of winners). A breakeven stop arms only
+               AFTER exit1 fills.
   exit1      : underlying reaches the shifted 1st opposing level (compute_exit_targets)
                → sell half, move stop to breakeven (entry)
   exit2      : underlying reaches the 2nd opposing level → sell remainder
   EOD        : 0DTE → close any remainder at the last bar
-  ordering   : within a bar, stop is checked before targets (conservative)
+  ordering   : within a bar, the breakeven stop (once armed) is checked before targets
 
 P&L is per-trade % of premium (one contract, spread ignored — close-to-close, so
 mildly optimistic by ~half-spread/leg). Cohorts compare the VWAP gate:
@@ -76,13 +78,13 @@ def simulate(signal_type, opt_path, und_by_min, exit1_u, exit2_u):
     entry = float(opt_path[0][4])          # close of entry bar
     if entry <= 0:
         return None
-    stop = 0.5 * entry
+    stop = None                            # no initial premium stop (the -50% stop was removed)
     held = 1.0
     proceeds = 0.0
     exit1_done = False
     for (t, o, h, l, c, v) in opt_path[1:]:           # bars after entry
         l, c = float(l), float(c)
-        if held > 0 and l <= stop:                    # stop (option intrabar low)
+        if held > 0 and stop is not None and l <= stop:   # breakeven stop (armed after exit1)
             proceeds += held * stop
             held = 0.0
             break

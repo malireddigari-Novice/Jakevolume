@@ -37,10 +37,11 @@ def levels(s, d):
 
 # ── Exit simulators (return % P&L on premium) ──────────────────────────────────
 def cur_rule(styp, entry, opath, ubymin, e1, e2):
-    """Current: half at e1 (underlying), half at e2, -50% stop, stop->BE after e1, EOD."""
-    stop, held, proc, e1done = 0.5*entry, 1.0, 0.0, False
+    """Current: half at e1 (underlying), half at e2, breakeven stop armed after e1, EOD.
+    No initial premium stop (-50% stop removed)."""
+    stop, held, proc, e1done = None, 1.0, 0.0, False
     for (t, h, l, c) in opath[1:]:
-        if held > 0 and l <= stop: proc += held*stop; held = 0; break
+        if held > 0 and stop is not None and l <= stop: proc += held*stop; held = 0; break
         u = ubymin.get(t.replace(second=0, microsecond=0))
         if u:
             uh, ul = u
@@ -63,13 +64,15 @@ def opt_rule(entry, opath, stop_pct, tp_pct=None, trail_arm=None, trail_pct=None
             if l <= ts: return (ts/entry-1)*100
     return (opath[-1][3]/entry-1)*100
 
-def ladder(entry, opath, legs, stop_pct=0.50, trail_arm=None, trail_pct=None):
+def ladder(entry, opath, legs, stop_pct=None, trail_arm=None, trail_pct=None):
     """Scale out at option-price take-profit legs [(tp_pct, qty_frac), ...]; remainder
-    runs to a trail (if set) or EOD. -50% hard stop on whatever is still held."""
-    stop, held, proc, peak = entry*(1-stop_pct), 1.0, 0.0, entry
+    runs to a trail (if set) or EOD. No initial premium stop by default (the -50% stop
+    was removed); an optional hard stop is honored if stop_pct is passed."""
+    stop = entry*(1-stop_pct) if stop_pct else None
+    held, proc, peak = 1.0, 0.0, entry
     legs = sorted(legs); li = 0
     for (t, h, l, c) in opath[1:]:
-        if held > 0 and l <= stop: proc += held*stop; held = 0; break
+        if held > 0 and stop is not None and l <= stop: proc += held*stop; held = 0; break
         while li < len(legs) and held > 0 and h >= entry*(1+legs[li][0]):
             q = min(legs[li][1], held); proc += q*entry*(1+legs[li][0]); held -= q; li += 1
         peak = max(peak, h)

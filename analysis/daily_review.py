@@ -33,17 +33,21 @@ def _conn():
 # ── exit / suggestion simulators on the option price path ──────────────────────
 
 def _current_rule(styp, entry, opath, ubymin, e1, e2):
-    """Current live exit: half at e1 (underlying), rest at e2, -50% stop, BE after e1, EOD."""
-    stop, held, proc, e1done = 0.5 * entry, 1.0, 0.0, False
+    """Current live exit: half at e1 (underlying), rest at e2, breakeven stop armed
+    only AFTER e1, ride the remainder to EOD. No initial premium stop — the old
+    -50% stop was removed (main.py) because 0DTE premium noise whipsawed it out of
+    winners. (Single-day path: the next-day-expiry overnight hold for strong losers
+    can't be reconstructed here, so a held remainder is valued at the day's EOD close.)"""
+    stop, held, proc, e1done = None, 1.0, 0.0, False   # no stop active until e1 fills
     for (t, h, l, c) in opath[1:]:
-        if held > 0 and l <= stop:
+        if held > 0 and stop is not None and l <= stop:
             proc += held * stop; held = 0.0; break
         u = ubymin.get(t.replace(second=0, microsecond=0))
         if u:
             uh, ul = u
             def hit(x): return x is not None and ((uh >= x) if styp == 'BULLISH' else (ul <= x))
             if not e1done and hit(e1):
-                proc += 0.5 * c; held -= 0.5; e1done = True; stop = entry
+                proc += 0.5 * c; held -= 0.5; e1done = True; stop = entry   # breakeven after e1
             if e1done and held > 0 and hit(e2):
                 proc += held * c; held = 0.0; break
     if held > 0:
@@ -51,13 +55,16 @@ def _current_rule(styp, entry, opath, ubymin, e1, e2):
     return (proc - entry) / entry * 100
 
 
-def _ladder(entry, opath, legs, stop_pct=0.50, trail_arm=None, trail_pct=None):
+def _ladder(entry, opath, legs, stop_pct=None, trail_arm=None, trail_pct=None):
     """Scale out at option-price take-profit legs [(gain_pct, qty_frac)]; remainder trails
-    (if set) or rides to EOD; -50% hard stop on whatever is still held."""
-    stop, held, proc, peak = entry * (1 - stop_pct), 1.0, 0.0, entry
+    (if set) or rides to EOD. No initial premium stop by default (stop_pct=None) — aligned
+    with the live rule, which dropped the -50% stop; an optional hard stop is honored if a
+    caller passes stop_pct, and the trailing stop still arms after trail_arm is reached."""
+    stop = entry * (1 - stop_pct) if stop_pct else None
+    held, proc, peak = 1.0, 0.0, entry
     legs = sorted(legs); li = 0
     for (t, h, l, c) in opath[1:]:
-        if held > 0 and l <= stop:
+        if held > 0 and stop is not None and l <= stop:
             proc += held * stop; held = 0.0; break
         while li < len(legs) and held > 0 and h >= entry * (1 + legs[li][0]):
             q = min(legs[li][1], held); proc += q * entry * (1 + legs[li][0]); held -= q; li += 1
@@ -77,7 +84,7 @@ def _suggest(entry, opath):
     mfe_pct = mfe * 100
     if mfe < 0.10:
         action = 'NO_RUNNER'
-        pnl = _ladder(entry, opath, [(0.15, 1.0)])      # scalp ~+15% if reached, else stop/EOD
+        pnl = _ladder(entry, opath, [(0.15, 1.0)])      # scalp ~+15% if reached, else ride to EOD
         text = (f"Peak only +{mfe_pct:.0f}% - not enough thrust to manage; scalp small or "
                 f"tighten entry. Consider exiting full near +15%.")
     elif mfe < 0.30:

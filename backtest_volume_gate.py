@@ -48,10 +48,10 @@ def simulate(styp, opt_after, und_by_min, e1, e2):
     if len(opt_after) < 2: return None
     entry = float(opt_after[0][1])
     if entry <= 0: return None
-    stop, held, proceeds, e1done = 0.5 * entry, 1.0, 0.0, False
+    stop, held, proceeds, e1done = None, 1.0, 0.0, False   # no initial stop (-50% stop removed)
     for (t, c, lo, v) in opt_after[1:]:
         c, lo = float(c), float(lo)
-        if held > 0 and lo <= stop:
+        if held > 0 and stop is not None and lo <= stop:    # breakeven stop, armed after e1
             proceeds += held * stop; held = 0.0; break
         u = und_by_min.get(t.replace(second=0, microsecond=0))
         if u:
