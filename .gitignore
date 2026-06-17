@@ -26,3 +26,9 @@ startup.log
 # IDE
 .vscode/
 .idea/
+
+# Generated docs
+*.docx
+
+# Claude Code tooling
+.claude/
