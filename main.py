@@ -26,12 +26,14 @@ from typing import Optional
 import config
 import db.ops as db
 import single_instance
-from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
+from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot, compute_secondary_watchlist
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector, compute_exit_targets
 from analysis.daily_review import analyze_daily_signals
+from analysis.nightly_pipeline import run_nightly_pipeline
 from analysis.flow_reversal import FlowReversalEngine, volume_event
+from analysis.volume_analytics import compute_leadership_scores
 from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
@@ -93,7 +95,8 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
     today = today_cst()
     logger.info("═══ MORNING SNAPSHOT START (%s) ═══", now.strftime('%Y-%m-%d %H:%M CST'))
 
-    sentiments: list[dict] = []
+    sentiments:    list[dict] = []
+    all_oi_buildup: list[dict] = []   # top OI_BUILDUP rows across all symbols → briefing
 
     for symbol in config.SYMBOLS:
         try:
@@ -144,8 +147,34 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
                 contracts=chain['all'],
                 underlying_price=pm_price,
             )
+            # Phase 0: compute oi_change vs prior session for every contract (§17)
+            try:
+                db.reconcile_oi_changes(symbol, today)
+            except Exception:
+                logger.warning("%s: OI change reconciliation failed", symbol, exc_info=True)
+
+            # §37 Next-day intent reconciliation: update prior-day oi_events with the
+            # overnight OI change now visible in today's option_chain_snapshots.
+            try:
+                db.reconcile_prior_oi_events(symbol, today)
+            except Exception:
+                logger.warning("%s: OI event reconciliation failed", symbol, exc_info=True)
+
             db.save_oi_levels(symbol, today, now, levels)
             db.save_morning_sentiment(symbol, today, sentiment['pc_ratio'], sentiment['bias'], now)
+
+            # §11-§16 Secondary OI Watchlist — extended ranks, outer wall, OI buildup.
+            # Runs after reconcile_oi_changes so OI_BUILDUP tier has overnight deltas.
+            try:
+                oi_changes = db.get_oi_changes_today(symbol, today)
+                secondary  = compute_secondary_watchlist(chain, pm_price, oi_changes)
+                db.save_secondary_oi_levels(symbol, today, now, secondary)
+                for row in secondary:
+                    if (row['watchlist_tier'] == 'OI_BUILDUP'
+                            and (row.get('oi_change') or 0) > 0):
+                        all_oi_buildup.append({'symbol': symbol, **row})
+            except Exception:
+                logger.warning("%s: secondary OI watchlist failed", symbol, exc_info=True)
 
             # ── Log to Google Sheets ──
             sheets.log_daily_levels(symbol, levels, pm_price, now)
@@ -193,7 +222,8 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
         }
         for s in sentiments
     ]
-    discord_briefing(discord_results, now)
+    top_buildup = sorted(all_oi_buildup, key=lambda x: x.get('oi_change') or 0, reverse=True)[:5]
+    discord_briefing(discord_results, now, oi_buildup=top_buildup)
 
     # Retention: keep only the most recent N trading days of 1-min bar data.
     # Runs once per trading day here; alerts/signals are never pruned.
@@ -358,10 +388,11 @@ def intraday_check(
             except Exception:
                 logger.warning("%s: option quote fetch failed, proceeding without", symbol)
 
-            # Per-minute 1-min OHLCV for the 6 S/R level option contracts
+            # Per-minute 1-min OHLCV + Greeks for the 6 S/R level option contracts
             if data_src and config.COLLECT_LEVEL_BARS and expiry:
                 try:
-                    _collect_level_bars(symbol, levels, expiry, today, data_src)
+                    _collect_level_bars(symbol, levels, expiry, today, data_src,
+                                        option_quotes=option_quotes)
                 except Exception:
                     logger.warning("%s: level option-bar collection failed", symbol, exc_info=True)
 
@@ -375,7 +406,16 @@ def intraday_check(
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
-                                     fired_today_fn=db.get_fired_directions_today)
+                                     fired_today_fn=db.get_fired_directions_today,
+                                     prev_range_fn=(db.get_option_prev_range
+                                                    if config.HIST_LOW_ENTRY_GATE else None))
+
+            # §73 — persist every candidate evaluation (blocked + passed), not just alerts.
+            if detector.last_candidates:
+                try:
+                    db.save_signal_candidates(detector.last_candidates, bars[-1]['bar_time'], today)
+                except Exception:
+                    logger.warning("%s: candidate logging failed", symbol, exc_info=True)
 
             for sig in signals:
                 sig_id = db.save_signal(sig)
@@ -388,6 +428,21 @@ def intraday_check(
                         and sig.get('confidence') != 'WATCH'
                         and not sig.get('upgrade')):
                     _execute_trade(sig, sig_id, alpaca, sheets)
+
+            # §41 Per-minute call/put leadership scores (stored for all symbols every poll).
+            # Uses the same scoring formula as the Flow Reversal Engine so both series
+            # are comparable when analysing which side dominated before an alert fired.
+            if option_quotes:
+                try:
+                    scores = compute_leadership_scores(
+                        symbol, option_quotes, detector._opt_vol_hist,
+                        low_dist_fn=detector._contract_low_dist,
+                    )
+                    if scores:
+                        db.save_volume_leadership(symbol, bars[-1]['bar_time'],
+                                                  today, underlying_price, scores)
+                except Exception:
+                    logger.warning("%s: volume leadership scoring failed", symbol, exc_info=True)
 
             # Exit monitoring — check R1/R2 or S1/S2 targets for open trades
             if alpaca and config.ALPACA_ENABLED:
@@ -406,36 +461,73 @@ def intraday_check(
             logger.exception("Intraday check failed for %s", symbol)
 
 
-def _collect_level_bars(symbol, levels, expiry, level_date, data_src) -> None:
+def _collect_level_bars(symbol, levels, expiry, level_date, data_src,
+                        option_quotes: dict = None) -> None:
     """
-    Pull and persist 1-min OHLCV for each S/R level's option contract.
+    Pull and persist 1-min OHLCV + Greeks for each S/R level's option contract.
 
-    Fetches the full session per contract (self-backfilling across polls) and
-    upserts into option_level_bars. All 6 levels share the nearest expiry, which
-    the morning snapshot anchored them to.
+    Greeks (delta/gamma/vega/theta/rho/IV) are sourced from option_quotes (Alpaca
+    OPRA snapshots, which include greeks + impliedVolatility) and attached to the
+    forming (most recent) bar only.  Historical bars are re-upserted with NULL Greeks;
+    the COALESCE logic in save_option_level_bars preserves any previously stored
+    Greek values so they are never overwritten with NULL.
+
+    cum_option_volume is the running session volume total for the contract,
+    recomputed across all bars each poll so completed bars self-correct.
     """
+    # Build a Greeks lookup from option_quotes keyed by (strike, option_type).
+    # option_quotes covers the nearest n strikes to spot; farther S/R levels
+    # get NULL Greeks until spot moves within range.
+    greeks_by_contract: dict = {}
+    if option_quotes:
+        for (strike, opt_type), q in option_quotes.items():
+            greeks_by_contract[(strike, opt_type)] = {
+                'implied_vol': q.get('implied_vol'),
+                'delta':       q.get('delta'),
+                'gamma':       q.get('gamma'),
+                'vega':        q.get('vega'),
+                'theta':       q.get('theta'),
+                'rho':         q.get('rho'),
+            }
+
     rows: list[dict] = []
     for lv in levels:
         strike      = float(lv['strike'])
         option_type = lv['option_type']
         occ         = occ_symbol(symbol, expiry, strike, option_type)
         obars       = data_src.get_option_bars(occ, count=config.SESSION_BARS)
-        for b in obars:
+        if not obars:
+            continue
+
+        current_greeks = greeks_by_contract.get((strike, option_type), {})
+        cum = 0
+        for i, b in enumerate(obars):
+            cum += b['volume']
+            # Greeks snapshot is only available for the forming (last) bar;
+            # historical bars keep whatever was stored during their forming minute.
+            g = current_greeks if i == len(obars) - 1 else {}
             rows.append({
-                'symbol':      symbol,
-                'level_date':  level_date,
-                'level_type':  lv['level_type'],
-                'rank':        lv['rank'],
-                'strike':      strike,
-                'option_type': option_type,
-                'expiry':      expiry,
-                'occ_symbol':  occ,
-                'bar_time':    b['bar_time'],
-                'open':        b['open'],
-                'high':        b['high'],
-                'low':         b['low'],
-                'close':       b['close'],
-                'volume':      b['volume'],
+                'symbol':            symbol,
+                'level_date':        level_date,
+                'level_type':        lv['level_type'],
+                'rank':              lv['rank'],
+                'strike':            strike,
+                'option_type':       option_type,
+                'expiry':            expiry,
+                'occ_symbol':        occ,
+                'bar_time':          b['bar_time'],
+                'open':              b['open'],
+                'high':              b['high'],
+                'low':               b['low'],
+                'close':             b['close'],
+                'volume':            b['volume'],
+                'cum_option_volume': cum,
+                'implied_vol':       g.get('implied_vol'),
+                'delta':             g.get('delta'),
+                'gamma':             g.get('gamma'),
+                'vega':              g.get('vega'),
+                'theta':             g.get('theta'),
+                'rho':               g.get('rho'),
             })
 
     db.save_option_level_bars(rows)
@@ -1156,14 +1248,17 @@ def main() -> None:
                 eod_liquidate(alpaca, now, sheets)
                 eod_done = now.date()
 
-            # Daily signal review — 15:00 CST (right after close), once per day.
-            # Analyzes every signal today and stores a suggested management outcome
-            # (take-profit + stop move) per signal in the signal_analysis table.
+            # Daily signal review + nightly Claude pipeline — once per day after close.
+            # analyze_daily_signals must complete first; the pipeline reads its output.
             if review_done != now.date() and is_post_close(now):
                 try:
                     analyze_daily_signals(now.date(), data_src=adata, sheets=sheets)
                 except Exception:
                     logger.warning("Daily signal review failed", exc_info=True)
+                try:
+                    run_nightly_pipeline(now.date())
+                except Exception:
+                    logger.warning("Nightly research pipeline failed", exc_info=True)
                 review_done = now.date()
 
         except Exception:
