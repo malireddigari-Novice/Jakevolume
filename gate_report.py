@@ -103,6 +103,17 @@ def build_gate_report(session_date) -> str:
             f"        ratio={ratio}  EventShare={share}  notional=${(notional or 0):,.0f}  "
             f"ContractLowDist={lowd}  Gold={bool(gold)}"
         )
+
+    # ── §16-17 control regression (so a red control surfaces in the nightly log) ──
+    try:
+        from gate_controls import controls_report
+        ctext, cfail = controls_report()
+        if cfail:
+            out.insert(0, f"🚨 {cfail} GATE CONTROL FAILURE(S) — gate change broke a "
+                          f"positive/negative control (see regression below)")
+        out += ["", ctext]
+    except Exception as exc:
+        out += ["", f"(gate control regression unavailable: {exc})"]
     return "\n".join(out)
 
 

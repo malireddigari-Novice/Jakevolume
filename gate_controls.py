@@ -99,19 +99,17 @@ def seed_controls() -> None:
     print("Seeded gate controls (idempotent).")
 
 
-def run_controls() -> int:
-    """Re-run the canonical gate on every control; return the number of FAILURES."""
+def controls_report() -> tuple:
+    """Re-run the canonical gate on every control; return (report_text, failure_count)."""
     conn = _conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM gate_controls ORDER BY control_type DESC, control_label")
         controls = cur.fetchall()
     conn.close()
     if not controls:
-        print("No controls seeded — run:  python gate_controls.py --seed")
-        return 0
+        return ("No gate controls seeded — run:  python gate_controls.py --seed", 0)
 
-    print(f"GATE CONTROL REGRESSION — {len(controls)} controls")
-    print("=" * 92)
+    lines = [f"GATE CONTROL REGRESSION — {len(controls)} controls", "=" * 92]
     failures = 0
     for c in controls:
         vols = [int(v) for v in c['vols']]
@@ -125,18 +123,25 @@ def run_controls() -> int:
             ok = False
         if c['expected_pass'] and c.get('expected_path') and ev['path'] != c['expected_path']:
             ok = False
-        tag = "PASS" if ok else "**FAIL**"
         if not ok:
             failures += 1
+        tag = "PASS" if ok else "**FAIL**"
         want = (f"pass(path {c['expected_path']}{'/gold' if c['expected_gold'] else ''})"
                 if c['expected_pass'] else "block")
         got = (f"valid path={ev['path']} gold={ev['gold_standard']}" if ev['valid']
                else f"blocked {ev['block_reason']}")
-        print(f"  [{tag}] {c['control_type']:8} {c['control_label']:32} {c['symbol']:5} "
-              f"want={want:22} got={got}")
-    print("-" * 92)
-    print(f"  {len(controls) - failures}/{len(controls)} controls OK"
-          + (f"  — {failures} FAILURE(S)" if failures else "  — all green"))
+        lines.append(f"  [{tag}] {c['control_type']:8} {c['control_label']:32} {c['symbol']:5} "
+                     f"want={want:22} got={got}")
+    lines.append("-" * 92)
+    lines.append(f"  {len(controls) - failures}/{len(controls)} controls OK"
+                 + (f"  — {failures} FAILURE(S)" if failures else "  — all green"))
+    return ("\n".join(lines), failures)
+
+
+def run_controls() -> int:
+    """CLI wrapper — print the control report, return the failure count."""
+    text, failures = controls_report()
+    print(text)
     return failures
 
 
