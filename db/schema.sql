@@ -788,3 +788,43 @@ CREATE TABLE IF NOT EXISTS research_change_points (
     created_at                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_cp_date ON research_change_points (symbol, session_date);
+
+-- ── §16-17 Gate control library — regression safety net ───────────────────────
+-- Known-good (POSITIVE) and spam-like (NEGATIVE) volume events. Every gate change
+-- is re-run against these: positive controls MUST still pass, negative MUST block.
+CREATE TABLE IF NOT EXISTS gate_controls (
+    id               BIGSERIAL PRIMARY KEY,
+    control_type     VARCHAR(8)  NOT NULL,         -- POSITIVE / NEGATIVE
+    control_label    VARCHAR(48) NOT NULL,         -- GOLD_STANDARD_LEVEL_REJECTION / SPAM_* / ...
+    symbol           VARCHAR(10) NOT NULL,
+    strike           NUMERIC(12,4),
+    option_type      VARCHAR(4),
+    alert_time       TIMESTAMPTZ,
+    spot             NUMERIC(12,4),
+    level_label      VARCHAR(4),
+    level_price      NUMERIC(12,4),
+    entry_price      NUMERIC(12,4),                -- option mark
+    vols             JSONB NOT NULL,               -- per-minute volume deltas (oldest→newest)
+    observed_vol     BIGINT,
+    completed_vol    BIGINT,
+    ratio            NUMERIC(10,2),
+    event_share      NUMERIC(6,3),
+    premium_notional NUMERIC(16,2),
+    low_dist         NUMERIC(8,4),
+    is_atm           BOOLEAN DEFAULT TRUE,
+    next_day_mode    BOOLEAN DEFAULT FALSE,
+    expected_pass    BOOLEAN NOT NULL,             -- POSITIVE→true / NEGATIVE→false
+    expected_path    VARCHAR(2),
+    expected_gold    BOOLEAN,
+    target1          NUMERIC(12,4),
+    target2          NUMERIC(12,4),
+    target1_reached  BOOLEAN,
+    target2_reached  BOOLEAN,
+    bid_mfe_pct      NUMERIC(10,2),
+    bid_mae_pct      NUMERIC(10,2),
+    time_to_mfe_min  INTEGER,
+    notes            TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (control_label, symbol, strike, alert_time)
+);
+CREATE INDEX IF NOT EXISTS idx_gate_controls_type ON gate_controls (control_type);

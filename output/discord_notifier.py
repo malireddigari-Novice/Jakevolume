@@ -109,33 +109,47 @@ def send_signal(sig: dict) -> None:
 
     spot      = sig.get('trigger_price')
     label     = sig.get('level_label', '')
-    # Trigger volume/ratio from the VolumeStickoutScore (the actual trigger),
-    # falling back to the legacy 1-min fields if absent.
+    # §13 — the production gate's trigger: prefer the completed 1-min bar, show the
+    # observed partial when it differed, and the trigger shape (1-min vs multi-min).
     tv_type   = sig.get('trigger_volume_type')
     trig_vol  = sig.get('trigger_volume')
     trig_ratio = sig.get('trigger_ratio')
     if trig_vol is None:
         trig_vol, trig_ratio, tv_type = sig.get('atm_vol_1m'), sig.get('atm_spike_ratio'), 'SINGLE_BAR'
-    vol_label = "Volume 5m" if tv_type == 'FIVE_BAR_WINDOW' else "Volume"
-    ratio_label = "Ratio 5m" if tv_type == 'FIVE_BAR_WINDOW' else "Ratio"
-    low_dist  = sig.get('low_dist')
+    trig_type_label = ("1-Minute Print" if tv_type == 'SINGLE_BAR'
+                       else "Multi-Minute Window" if tv_type == 'MULTI_MIN_WINDOW'
+                       else "Volume")
+    observed   = sig.get('observed_vol')
+    bar_status = sig.get('bar_status')
+    peak1m     = sig.get('peak_1m')
+    vol3m      = sig.get('vol3m_window') or sig.get('vol_3m_window')
+    low_dist   = sig.get('low_dist')
+    gold       = sig.get('gold_standard')
 
     sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
     head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
-    lines = [f"{arrow} **{head}**"]
+    lines = [f"{arrow} **{head}**" + ("  ⭐" if gold else "")]
     if spot is not None:
         lines.append(f"Spot: {spot:.2f}")
     lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())
     if expiry_s:
         lines.append(f"Expiry: {expiry_s}")
     if trig_vol is not None:
-        lines.append(f"{vol_label}: {int(trig_vol):,}")
+        lines.append(f"Trigger: {trig_type_label}")
+        bar_tag = f" ({bar_status.lower()})" if bar_status else ""
+        lines.append(f"Trigger Volume: {int(trig_vol):,}{bar_tag}")
+        if observed is not None and int(observed) != int(trig_vol):
+            lines.append(f"Observed at Alert: {int(observed):,}")
+        if peak1m is not None and int(peak1m) != int(trig_vol):
+            lines.append(f"Peak 1m Volume: {int(peak1m):,}")
+        if vol3m:
+            lines.append(f"3m Volume: {int(vol3m):,}")
     if trig_ratio:
-        lines.append(f"{ratio_label}: {trig_ratio:.1f}x")
+        lines.append(f"Ratio: {trig_ratio:.1f}x")
     if low_dist is not None:
-        lines.append(f"ContractLowDistance: {low_dist:.2f}")
+        lines.append(f"Contract Low Distance: {low_dist:.2f}")
 
     # Shifted exit targets (skip the too-close nearest level).
     exit1 = sig.get('exit1_price')

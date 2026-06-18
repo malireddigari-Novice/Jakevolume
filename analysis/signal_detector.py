@@ -1055,10 +1055,20 @@ class SignalDetector:
             'atm_vol_1m':       atm_delta,
             'atm_spike_ratio':  atm.get('spike_ratio', 0.0),
             'atm_vol_3m':       atm.get('vol', 0),
-            # Volume trigger (what Discord shows: single-bar vs 5-bar window)
+            # Volume trigger (what Discord shows: single-bar vs multi-min window)
             'trigger_volume_type': atm.get('trigger_type'),
             'trigger_volume':      atm.get('trigger_volume'),
             'trigger_ratio':       atm.get('trigger_ratio'),
+            # §13 production-gate display fields
+            'gate_path':        atm.get('path'),
+            'gold_standard':    bool(atm.get('gold_standard')),
+            'observed_vol':     atm.get('observed_vol'),
+            'completed_vol':    atm.get('completed_vol'),
+            'bar_status':       atm.get('bar_status'),
+            'peak_1m':          atm.get('peak_1m'),
+            'vol_3m_window':    atm.get('vol_3m'),
+            'event_share':      atm.get('event_share'),
+            'premium_notional': atm.get('premium_notional'),
             'itm_vol_1m':       itm_delta,
             'itm_spike_ratio':  itm.get('spike_ratio', 0.0),
             'itm_vol_3m':       itm.get('vol', 0),
