@@ -1283,6 +1283,12 @@ def main() -> None:
                 except Exception:
                     logger.warning("Daily signal review failed", exc_info=True)
                 try:
+                    from gate_report import build_gate_report
+                    logger.info("Production volume-gate report:\n%s",
+                                build_gate_report(now.date()))
+                except Exception:
+                    logger.warning("Gate report failed", exc_info=True)
+                try:
                     run_nightly_pipeline(now.date())
                 except Exception:
                     logger.warning("Nightly research pipeline failed", exc_info=True)

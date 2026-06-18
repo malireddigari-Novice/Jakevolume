@@ -522,6 +522,7 @@ def save_signal_candidates(rows: list, ts, session_date) -> None:
         r['already_alerted'], r['alert_fired'], r['signal_type'], r['blocked_reason'],
         r.get('hv_pctile'), r['atm_vol_1m'], r['win_vol'], r['active_bars'],
         r.get('gate_path'), r.get('gold_standard'), r.get('pending'),
+        r.get('trigger_volume'), r.get('trigger_ratio'),
         r.get('premium_notional'), r.get('peak_1m'), r.get('vol_3m'), r.get('vol_5m'),
         r.get('event_share'), r.get('persistent_bg'), r.get('bar_status'),
         r.get('observed_vol'), r.get('completed_vol'), r.get('classification'),
@@ -532,7 +533,8 @@ def save_signal_candidates(rows: list, ts, session_date) -> None:
              near_level, contract_low_distance, contract_near_low, valid_volume_event,
              already_alerted, alert_fired, signal_type, blocked_reason, hv_pctile,
              atm_vol_1m, win_vol, active_bars,
-             gate_path, gold_standard, pending, premium_notional, peak_1m, vol_3m, vol_5m,
+             gate_path, gold_standard, pending, trigger_volume, trigger_ratio,
+             premium_notional, peak_1m, vol_3m, vol_5m,
              event_share, persistent_bg, bar_status, observed_vol, completed_vol, classification)
         VALUES %s
     """

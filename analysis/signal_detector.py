@@ -945,6 +945,8 @@ class SignalDetector:
             'gate_path':        a.get('path'),
             'gold_standard':    bool(a.get('gold_standard')),
             'pending':          bool(a.get('pending')),
+            'trigger_volume':   a.get('trigger_volume'),
+            'trigger_ratio':    a.get('trigger_ratio'),
             'premium_notional': a.get('premium_notional'),
             'peak_1m':          a.get('peak_1m'),
             'vol_3m':           a.get('vol_3m'),

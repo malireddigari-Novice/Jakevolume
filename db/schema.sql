@@ -689,6 +689,8 @@ CREATE TABLE IF NOT EXISTS signal_candidates (
     gate_path             VARCHAR(2),               -- A (dominant) / B (contextual) / NULL
     gold_standard         BOOLEAN,
     pending               BOOLEAN,                  -- PENDING_VOLUME_CONFIRMATION
+    trigger_volume        BIGINT,                   -- volume of the qualifying shape (used)
+    trigger_ratio         NUMERIC(10,2),
     premium_notional      NUMERIC(16,2),            -- trigger_vol × mark × 100
     peak_1m               BIGINT,
     vol_3m                BIGINT,
@@ -705,6 +707,8 @@ CREATE TABLE IF NOT EXISTS signal_candidates (
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS gate_path        VARCHAR(2);
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS gold_standard    BOOLEAN;
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS pending          BOOLEAN;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS trigger_volume   BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS trigger_ratio    NUMERIC(10,2);
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS premium_notional NUMERIC(16,2);
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS peak_1m          BIGINT;
 ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS vol_3m           BIGINT;
