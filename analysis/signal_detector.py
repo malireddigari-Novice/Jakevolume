@@ -37,6 +37,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config
+from analysis.flow_reversal import volume_event
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -267,6 +268,11 @@ class SignalDetector:
         # Fallback when no live multi-day history exists (Schwab serves no option
         # price-history): the contract's previous-session (low, high) from the DB.
         self._prev_range_fn = None
+        # §7-8 completed 1-min bar volume provider + per-contract/minute cache,
+        # plus the pending-volume-confirmation set (near-miss partial-bar candidates).
+        self._completed_bar_fn = None
+        self._completed_bar_cache: dict = {}
+        self._pending_candidates: dict = {}
         # §14 prior major volume events per contract key → [(volume, price), …].
         self._major_events: dict[str, list[tuple[int, float]]] = defaultdict(list)
         self._history_date: Optional[date] = None
@@ -288,6 +294,7 @@ class SignalDetector:
         hist_range_fn=None,
         fired_today_fn=None,
         prev_range_fn=None,
+        completed_bar_fn=None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -312,6 +319,7 @@ class SignalDetector:
         bar_time    = current['bar_time']
         self._hist_range_fn = hist_range_fn
         self._prev_range_fn = prev_range_fn
+        self._completed_bar_fn = completed_bar_fn
 
         # Keep 1DTE expiry handling (target-strike pricing); roles stay frozen.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -327,6 +335,8 @@ class SignalDetector:
             self._opt_last_bar    = {}
             self._opt_hist_range  = {}
             self._major_events    = defaultdict(list)
+            self._completed_bar_cache = {}
+            self._pending_candidates  = {}
 
         # Durable dedup: fold in directions already fired today (DB).
         if fired_today_fn is not None:
@@ -420,22 +430,29 @@ class SignalDetector:
             atm_delta = vol_deltas.get(atm_key, 0)
             atm_okey: _OptKey = (symbol, atm_key[0], confirm_type)
             atm_low   = self._contract_low_dist(atm_okey, atm_data)
+            atm_completed = self._completed_bar(symbol, atm_key[0], confirm_type, expiry,
+                                                atm_delta, bar_time)
             atm = self._eval_volume(symbol, list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
                                     min_single_vol, min_cluster_vol, cluster_ratio_min,
-                                    excitation_min)
+                                    excitation_min, mark=atm_data.get('mark'), is_atm=True,
+                                    next_day_mode=next_day_mode, completed_vol=atm_completed)
 
             if itm_key:
                 itm_data  = opt_data_map[itm_key]
                 itm_delta = vol_deltas.get(itm_key, 0)
                 itm_okey: _OptKey = (symbol, itm_key[0], confirm_type)
                 itm_low   = self._contract_low_dist(itm_okey, itm_data)
+                itm_completed = self._completed_bar(symbol, itm_key[0], confirm_type, expiry,
+                                                    itm_delta, bar_time)
                 itm = self._eval_volume(symbol, list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
                                         min_single_vol, min_cluster_vol, cluster_ratio_min,
-                                        excitation_min)
+                                        excitation_min, mark=itm_data.get('mark'), is_atm=False,
+                                        next_day_mode=next_day_mode, completed_vol=itm_completed)
             else:
                 itm_data, itm_delta, itm_low = {}, 0, None
                 itm = self._eval_volume(symbol, [], 0, None, min_single_vol, min_cluster_vol,
-                                        cluster_ratio_min, excitation_min)
+                                        cluster_ratio_min, excitation_min,
+                                        next_day_mode=next_day_mode)
 
             valid_volume = atm['valid'] or itm['valid']
 
@@ -548,15 +565,29 @@ class SignalDetector:
         min_cluster_vol: int,
         cluster_ratio_min: float,
         excitation_min: float,
+        *,
+        mark: Optional[float] = None,
+        is_atm: bool = False,
+        next_day_mode: bool = False,
+        completed_vol: Optional[int] = None,
     ) -> dict:
         """
-        ValidVolumeSignal = SingleBarValid OR ClusterValid OR StairStepValid, with the
-        explicit thresholds from the entry-volume spec. Real abnormal volume is the
-        trigger; contract-low is only a qualifier. Volume that does not visually stand
-        out → not valid (no alert).
+        PRODUCTION VOLUME GATE (two-path) — absolute volume is the binding
+        requirement; a high ratio is NEVER sufficient on its own.
+
+          Path A DOMINANT ABSOLUTE      — a very large event qualifies on size +
+                                          concentration + near-low + notional.
+          Path B CONTEXTUAL CONVICTION  — moderate size qualifies only with extreme
+                                          ratio + concentrated event + near contract
+                                          low + meaningful premium notional (the
+                                          caller has already enforced primary-level
+                                          proximity, correct side, and ATM/1-ITM).
 
         `history` is per-minute volume deltas oldest→newest, current bar (`delta`) last.
-        `excitation_min` carries the opening-range tightening for the stair-step rule.
+        `completed_vol` (§7-8) is the closed 1-min bar volume when available; it is
+        preferred over the live poll-delta as the trigger. The legacy single/cluster/
+        stair booleans are kept for shape labels + logging only — they no longer decide
+        `valid` (§14: no alternate ratio-led path).
         """
         volatile  = symbol in config.VOLATILE_SYMBOLS
         vol_floor = 250 if volatile else 100      # single-bar current-volume floor
@@ -585,66 +616,136 @@ class SignalDetector:
         clu        = _cluster_metrics(history)
         excitation = _excitation(clu['window'], clu['base_unit'])
 
-        # ── Absolute volume liquidity floor (the binding gate) ────────────────
-        # Volume is gated on ABSOLUTE size, not a ratio: a single bar OR a short
-        # rolling 2-min window must clear the floor. Sits under the building
-        # pattern below — no extreme-outlier/standout gating (anti-predictive).
-        win_abs      = sum(history[-config.OPT_ABS_VOL_WINDOW_BARS:])
-        liquidity_ok = (delta >= config.OPT_MIN_ABS_VOL_SINGLE
-                        or win_abs >= config.OPT_MIN_ABS_VOL_WINDOW)
-
-        near_175 = (low_dist is None or low_dist <= 1.75)
-        near_200 = (low_dist is None or low_dist <= 2.00)
-
-        # ── The three valid-volume rules (the sustained "building" pattern) ───
-        single_valid = (delta >= vol_floor and vol_ratio >= 8.0
-                        and delta >= 0.75 * max20 and near_175)
-        cluster_valid = (win5 >= win_floor and win_ratio5 >= 3.0 and active5 >= 3
-                        and cluster_dom >= 0.75 and near_175)
-        stair_valid = (win5 >= win_floor and active5 >= 3 and excitation >= excitation_min
-                       and win_ratio5 >= 2.5 and near_200)
-        # Liquidity floor is required FIRST — building pattern alone isn't enough.
-        valid = liquidity_ok and (single_valid or cluster_valid or stair_valid)
-
-        # ── Trigger fields (Discord shows the actual trigger, not raw 1-min) ──
-        if single_valid:
-            trig_type, trig_vol, trig_ratio = 'SINGLE_BAR', delta, vol_ratio
-        elif cluster_valid or stair_valid:
-            trig_type, trig_vol, trig_ratio = 'FIVE_BAR_WINDOW', win5, win_ratio5
+        # ════════════════════════════════════════════════════════════════════
+        # PRODUCTION TWO-PATH GATE (§1-6,10-12,14,19)
+        # ════════════════════════════════════════════════════════════════════
+        # §7-8 partial vs completed bar: prefer the closed 1-min bar volume as the
+        # trigger when it is larger (e.g. 456 observed → 508 completed).
+        observed_vol = int(delta)
+        peak1m = int(delta)
+        if completed_vol is not None:
+            bar_status = 'REVISED' if completed_vol != observed_vol else 'COMPLETED'
+            peak1m = max(peak1m, int(completed_vol))
         else:
-            trig_type, trig_vol, trig_ratio = 'SINGLE_BAR', delta, vol_ratio
+            bar_status = 'PARTIAL'
 
-        # ── Granular blocked reason ───────────────────────────────────────────
+        vol3m = sum(history[-3:-1]) + peak1m          # last 3 min, current bar = peak1m
+        vol5m = sum(history[-5:-1]) + peak1m
+
+        # Concentration + background quality (reuse the reversal event metrics).
+        ev = volume_event(history)
+        event_share   = ev['share'] if ev else round(peak1m / max(vol5m, 1), 3)
+        persistent_bg = bool(ev['persistent_bg']) if ev else False
+
+        single_ratio = round(peak1m / baseline, 2)
+        window_ratio = round(clu['ratio'], 2)         # WindowRatio5
+
+        def _grp(d):
+            return d.get(symbol, d['default'])
+        notional_min = (config.MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY if next_day_mode
+                        else config.MINIMUM_PREMIUM_NOTIONAL_0DTE)
+
+        # Qualifying shape for the Path-B base floors + its event-share requirement.
+        if peak1m >= config.SINGLE_PRINT_BASE_FLOOR:
+            shape, trig_vol, share_min = 'SINGLE_BAR', peak1m, config.SINGLE_PRINT_EVENT_SHARE_MIN
+        elif vol3m >= config.THREE_MINUTE_BASE_FLOOR:
+            shape, trig_vol, share_min = 'THREE_MIN', vol3m, config.THREE_MINUTE_EVENT_SHARE_MIN
+        elif vol5m >= config.FIVE_MINUTE_BASE_FLOOR:
+            shape, trig_vol, share_min = 'FIVE_MIN', vol5m, config.FIVE_MINUTE_EVENT_SHARE_MIN
+        else:
+            shape, trig_vol, share_min = 'SINGLE_BAR', peak1m, config.SINGLE_PRINT_EVENT_SHARE_MIN
+        base_vol_ok = (peak1m >= config.SINGLE_PRINT_BASE_FLOOR
+                       or vol3m >= config.THREE_MINUTE_BASE_FLOOR
+                       or vol5m >= config.FIVE_MINUTE_BASE_FLOOR)
+
+        premium_notional = round(trig_vol * (mark or 0.0) * 100.0)
+        notional_ok  = premium_notional >= notional_min
+        near_low_ctx = (low_dist is None or low_dist <= config.CONTEXTUAL_LOW_DIST_MAX)   # ≤1.50
+        near_low_dom = (low_dist is None or low_dist <= config.NEAR_LOW_MAX_DIST)         # ≤1.75
+
+        # ── Path A — Dominant absolute volume (§3) ────────────────────────────
+        dom_vol_ok = (peak1m >= _grp(config.DOMINANT_SINGLE_PRINT)
+                      or vol3m >= _grp(config.DOMINANT_3M)
+                      or vol5m >= _grp(config.DOMINANT_5M))
+        path_a = (config.TRUE_CONVICTION_GATE_ENABLED and dom_vol_ok
+                  and event_share >= config.DOMINANT_EVENT_SHARE_MIN
+                  and not persistent_bg and near_low_dom and notional_ok)
+
+        # ── Path B — Contextual level conviction (§4) ─────────────────────────
+        # NearPrimaryLevel + correct side + ATM/1-ITM are enforced by the caller.
+        ratio_ok = (single_ratio >= config.CONTEXTUAL_SINGLE_PRINT_RATIO
+                    or window_ratio >= config.CONTEXTUAL_MULTI_BAR_RATIO)
+        path_b = (config.CONTEXTUAL_LEVEL_CONVICTION_ENABLED and base_vol_ok and ratio_ok
+                  and near_low_ctx and event_share >= share_min
+                  and not persistent_bg and notional_ok)
+
+        valid = bool(path_a or path_b)
+        path  = 'A' if path_a else ('B' if path_b else None)
+
+        # ── Gold-standard quality label (§5) ──────────────────────────────────
+        gold_standard = bool(
+            path_b and low_dist is not None and low_dist <= config.GOLD_STANDARD_LOW_DIST
+            and is_atm and single_ratio >= config.CONTEXTUAL_SINGLE_PRINT_RATIO)
+        classification = (['GOLD_STANDARD_ALERT', 'PRIMARY_LEVEL_CONVICTION',
+                           'ATM_LEVEL_MATCH', 'ENTRY_NEAR_CONTRACT_LOW']
+                          if gold_standard else [])
+
+        # ── §8 PENDING_VOLUME_CONFIRMATION — near-miss on a still-partial bar ──
+        # Within tolerance of the single-print floor AND the bar has not closed AND
+        # every other contextual condition already passes → hold, do not reject;
+        # the next poll (or the completed bar) re-evaluates.
+        ctx_ok = (ratio_ok and near_low_ctx and not persistent_bg
+                  and event_share >= config.SINGLE_PRINT_EVENT_SHARE_MIN
+                  and round(peak1m * (mark or 0.0) * 100.0) >= notional_min)
+        pending = bool(
+            not valid and not base_vol_ok and bar_status == 'PARTIAL'
+            and config.CONTEXTUAL_LEVEL_CONVICTION_ENABLED and ctx_ok
+            and peak1m >= (1.0 - config.PENDING_VOLUME_TOLERANCE_PCT) * config.SINGLE_PRINT_BASE_FLOOR)
+
+        # ── Block reason (§6 spam first, then the specific failing condition) ──
         if valid:
             block_reason = 'OK'
-        elif not liquidity_ok:
-            block_reason = 'BELOW_ABS_VOLUME_FLOOR'
-        elif delta < vol_floor and win5 < win_floor:
-            block_reason = 'LOW_ABSOLUTE_VOLUME'
-        elif win5 < win_floor:                         # only the single-bar path is viable
-            block_reason = ('LOW_RATIO' if vol_ratio < 8.0
-                            else 'LOW_VISUAL_DOMINANCE' if visual_dom < 0.75
-                            else 'LOW_WINDOW_VOLUME')
-        elif active5 < 3:
-            block_reason = 'NOT_ENOUGH_ACTIVE_BARS'
-        elif win_ratio5 < 2.5:
-            block_reason = 'LOW_RATIO'
-        elif cluster_dom < 0.75:
-            block_reason = 'LOW_VISUAL_DOMINANCE'
+        elif pending:
+            block_reason = 'PENDING_VOLUME_CONFIRMATION'
+        elif not base_vol_ok:
+            block_reason = 'INSUFFICIENT_CONVICTION_VOLUME'       # small vol + (any) ratio
+        elif persistent_bg:
+            block_reason = 'PERSISTENT_BACKGROUND_FLOW'
+        elif not notional_ok:
+            block_reason = 'LOW_PREMIUM_NOTIONAL'
+        elif not near_low_ctx:
+            block_reason = 'CONTRACT_NOT_NEAR_LOW'
+        elif event_share < share_min:
+            block_reason = 'LOW_EVENT_SHARE'
+        elif not ratio_ok:
+            block_reason = 'LOW_RELATIVE_VOLUME'
         else:
-            block_reason = 'LOW_WINDOW_VOLUME'
+            block_reason = 'NO_CONVICTION_PATH'
+
+        trig_type  = 'SINGLE_BAR' if shape == 'SINGLE_BAR' else 'MULTI_MIN_WINDOW'
+        trig_ratio = single_ratio if shape == 'SINGLE_BAR' else window_ratio
+
+        # Legacy shape booleans (labels/logging only — not an alert path).
+        single_valid  = peak1m >= config.SINGLE_PRINT_BASE_FLOOR and single_ratio >= 8.0
+        cluster_valid = vol5m >= config.FIVE_MINUTE_BASE_FLOOR and window_ratio >= 3.0
+        stair_valid   = vol5m >= config.FIVE_MINUTE_BASE_FLOOR and excitation >= excitation_min
 
         return {
-            'delta': delta, 'spike_ratio': round(vol_ratio, 2),
-            'vol': win5, 'ratio': round(win_ratio5, 2),
-            'win_abs': win_abs, 'liquidity_ok': liquidity_ok,
+            'delta': delta, 'spike_ratio': single_ratio,
+            'vol': vol5m, 'ratio': window_ratio,
+            'peak_1m': peak1m, 'vol_3m': vol3m, 'vol_5m': vol5m,
+            'event_share': event_share, 'persistent_bg': persistent_bg,
+            'premium_notional': premium_notional,
+            'observed_vol': observed_vol, 'completed_vol': completed_vol,
+            'bar_status': bar_status, 'shape': shape, 'pending': pending,
+            'path': path, 'gold_standard': gold_standard, 'classification': classification,
             'active': active5, 'burst': clu['burst'], 'excitation': excitation,
             'visual_dom': round(visual_dom, 2), 'cluster_dom': round(cluster_dom, 2),
-            'A': single_valid, 'B': cluster_valid, 'C': stair_valid,
-            'strong': single_valid and (cluster_valid or stair_valid),
+            'A': bool(single_valid), 'B': bool(cluster_valid), 'C': bool(stair_valid),
+            'strong': bool(gold_standard or path_a),
             'block_reason': block_reason,
             'trigger_type': trig_type, 'trigger_volume': trig_vol,
-            'trigger_ratio': round(trig_ratio, 2),
+            'trigger_ratio': trig_ratio,
             'valid': valid,
         }
 
@@ -764,6 +865,30 @@ class SignalDetector:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _completed_bar(self, symbol, strike, ot, expiry, observed, bar_time) -> Optional[int]:
+        """
+        §7-8 — the closed 1-min OPRA bar volume for a contract, or None.
+
+        Only queried when the live poll-delta (`observed`) is already promising
+        (≥ half the single-print floor) so we don't spend an API call per contract
+        per poll on obvious non-events. Cached per contract per minute.
+        """
+        if self._completed_bar_fn is None or expiry is None:
+            return None
+        if observed < 0.5 * config.SINGLE_PRINT_BASE_FLOOR:
+            return None
+        occ  = occ_symbol(symbol, expiry, strike, ot)
+        ckey = (occ, bar_time.replace(second=0, microsecond=0))
+        if ckey in self._completed_bar_cache:
+            return self._completed_bar_cache[ckey]
+        vol = None
+        try:
+            vol = self._completed_bar_fn(occ, bar_time)
+        except Exception as exc:
+            logger.warning("completed_bar_fn failed for %s: %s", occ, exc)
+        self._completed_bar_cache[ckey] = vol
+        return vol
+
     def _contract_low_dist(self, okey: _OptKey, data: dict) -> Optional[float]:
         """
         §12 ContractLowDistance = mark / max(IntradayLow, 0.01); None if unknown.
@@ -816,6 +941,20 @@ class SignalDetector:
             'hv_pctile': hv,
             'atm_vol_1m': a.get('delta'), 'win_vol': a.get('vol'),
             'active_bars': a.get('active'),
+            # ── Production two-path gate fields (§12/§15 research logging) ──
+            'gate_path':        a.get('path'),
+            'gold_standard':    bool(a.get('gold_standard')),
+            'pending':          bool(a.get('pending')),
+            'premium_notional': a.get('premium_notional'),
+            'peak_1m':          a.get('peak_1m'),
+            'vol_3m':           a.get('vol_3m'),
+            'vol_5m':           a.get('vol_5m'),
+            'event_share':      a.get('event_share'),
+            'persistent_bg':    bool(a.get('persistent_bg')) if a else None,
+            'bar_status':       a.get('bar_status'),
+            'observed_vol':     a.get('observed_vol'),
+            'completed_vol':    a.get('completed_vol'),
+            'classification':   ','.join(a.get('classification') or []) or None,
         })
 
     def _build_signal(

@@ -292,6 +292,21 @@ def _print_mag7_briefing(sentiments: list[dict], now) -> None:
 
 # ── Intraday check (every minute during market hours) ────────────────────────
 
+def _last_closed_opt_bar_vol(data_src, occ: str, bar_time) -> Optional[int]:
+    """
+    Volume of the most recent CLOSED 1-min OPRA bar for `occ`, strictly before the
+    current minute — the §7-8 completed-bar source for the production volume gate.
+    Returns None on no data / error so the gate falls back to the live poll-delta.
+    """
+    try:
+        cur_min = bar_time.replace(second=0, microsecond=0)
+        bars = data_src.get_option_bars(occ)
+        closed = [int(b['volume']) for b in bars if b['bar_time'] < cur_min]
+        return closed[-1] if closed else None
+    except Exception:
+        return None
+
+
 def intraday_check(
     dbc: DatabentoClient,
     detector: SignalDetector,
@@ -410,12 +425,17 @@ def intraday_check(
             # multi-day (low, high) on demand (daily option candles), cached per day.
             hist_range_fn = (data_src.get_option_history_range
                              if (data_src and config.HIST_LOW_ENTRY_GATE) else None)
+            # §7-8: closed 1-min OPRA bar volume for the production gate's partial→
+            # completed re-evaluation (None when no Alpaca data client is available).
+            completed_bar_fn = ((lambda occ, bt: _last_closed_opt_bar_vol(data_src, occ, bt))
+                                if data_src else None)
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
                                      fired_today_fn=db.get_fired_directions_today,
                                      prev_range_fn=(db.get_option_hist_range
-                                                    if config.HIST_LOW_ENTRY_GATE else None))
+                                                    if config.HIST_LOW_ENTRY_GATE else None),
+                                     completed_bar_fn=completed_bar_fn)
 
             # §73 — persist every candidate evaluation (blocked + passed), not just alerts.
             if detector.last_candidates:

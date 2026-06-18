@@ -70,15 +70,51 @@ OPT_PRIOR_LOOKBACK = int(os.getenv('OPT_PRIOR_LOOKBACK', '10'))
 OPT_SINGLE_PRINT_RATIO   = float(os.getenv('OPT_SINGLE_PRINT_RATIO', '8.0'))
 OPT_MIN_SINGLE_PRINT_VOL = {'TSLA': 750, 'NVDA': 750, 'default': 300}
 
-# ── Absolute volume liquidity floor — the binding entry gate ──────────────────
-# Volume is gated on ABSOLUTE size, not a ratio. A signal must clear this floor
-# with EITHER a single bar OR a short rolling window. This sits UNDER the existing
-# sustained multi-bar "building" pattern (cluster/stair) — it does not replace it,
-# and it adds no extreme-outlier/standout gating (which backtested anti-predictive).
-# Raised from the old 100/300 floors after live signals fired on too-thin volume.
-OPT_MIN_ABS_VOL_SINGLE  = int(os.getenv('OPT_MIN_ABS_VOL_SINGLE', '1000'))  # one-bar contracts
-OPT_MIN_ABS_VOL_WINDOW  = int(os.getenv('OPT_MIN_ABS_VOL_WINDOW', '3000'))  # sum over the window
-OPT_ABS_VOL_WINDOW_BARS = int(os.getenv('OPT_ABS_VOL_WINDOW_BARS', '2'))    # window length (2-min)
+# ── Production volume gate (two-path) — §18 ───────────────────────────────────
+# Volume is gated on ABSOLUTE size (ratio alone is NEVER sufficient) via two paths:
+#   Path A DOMINANT ABSOLUTE — a very large event qualifies on size + concentration.
+#   Path B CONTEXTUAL LEVEL CONVICTION — moderate size qualifies only with extreme
+#     ratio + exact primary OI level + correct ATM/1-ITM contract + near contract low
+#     + concentrated event + meaningful premium notional.
+# Preserves gold-standard setups (e.g. NVDA 210P ≈ 500 contracts at R1, at its low,
+# 45× ratio, ~$86k notional) while blocking small-volume / huge-ratio spam.
+TRUE_CONVICTION_GATE_ENABLED        = os.getenv('TRUE_CONVICTION_GATE_ENABLED', 'true').lower() == 'true'
+CONTEXTUAL_LEVEL_CONVICTION_ENABLED = os.getenv('CONTEXTUAL_LEVEL_CONVICTION_ENABLED', 'true').lower() == 'true'
+
+# Path B base floors (moderate absolute volume — also the spam floor, §6).
+SINGLE_PRINT_BASE_FLOOR = int(os.getenv('SINGLE_PRINT_BASE_FLOOR', '500'))    # peak 1-min
+THREE_MINUTE_BASE_FLOOR = int(os.getenv('THREE_MINUTE_BASE_FLOOR', '1000'))   # 3-min window
+FIVE_MINUTE_BASE_FLOOR  = int(os.getenv('FIVE_MINUTE_BASE_FLOOR',  '1250'))   # 5-min window
+
+# Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
+DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
+DOMINANT_3M           = {'NVDA': 1750, 'TSLA': 1750, 'default': 1250}
+DOMINANT_5M           = {'NVDA': 2500, 'TSLA': 2500, 'default': 1750}
+
+# Relative volume (Path B context only — never sufficient on its own).
+CONTEXTUAL_SINGLE_PRINT_RATIO = float(os.getenv('CONTEXTUAL_SINGLE_PRINT_RATIO', '8.0'))
+CONTEXTUAL_MULTI_BAR_RATIO    = float(os.getenv('CONTEXTUAL_MULTI_BAR_RATIO',    '3.0'))
+
+# Event-concentration share by shape (§10) — share of recent window taken by the event.
+SINGLE_PRINT_EVENT_SHARE_MIN = float(os.getenv('SINGLE_PRINT_EVENT_SHARE_MIN', '0.35'))
+THREE_MINUTE_EVENT_SHARE_MIN = float(os.getenv('THREE_MINUTE_EVENT_SHARE_MIN', '0.40'))
+FIVE_MINUTE_EVENT_SHARE_MIN  = float(os.getenv('FIVE_MINUTE_EVENT_SHARE_MIN',  '0.45'))
+DOMINANT_EVENT_SHARE_MIN     = float(os.getenv('DOMINANT_EVENT_SHARE_MIN',     '0.45'))
+
+# Premium notional floor (§11): TriggerVolume × OptionMark × 100.
+MINIMUM_PREMIUM_NOTIONAL_0DTE        = int(os.getenv('MINIMUM_PREMIUM_NOTIONAL_0DTE',        '50000'))
+MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY = int(os.getenv('MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY', '75000'))
+
+# Path B contract-value location (§4E): hard ≤ 1.50, preferred (gold-standard) ≤ 1.25.
+CONTEXTUAL_LOW_DIST_MAX = float(os.getenv('CONTEXTUAL_LOW_DIST_MAX', '1.50'))
+GOLD_STANDARD_LOW_DIST  = float(os.getenv('GOLD_STANDARD_LOW_DIST',  '1.25'))
+
+# Partial-bar pending (§7-8): hold a candidate whose partial volume is within this
+# fraction of the floor and re-evaluate on the completed 1-min bar.
+PENDING_VOLUME_TOLERANCE_PCT = float(os.getenv('PENDING_VOLUME_TOLERANCE_PCT', '0.20'))
+
+# Chain evidence (§12) — computed and logged, NOT a hard gate by default.
+CHAIN_DOMINANCE_HARD_GATE_ENABLED = os.getenv('CHAIN_DOMINANCE_HARD_GATE_ENABLED', 'false').lower() == 'true'
 
 # Valid volume cluster: rolling 5-bar window.
 #   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0

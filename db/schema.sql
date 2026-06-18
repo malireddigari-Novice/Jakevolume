@@ -685,10 +685,39 @@ CREATE TABLE IF NOT EXISTS signal_candidates (
     atm_vol_1m            BIGINT,
     win_vol               BIGINT,
     active_bars           SMALLINT,
+    -- ── Production two-path volume gate (§12/§15) ──
+    gate_path             VARCHAR(2),               -- A (dominant) / B (contextual) / NULL
+    gold_standard         BOOLEAN,
+    pending               BOOLEAN,                  -- PENDING_VOLUME_CONFIRMATION
+    premium_notional      NUMERIC(16,2),            -- trigger_vol × mark × 100
+    peak_1m               BIGINT,
+    vol_3m                BIGINT,
+    vol_5m                BIGINT,
+    event_share           NUMERIC(6,3),
+    persistent_bg         BOOLEAN,
+    bar_status            VARCHAR(12),              -- PARTIAL / COMPLETED / REVISED
+    observed_vol          BIGINT,                   -- live poll-delta at evaluation
+    completed_vol         BIGINT,                   -- closed 1-min OPRA bar volume
+    classification        TEXT,
     created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+-- Additive columns for already-existing signal_candidates tables.
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS gate_path        VARCHAR(2);
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS gold_standard    BOOLEAN;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS pending          BOOLEAN;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS premium_notional NUMERIC(16,2);
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS peak_1m          BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS vol_3m           BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS vol_5m           BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS event_share      NUMERIC(6,3);
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS persistent_bg    BOOLEAN;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS bar_status       VARCHAR(12);
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS observed_vol     BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS completed_vol    BIGINT;
+ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS classification   TEXT;
 CREATE INDEX IF NOT EXISTS idx_sig_candidates_date  ON signal_candidates (session_date, symbol);
 CREATE INDEX IF NOT EXISTS idx_sig_candidates_fired ON signal_candidates (session_date, alert_fired);
+CREATE INDEX IF NOT EXISTS idx_sig_candidates_gold  ON signal_candidates (session_date, gold_standard);
 
 -- ── Phase 6: Statistical Research Toolkit (§74-§77) ─────────────────────────
 
