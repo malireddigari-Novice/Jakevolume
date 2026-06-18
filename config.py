@@ -70,6 +70,16 @@ OPT_PRIOR_LOOKBACK = int(os.getenv('OPT_PRIOR_LOOKBACK', '10'))
 OPT_SINGLE_PRINT_RATIO   = float(os.getenv('OPT_SINGLE_PRINT_RATIO', '8.0'))
 OPT_MIN_SINGLE_PRINT_VOL = {'TSLA': 750, 'NVDA': 750, 'default': 300}
 
+# ── Absolute volume liquidity floor — the binding entry gate ──────────────────
+# Volume is gated on ABSOLUTE size, not a ratio. A signal must clear this floor
+# with EITHER a single bar OR a short rolling window. This sits UNDER the existing
+# sustained multi-bar "building" pattern (cluster/stair) — it does not replace it,
+# and it adds no extreme-outlier/standout gating (which backtested anti-predictive).
+# Raised from the old 100/300 floors after live signals fired on too-thin volume.
+OPT_MIN_ABS_VOL_SINGLE  = int(os.getenv('OPT_MIN_ABS_VOL_SINGLE', '1000'))  # one-bar contracts
+OPT_MIN_ABS_VOL_WINDOW  = int(os.getenv('OPT_MIN_ABS_VOL_WINDOW', '3000'))  # sum over the window
+OPT_ABS_VOL_WINDOW_BARS = int(os.getenv('OPT_ABS_VOL_WINDOW_BARS', '2'))    # window length (2-min)
+
 # Valid volume cluster: rolling 5-bar window.
 #   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0
 #   ActiveBars5  = bars in window with per-bar ratio ≥ 2.0      ≥ 3
@@ -170,8 +180,9 @@ STAIRSTEP_ACTIVE_MIN       = int(os.getenv('STAIRSTEP_ACTIVE_MIN', '3'))
 STAIRSTEP_LOW_DIST_MAX     = float(os.getenv('STAIRSTEP_LOW_DIST_MAX', '2.0'))
 
 # §13 Historical value percentile — (mark-HistLow)/(HistHigh-HistLow) over the
-# current day + prior sessions. Block an alert when the contract is too rich.
-HIST_VALUE_PCTILE_MAX = float(os.getenv('HIST_VALUE_PCTILE_MAX', '0.60'))
+# FULL stored option history (all prior sessions). Require the contract at/near
+# its relative historical low: block unless it sits in the bottom third of range.
+HIST_VALUE_PCTILE_MAX = float(os.getenv('HIST_VALUE_PCTILE_MAX', '0.33'))
 
 # §14 Short-cover risk — a fresh major volume event that mirrors an earlier event
 # of similar size but at a much lower price looks like shorts covering, not new

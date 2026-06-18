@@ -414,7 +414,7 @@ def intraday_check(
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
                                      fired_today_fn=db.get_fired_directions_today,
-                                     prev_range_fn=(db.get_option_prev_range
+                                     prev_range_fn=(db.get_option_hist_range
                                                     if config.HIST_LOW_ENTRY_GATE else None))
 
             # §73 — persist every candidate evaluation (blocked + passed), not just alerts.

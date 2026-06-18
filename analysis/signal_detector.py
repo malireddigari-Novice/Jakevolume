@@ -298,8 +298,9 @@ class SignalDetector:
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
         prev_range_fn : callable(symbol, strike, opt_type, before_date) -> (low, high) | None.
-                        §13 fallback: the contract's previous-session (low, high) from the DB,
-                        used when hist_range_fn yields nothing (no live option price-history).
+                        §13 historical range: the contract's FULL stored-history (low, high)
+                        from the DB, used when hist_range_fn yields nothing (no live option
+                        price-history). Backs the "at/near historical low" requirement.
         """
         self.last_candidates = []          # §73 — reset per poll
         if not bars:
@@ -584,17 +585,26 @@ class SignalDetector:
         clu        = _cluster_metrics(history)
         excitation = _excitation(clu['window'], clu['base_unit'])
 
+        # ── Absolute volume liquidity floor (the binding gate) ────────────────
+        # Volume is gated on ABSOLUTE size, not a ratio: a single bar OR a short
+        # rolling 2-min window must clear the floor. Sits under the building
+        # pattern below — no extreme-outlier/standout gating (anti-predictive).
+        win_abs      = sum(history[-config.OPT_ABS_VOL_WINDOW_BARS:])
+        liquidity_ok = (delta >= config.OPT_MIN_ABS_VOL_SINGLE
+                        or win_abs >= config.OPT_MIN_ABS_VOL_WINDOW)
+
         near_175 = (low_dist is None or low_dist <= 1.75)
         near_200 = (low_dist is None or low_dist <= 2.00)
 
-        # ── The three valid-volume rules ──────────────────────────────────────
+        # ── The three valid-volume rules (the sustained "building" pattern) ───
         single_valid = (delta >= vol_floor and vol_ratio >= 8.0
                         and delta >= 0.75 * max20 and near_175)
         cluster_valid = (win5 >= win_floor and win_ratio5 >= 3.0 and active5 >= 3
                         and cluster_dom >= 0.75 and near_175)
         stair_valid = (win5 >= win_floor and active5 >= 3 and excitation >= excitation_min
                        and win_ratio5 >= 2.5 and near_200)
-        valid = single_valid or cluster_valid or stair_valid
+        # Liquidity floor is required FIRST — building pattern alone isn't enough.
+        valid = liquidity_ok and (single_valid or cluster_valid or stair_valid)
 
         # ── Trigger fields (Discord shows the actual trigger, not raw 1-min) ──
         if single_valid:
@@ -607,6 +617,8 @@ class SignalDetector:
         # ── Granular blocked reason ───────────────────────────────────────────
         if valid:
             block_reason = 'OK'
+        elif not liquidity_ok:
+            block_reason = 'BELOW_ABS_VOLUME_FLOOR'
         elif delta < vol_floor and win5 < win_floor:
             block_reason = 'LOW_ABSOLUTE_VOLUME'
         elif win5 < win_floor:                         # only the single-bar path is viable
@@ -625,6 +637,7 @@ class SignalDetector:
         return {
             'delta': delta, 'spike_ratio': round(vol_ratio, 2),
             'vol': win5, 'ratio': round(win_ratio5, 2),
+            'win_abs': win_abs, 'liquidity_ok': liquidity_ok,
             'active': active5, 'burst': clu['burst'], 'excitation': excitation,
             'visual_dom': round(visual_dom, 2), 'cluster_dom': round(cluster_dom, 2),
             'A': single_valid, 'B': cluster_valid, 'C': stair_valid,

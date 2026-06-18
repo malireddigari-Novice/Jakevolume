@@ -51,6 +51,14 @@ A backtest of one day's signals showed the right direction was picked (puts ran 
 
 6. **Daily-review safety + a bug fix** (§M). (a) Fixed a latent bug that silently broke the `signal_volume_analytics` write on every review (`execute_values` had too many `%s` placeholders). (b) Added a **guard**: a re-run that can't rebuild a trade's price path (e.g. an expired 0DTE contract the broker no longer serves) **no longer overwrites already-computed metrics with NULLs** — prior results are kept.
 
+### 🔵 June 17, 2026 — volume & historical-low tightening (in simple steps)
+
+Signals were firing on too-thin volume. Two changes raise the bar without re-introducing the "chase" the backtest warned against:
+
+1. **Volume is now an absolute liquidity floor, not a ratio** (§D4). Before, a signal could qualify on a *ratio* spike even if the raw volume was tiny. Now a contract must trade **≥ 1,000 in a single bar OR ≥ 3,000 over a rolling 2-minute window** before anything else is considered — thin volume is blocked `BELOW_ABS_VOLUME_FLOOR`. The existing sustained multi-bar "building" pattern (cluster/stair-step) is **kept** as the trigger on top of the floor. Deliberately **no** bell-curve/standout gating was added: the backtest showed extreme standout volume is anti-predictive (−24.8%), while moderate building volume is the edge (+52%) — so this is a *liquidity* floor, not a chase trigger.
+
+2. **"At/near historical low in value" now uses the full look-back** (§D5/§13). The §13 gate asks "is this option cheap relative to its own history?" It now measures over the **entire stored option history** (all prior sessions in `option_level_bars`, the deepest available since Schwab serves none), and requires the contract in the **bottom third** of its low→high range (`HIST_VALUE_PCTILE_MAX` 0.60 → **0.33**) — i.e. genuinely near its relative low, not just cheap-ish.
+
 ---
 
 ## A. Scheduling & startup
@@ -120,7 +128,8 @@ For **each symbol**:
 36. <span style="color:#d1242f">~~Proximity score by distance band (0.25%→1.0, 0.35%→0.7, 0.50%→0.5).~~</span> <span style="color:#1a7f37">**[CHANGED] Binary proximity** — `NearLevel` if `|spot−level|/spot ≤ 0.0035` (default) or `≤ 0.0050` for **TSLA/NVDA**. Not near → log `NOT_NEAR_LEVEL`, skip.</span>
 37. **Pick ATM + 1 ITM** confirm-side contracts (ATM nearest spot; ITM one strike in-the-money).
 
-### D4. Volume validation — a valid signal needs **any one** of §9/§10/§11 (per contract, ATM or ITM)
+### D4. Volume validation — an absolute liquidity floor **AND** any one of §9/§10/§11 (per contract, ATM or ITM)
+37b. 🔵 **[Jun-17 NEW] Absolute volume liquidity floor (the binding gate)** — volume is gated on **absolute size, not a ratio**. A contract must clear `delta ≥ OPT_MIN_ABS_VOL_SINGLE` (1,000) **OR** `sum(last OPT_ABS_VOL_WINDOW_BARS=2 bars) ≥ OPT_MIN_ABS_VOL_WINDOW` (3,000). This is required **first** — the §9/§10/§11 "building" pattern alone is no longer enough; thin volume is blocked `BELOW_ABS_VOLUME_FLOOR`. Raised from the old 100/300 floors after live signals fired on too-thin volume. No extreme-outlier/standout gating is added (that band backtested anti-predictive); the sustained multi-bar pattern below is kept as the trigger.
 38. **§9 Extreme single print** — `delta ≥ floor` (300 / 750 NVDA·TSLA) **AND** `delta / max(avgPrior10,10) ≥ 8×` **AND** `low_dist ≤ 1.75`.
 39. **§10 Cluster** (last 5 deltas) — <span style="color:#1a7f37">**[ADDED] `WindowVol5 ≥ floor` (300 / 600)** **AND**</span> `WindowRatio5 ≥ 3×` **AND** `ActiveBars5 (per-bar ≥ 2×) ≥ 3` **AND** `low_dist ≤ 1.75`.
 40. <span style="color:#1a7f37">**[NEW] §11 Stair-step accumulation** — `ExcitationScore ≥ 0.70` **AND** `WindowVol5 ≥ floor (300/600)` **AND** `WindowRatio5 ≥ 2.5` **AND** `ActiveBars5 ≥ 3` **AND** `low_dist ≤ 2.0`, where `ExcitationRaw = 1.0·r[t] + 0.6·r[t-1] + 0.35·r[t-2] + 0.20·r[t-3] + 0.10·r[t-4]` and `ExcitationScore = min(ExcitationRaw,10)/10`. The absolute `WindowVol5` floor (same as the cluster path) stops it firing on ratios alone in a quiet contract.</span>
@@ -133,8 +142,8 @@ For **each symbol**:
 45. <span style="color:#d1242f">~~Target-room gate — require room to the nearest opposing level.~~</span> <span style="color:#d1242f">**[REMOVED]**</span>
 46. **Chased** — ATM `low_dist > 2.50` → block `CONTRACT_CHASED`.
 47. No valid volume → block `NO_VALID_VOLUME_SIGNAL`.
-48. <span style="color:#1a7f37">**[CHANGED] §13 Historical value percentile** — on the contract you'd buy: `pctile = (mark − HistLow)/(HistHigh − HistLow)` over the multi-day window (Schwab daily candles, cached/day). `pctile > 0.60` → block `HISTORICAL_VALUE_TOO_HIGH`. 0DTE has no history → gate skipped. <span style="color:#d1242f">~~(Old: `mark/hist_low ≤ 1.25`, and a failure only downgraded to WATCH.)~~</span></span>
-    - 🔵 **[Jun-16 NEW] Previous-session fallback** — when no live multi-day history exists (Schwab serves no option price-history, so the gate was a silent no-op), the detector falls back to the contract's **previous session's `(low, high)`** from `option_level_bars` (`db.get_option_prev_range`), so the gate can still evaluate. Matched by strike + type (not expiry), so a 0DTE contract uses **yesterday's same-strike** contract. Cached per contract/day.
+48. <span style="color:#1a7f37">**[CHANGED] §13 Historical value percentile** — on the contract you'd buy: `pctile = (mark − HistLow)/(HistHigh − HistLow)`. 🔵 **[Jun-17]** over the **full stored history** (all prior sessions), `pctile > 0.33` → block `HISTORICAL_VALUE_TOO_HIGH` (require the contract in the **bottom third** of its range). 0DTE has no live history → uses the DB fallback below. <span style="color:#d1242f">~~(Old: `mark/hist_low ≤ 1.25`, and a failure only downgraded to WATCH; pctile cap was 0.60 over a 10-day window.)~~</span></span>
+    - 🔵 **[Jun-16 NEW, broadened Jun-17] Full stored-history fallback** — when no live multi-day history exists (Schwab serves no option price-history, so the gate was a silent no-op), the detector falls back to the contract's **`(low, high)` over its entire stored history** in `option_level_bars` (`db.get_option_hist_range`), so the gate can still evaluate. Matched by strike + type (not expiry), so a 0DTE contract inherits its **same-strike** history across expiries. Cached per contract/day.
 49. <span style="color:#1a7f37">**[NEW] §14 Short-cover risk** — store prior *major* volume events per contract. If the current major event has `VolumeSimilarity ∈ [0.70, 1.50]` vs a prior event **and** `CurrentPrice/PriorPrice ≤ 0.50` (similar size, much cheaper now → shorts covering), block `SHORT_COVER_RISK`.</span>
 50. **§19 Already alerted** this direction today → block `ALREADY_ALERTED_TODAY`.
 
@@ -221,7 +230,7 @@ For **each symbol**:
 
 - **"1-minute volume" is an approximation** — a quote-delta sampled each poll, robust to strike rotation but cadence-sensitive.
 - **Stop-loss is a soft, poll-based mark check** (50% hardcoded), not a resting broker order.
-- <span style="color:#1a7f37">**§13 and §14 are data-dependent** (Schwab daily candles / intraday event history) — worth watching the `MONITOR … → <REASON>` logs early to confirm they gate rather than over-block.</span> 🔵 **[Jun-16]** §13 no longer goes fully dark without live history — it falls back to the previous session's option low/high from the DB (see §D5.48).
+- <span style="color:#1a7f37">**§13 and §14 are data-dependent** (Schwab daily candles / intraday event history) — worth watching the `MONITOR … → <REASON>` logs early to confirm they gate rather than over-block.</span> 🔵 **[Jun-16, broadened Jun-17]** §13 no longer goes dark without live history — it falls back to the contract's full stored-history option low/high from the DB (see §D5.48).
 
 ---
 
@@ -240,7 +249,9 @@ For **each symbol**:
 | `NEAR_LOW_MAX_DIST` / `CONTRACT_LOW_MAX_DIST` | 1.75 / 2.50 | NearLow / chased block |
 | `HIST_LOW_ENTRY_GATE` | true | Enable the historical-value gate |
 | `OPT_HIST_LOOKBACK_DAYS` | 10 | Days of daily candles |
-| <span style="color:#1a7f37">`HIST_VALUE_PCTILE_MAX`</span> | <span style="color:#1a7f37">0.60</span> | <span style="color:#1a7f37">Block if value percentile above this (§13)</span> |
+| <span style="color:#1a7f37">`OPT_MIN_ABS_VOL_SINGLE`</span> | <span style="color:#1a7f37">1000</span> | <span style="color:#1a7f37">Single-bar absolute volume floor (§D4 liquidity gate)</span> |
+| <span style="color:#1a7f37">`OPT_MIN_ABS_VOL_WINDOW` / `_BARS`</span> | <span style="color:#1a7f37">3000 / 2</span> | <span style="color:#1a7f37">Rolling-window absolute floor + window length (§D4)</span> |
+| <span style="color:#1a7f37">`HIST_VALUE_PCTILE_MAX`</span> | <span style="color:#1a7f37">0.33</span> | <span style="color:#1a7f37">Block unless value in bottom third of full-history range (§13)</span> |
 | <span style="color:#1a7f37">`SHORT_COVER_FILTER` / `_SIM_LOW/HIGH` / `_REPRICE_MAX`</span> | <span style="color:#1a7f37">true · 0.70/1.50 · 0.50</span> | <span style="color:#1a7f37">Short-cover risk filter (§14)</span> |
 | <span style="color:#1a7f37">`OPENING_RANGE_MINUTES` / `_VOL_MULT` / `_CLUSTER_RATIO` / `_EXCITATION_MIN`</span> | <span style="color:#1a7f37">15 · 1.5 · 4.0 · 0.80</span> | <span style="color:#1a7f37">Opening-range raised thresholds (§15)</span> |
 | <span style="color:#1a7f37">`EXIT_MIN_ROOM_PCT`</span> | <span style="color:#1a7f37">0.0025</span> | <span style="color:#1a7f37">Min room after the exit-target shift</span> |
