@@ -38,6 +38,7 @@ from typing import Optional
 
 import config
 from analysis.flow_reversal import volume_event
+from analysis.volume_analytics import compute_leadership_scores
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -551,6 +552,19 @@ class SignalDetector:
         for ev in self.last_candidates:
             if ev['alert_fired'] is False and ev['level_label'] in fired_labels and ev['blocked_reason'] == 'PASSED':
                 ev['alert_fired'] = True
+
+        # ── §3-7 Chain-led emergent entries — additive, independent of level proximity ──
+        if config.CHAIN_LED_ENTRY_ENABLED:
+            for confirm_type in ('CALL', 'PUT'):
+                csig, creason = self._chain_led_entry(
+                    symbol, confirm_type, opt_data_map, vol_deltas, levels,
+                    close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio)
+                if csig is not None:
+                    st = csig['signal_type']
+                    self._fired_today[(symbol, st, 'CHAIN_LED_EMERGENT_ENTRY')] = True
+                    fired.append(csig)
+                elif creason:
+                    logger.info("CHAIN-LED  %s %s  → %s", symbol, confirm_type, creason)
         return fired
 
     # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
@@ -902,6 +916,195 @@ class SignalDetector:
             return round(mark / low, 4)
         return None
 
+    def _strike_metrics(self, symbol, key, quote, delta, bar_time, expiry) -> dict:
+        """Per-strike chain metrics (peak1m incl. completed bar, 3m/5m, share, bg, notional)."""
+        strike, ot = key
+        hist = list(self._opt_vol_hist.get((symbol, strike, ot), []))
+        completed = self._completed_bar(symbol, strike, ot, expiry, int(delta or 0), bar_time)
+        peak1m = max(int(delta or 0), int(completed)) if completed is not None else int(delta or 0)
+        vol3m = sum(hist[-3:-1]) + peak1m
+        vol5m = sum(hist[-5:-1]) + peak1m
+        ev = volume_event(hist)
+        share         = ev['share'] if ev else round(peak1m / max(vol5m, 1), 3)
+        event_vol     = ev['event_vol'] if ev else peak1m
+        persistent_bg = bool(ev['persistent_bg']) if ev else False
+        low_dist = self._contract_low_dist((symbol, strike, ot), quote)
+        mark     = quote.get('mark') or 0.0
+        notional = round(max(peak1m, vol3m) * mark * 100.0)
+        return dict(key=key, strike=strike, ot=ot, peak1m=peak1m, vol3m=vol3m, vol5m=vol5m,
+                    share=share, event_vol=event_vol, persistent_bg=persistent_bg,
+                    low_dist=low_dist, mark=mark, notional=notional, delta=int(delta or 0))
+
+    @staticmethod
+    def _target_oi_name(price, levels) -> Optional[str]:
+        """Map a target price back to its morning OI rank label (R1..S3), §17."""
+        if price is None:
+            return None
+        best, bestd = None, 1e9
+        for lv in levels:
+            d = abs(float(lv['strike']) - float(price))
+            if d < bestd:
+                bestd, best = d, lv
+        if best is None:
+            return None
+        side = 'R' if best['level_type'] == 'RESISTANCE' else 'S'
+        return f"{side}{best.get('rank', '')}".rstrip()
+
+    def _chain_led_entry(self, symbol, confirm_type, opt_data_map, vol_deltas, levels,
+                         close_price, expiry, bars, bar_time, now, next_day_mode,
+                         hv_pctile, pc_ratio):
+        """
+        §3-7 — chain-led emergent entry. Coordinated ATM + adjacent-strike volume builds a
+        new emergent support/resistance before spot reaches a primary level. Returns
+        (signal_dict | None, block_reason | None). Additive to the primary-level path.
+        """
+        if not config.CHAIN_LED_ENTRY_ENABLED:
+            return None, None
+        signal_type = 'BULLISH' if confirm_type == 'CALL' else 'BEARISH'
+        if self._fired_today.get((symbol, signal_type, 'CHAIN_LED_EMERGENT_ENTRY')):
+            return None, None
+
+        ct = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
+        if len(ct) < 2:
+            return None, 'CHAIN_CONFIRMATION_MISSING'
+        atm_key = min(ct, key=lambda k: abs(k[0] - close_price))
+        a_strike = atm_key[0]
+        if confirm_type == 'CALL':           # ITM below spot, OTM above
+            itm = [k for k in ct if k[0] < a_strike]; otm = [k for k in ct if k[0] > a_strike]
+            itm_key = max(itm, key=lambda k: k[0]) if itm else None
+            otm_key = min(otm, key=lambda k: k[0]) if otm else None
+        else:                                # PUT: ITM above spot, OTM below
+            itm = [k for k in ct if k[0] > a_strike]; otm = [k for k in ct if k[0] < a_strike]
+            itm_key = min(itm, key=lambda k: k[0]) if itm else None
+            otm_key = max(otm, key=lambda k: k[0]) if otm else None
+
+        def m(key):
+            return (self._strike_metrics(symbol, key, opt_data_map[key],
+                                         vol_deltas.get(key, 0), bar_time, expiry)
+                    if key is not None else None)
+        atm_m, itm_m, otm_m = m(atm_key), m(itm_key), m(otm_key)
+        chain = [x for x in (itm_m, atm_m, otm_m) if x]
+
+        # §4D individual strike quality
+        atm_ok = atm_m['peak1m'] >= config.CHAIN_ATM_1M_MIN or atm_m['vol3m'] >= config.CHAIN_ATM_3M_MIN
+        adj = [x for x in (itm_m, otm_m)
+               if x and (x['peak1m'] >= config.CHAIN_ADJACENT_1M_MIN
+                         or x['vol3m'] >= config.CHAIN_ADJACENT_3M_MIN)]
+        if not atm_ok:
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+        if not adj:                                   # §4A multi-strike confirmation
+            return None, 'CHAIN_CONFIRMATION_MISSING'
+
+        # §4C combined absolute volume (ITM+ATM+OTM)
+        c1, c3, c5 = (sum(x['peak1m'] for x in chain), sum(x['vol3m'] for x in chain),
+                      sum(x['vol5m'] for x in chain))
+        if confirm_type == 'CALL':
+            f1, f3, f5 = (config.CHAIN_CALL_COMBINED_1M_FLOOR, config.CHAIN_CALL_COMBINED_3M_FLOOR,
+                          config.CHAIN_CALL_COMBINED_5M_FLOOR)
+        else:
+            f1, f3, f5 = (config.CHAIN_PUT_COMBINED_1M_FLOOR, config.CHAIN_PUT_COMBINED_3M_FLOOR,
+                          config.CHAIN_PUT_COMBINED_5M_FLOOR)
+        if not (c1 >= f1 or c3 >= f3 or c5 >= f5):
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4F economic size
+        comb_notional = sum(x['notional'] for x in chain)
+        if not (comb_notional >= config.CHAIN_COMBINED_NOTIONAL_MIN
+                and atm_m['notional'] >= config.CHAIN_ATM_NOTIONAL_MIN):
+            return None, 'CHAIN_NOTIONAL_INSUFFICIENT'
+
+        # §4E contract value location
+        if atm_m['low_dist'] is not None and atm_m['low_dist'] > config.CHAIN_ATM_LOW_DISTANCE_MAX:
+            return None, 'EMERGENT_ENTRY_CHASED'
+        if not any(x['low_dist'] is None or x['low_dist'] <= config.CHAIN_ADJACENT_LOW_DISTANCE_MAX
+                   for x in adj):
+            return None, 'EMERGENT_ENTRY_CHASED'
+
+        # §4G flow concentration
+        concentrated = sum(1 for x in chain if x['share'] >= config.CHAIN_EVENT_SHARE_MIN)
+        tot20 = sum(x['event_vol'] / max(x['share'], 0.01) for x in chain)
+        comb_share = sum(x['event_vol'] for x in chain) / max(tot20, 1.0)
+        if not (concentrated >= 2 or comb_share >= config.CHAIN_COMBINED_EVENT_SHARE_MIN):
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4H background quality
+        if atm_m['persistent_bg']:
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4I directional leadership
+        ld = compute_leadership_scores(symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist)
+        call_ld = (ld or {}).get('call_leadership', 0.0)
+        put_ld  = (ld or {}).get('put_leadership', 0.0)
+        lead, opp = (call_ld, put_ld) if confirm_type == 'CALL' else (put_ld, call_ld)
+        if not (lead >= config.CHAIN_LEADERSHIP_MIN and (lead - opp) >= config.CHAIN_LEADERSHIP_MARGIN):
+            return None, 'CHAIN_LEADERSHIP_INSUFFICIENT'
+
+        # §7 contract selection — ATM default; 1-OTM only if independently strong + near low.
+        selected = atm_m
+        if (otm_m and otm_m in adj and otm_m['low_dist'] is not None
+                and otm_m['low_dist'] <= config.CHAIN_ATM_LOW_DISTANCE_MAX
+                and (otm_m['peak1m'] >= config.CHAIN_ATM_1M_MIN or otm_m['vol3m'] >= config.CHAIN_ATM_3M_MIN)):
+            selected = otm_m
+        # §4J selected not already chased
+        if selected['low_dist'] is not None and selected['low_dist'] > config.CHAIN_SELECTED_LOW_DISTANCE_MAX:
+            return None, 'EMERGENT_ENTRY_CHASED'
+
+        # ── Build the emergent signal (reuse _build_signal + price-order targets §16) ──
+        sel_key = selected['key']
+        sel_quote = opt_data_map[sel_key]
+        other_m = next((x for x in (atm_m, itm_m, otm_m) if x and x is not selected), atm_m)
+        sel_ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, sel_key[0], confirm_type), [])),
+                                   selected['delta'], selected['low_dist'], 300, 300, 3.0,
+                                   config.STAIRSTEP_EXCITATION_MIN, mark=selected['mark'],
+                                   is_atm=(selected is atm_m), next_day_mode=next_day_mode)
+        oth_ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, other_m['key'][0], confirm_type), [])),
+                                   other_m['delta'], other_m['low_dist'], 300, 300, 3.0,
+                                   config.STAIRSTEP_EXCITATION_MIN, mark=other_m['mark'], is_atm=False,
+                                   next_day_mode=next_day_mode)
+
+        # Emergent location spot = underlying close ~window bars back (§6).
+        n = config.CHAIN_CONFIRMATION_WINDOW_MINUTES + 1
+        emergent_spot = float(bars[-n]['close']) if len(bars) >= n else float(close_price)
+        loc_type = 'SUPPORT' if confirm_type == 'CALL' else 'RESISTANCE'
+        day_mode = 'NEXT_DAY' if next_day_mode else '0DTE'
+
+        sig = self._build_signal(
+            symbol, {'strike': float(sel_key[0])}, levels, 0, 'EMERGENT', loc_type,
+            confirm_type, signal_type, {'close': close_price}, expiry, sel_quote, sel_ev,
+            selected['delta'], selected['low_dist'], oth_ev, other_m['delta'], True,
+            round(lead, 3), 'CHAIN_LED', hv_pctile, pc_ratio,
+            _pc_conviction(signal_type, pc_ratio), next_day_mode, day_mode, sel_quote,
+            float(sel_key[0]), None)
+
+        # Chain-led overrides + emergent metadata (persisted by the caller).
+        sig['signal_context'] = 'CHAIN_LED_EMERGENT_ENTRY'
+        sig['signal_shape'] = sig['flow_shape'] = 'CHAIN_LED'
+        sig['level_label'] = 'EMERGENT'
+        sig['level_price'] = emergent_spot
+        sig['bias'] = 'Chain-led call' if confirm_type == 'CALL' else 'Chain-led put'
+        sig['target1_oi_name'] = self._target_oi_name(sig.get('exit1_price'), levels)
+        sig['target2_oi_name'] = self._target_oi_name(sig.get('exit2_price'), levels)
+        sig['emergent_location_id'] = None
+        sig['emergent'] = {
+            'session_date': now.date(), 'symbol': symbol, 'location_type': loc_type,
+            'location_spot': emergent_spot, 'direction': signal_type,
+            'event_start': bar_time, 'event_end': bar_time,
+            'atm_strike': atm_m['strike'], 'itm_strike': itm_m['strike'] if itm_m else None,
+            'otm_strike': otm_m['strike'] if otm_m else None,
+            'atm_vol_3m': atm_m['vol3m'], 'itm_vol_3m': itm_m['vol3m'] if itm_m else None,
+            'otm_vol_3m': otm_m['vol3m'] if otm_m else None, 'combined_vol_3m': c3,
+            'atm_notional': atm_m['notional'], 'combined_notional': comb_notional,
+            'atm_low_dist': atm_m['low_dist'], 'itm_low_dist': itm_m['low_dist'] if itm_m else None,
+            'otm_low_dist': otm_m['low_dist'] if otm_m else None,
+            'call_leadership': round(call_ld, 3), 'put_leadership': round(put_ld, 3),
+            'selected_strike': float(sel_key[0]),
+        }
+        # Chain-led trigger display fields (§18).
+        sig['chain_strikes'] = [x['strike'] for x in chain]
+        sig['chain_combined_3m'] = c3
+        sig['emergent_spot'] = emergent_spot
+        return sig, None
+
     def _log_eval(self, symbol, label, strike, spot, confirm_type, *,
                   reason: str, dist: float, atm: dict = None,
                   low: Optional[float] = None, hv: Optional[float] = None) -> None:
@@ -1032,6 +1235,11 @@ class SignalDetector:
             'level_price':      strike,
             'level_label':      level_label,      # 'R1'…'S3' (used in Discord/selection)
             'level_rank':       rank,
+            # §1 production signal context (chain-led / countertrend override this)
+            'signal_context':       'PRIMARY_LEVEL_CONTINUATION',
+            'emergent_location_id': None,
+            'target1_oi_name':      None,
+            'target2_oi_name':      None,
             'expiry':           expiry,
             'trigger_price':    spot,
             'option_type':      confirm_type,

@@ -116,6 +116,35 @@ PENDING_VOLUME_TOLERANCE_PCT = float(os.getenv('PENDING_VOLUME_TOLERANCE_PCT', '
 # Chain evidence (§12) — computed and logged, NOT a hard gate by default.
 CHAIN_DOMINANCE_HARD_GATE_ENABLED = os.getenv('CHAIN_DOMINANCE_HARD_GATE_ENABLED', 'false').lower() == 'true'
 
+# ── Chain-led emergent entry path (§20) ───────────────────────────────────────
+# Allow CALL/PUT alerts when coordinated ATM + adjacent-strike volume builds a new
+# emergent support/resistance BEFORE spot reaches a morning OI level. Additive to the
+# primary-level path; requires stronger multi-strike evidence instead of proximity.
+CHAIN_LED_ENTRY_ENABLED           = os.getenv('CHAIN_LED_ENTRY_ENABLED', 'true').lower() == 'true'
+CHAIN_CONFIRMATION_WINDOW_MINUTES = int(os.getenv('CHAIN_CONFIRMATION_WINDOW_MINUTES', '5'))
+# Combined volume across {1 ITM, ATM, 1 OTM} of the confirm side (§4C / §5).
+CHAIN_CALL_COMBINED_1M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_1M_FLOOR', '1000'))
+CHAIN_CALL_COMBINED_3M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_3M_FLOOR', '1500'))
+CHAIN_CALL_COMBINED_5M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_5M_FLOOR', '2000'))
+CHAIN_PUT_COMBINED_1M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_1M_FLOOR', '1000'))
+CHAIN_PUT_COMBINED_3M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_3M_FLOOR', '1500'))
+CHAIN_PUT_COMBINED_5M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_5M_FLOOR', '2000'))
+# Individual-strike quality (§4D): ATM and adjacent floors.
+CHAIN_ATM_1M_MIN      = int(os.getenv('CHAIN_ATM_1M_MIN', '500'))
+CHAIN_ATM_3M_MIN      = int(os.getenv('CHAIN_ATM_3M_MIN', '1000'))
+CHAIN_ADJACENT_1M_MIN = int(os.getenv('CHAIN_ADJACENT_1M_MIN', '350'))
+CHAIN_ADJACENT_3M_MIN = int(os.getenv('CHAIN_ADJACENT_3M_MIN', '700'))
+# Economic size (§4F), contract-value location (§4E/§4J), leadership (§4I), concentration (§4G).
+CHAIN_COMBINED_NOTIONAL_MIN     = int(os.getenv('CHAIN_COMBINED_NOTIONAL_MIN', '100000'))
+CHAIN_ATM_NOTIONAL_MIN          = int(os.getenv('CHAIN_ATM_NOTIONAL_MIN', '50000'))
+CHAIN_ATM_LOW_DISTANCE_MAX      = float(os.getenv('CHAIN_ATM_LOW_DISTANCE_MAX', '1.50'))
+CHAIN_ADJACENT_LOW_DISTANCE_MAX = float(os.getenv('CHAIN_ADJACENT_LOW_DISTANCE_MAX', '1.75'))
+CHAIN_SELECTED_LOW_DISTANCE_MAX = float(os.getenv('CHAIN_SELECTED_LOW_DISTANCE_MAX', '1.75'))
+CHAIN_LEADERSHIP_MIN           = float(os.getenv('CHAIN_LEADERSHIP_MIN', '0.75'))
+CHAIN_LEADERSHIP_MARGIN        = float(os.getenv('CHAIN_LEADERSHIP_MARGIN', '0.20'))
+CHAIN_EVENT_SHARE_MIN          = float(os.getenv('CHAIN_EVENT_SHARE_MIN', '0.35'))
+CHAIN_COMBINED_EVENT_SHARE_MIN = float(os.getenv('CHAIN_COMBINED_EVENT_SHARE_MIN', '0.45'))
+
 # Valid volume cluster: rolling 5-bar window.
 #   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0
 #   ActiveBars5  = bars in window with per-bar ratio ≥ 2.0      ≥ 3

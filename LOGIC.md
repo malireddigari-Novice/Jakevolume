@@ -62,6 +62,16 @@ Signals were firing on too-thin volume. Two changes raise the bar without re-int
 
 2. **"At/near historical low in value" now uses the full look-back** (§D5/§13). The §13 gate asks "is this option cheap relative to its own history?" It now measures over the **entire stored option history** (all prior sessions in `option_level_bars`, the deepest available since Schwab serves none), and requires the contract in the **bottom third** of its low→high range (`HIST_VALUE_PCTILE_MAX` 0.60 → **0.33**) — i.e. genuinely near its relative low, not just cheap-ish.
 
+### 🔵 June 18, 2026 — chain-led emergent entry path (Phase 1)
+
+Primary OI levels are no longer the **only** way to a valid intraday location. A valid signal may now qualify through **either** path (additive — the primary-level path is unchanged):
+
+1. **Three signal contexts** (`signal_context` on every signal): `PRIMARY_LEVEL_CONTINUATION` (existing), `CHAIN_LED_EMERGENT_ENTRY` (new), `PRIMARY_LEVEL_COUNTERTREND_REVERSAL` (Phase 2, not yet built).
+
+2. **Chain-led emergent entry** (§D7, `_chain_led_entry`): when coordinated **ATM + adjacent-strike** volume builds a new emergent support/resistance **before** spot reaches a morning level, a CALL/PUT can fire without level proximity. Requires (all): multi-strike confirmation (ATM + ≥1 adjacent) · combined 1m/3m/5m floors (1000/1500/2000) · individual ATM (≥500/1000) + adjacent (≥350/700) · combined notional ≥$100k & ATM ≥$50k · ATM near low (≤1.50) & ≥1 adjacent (≤1.75) · concentration (≥2 strikes EventShare≥0.35 OR combined≥0.45) · ATM not persistent background · call/put **leadership** ≥0.75 with ≥0.20 margin · selected contract not chased (≤1.75). It picks ATM by default, or **1-OTM** when independently strong + near-low (AMZN example trades **240C**). The emergent spot (= underlying close ~5 bars back) becomes the entry-location reference (`emergent_locations` table); targets use the existing price-ordered ladder with original OI names stored (`target1/2_oi_name`). Dedup is context-aware: a chain-led call isn't blocked by a primary call. Block reasons: `CHAIN_CONFIRMATION_MISSING / CHAIN_VOLUME_INSUFFICIENT / CHAIN_NOTIONAL_INSUFFICIENT / CHAIN_LEADERSHIP_INSUFFICIENT / EMERGENT_ENTRY_CHASED`. Reuses `compute_leadership_scores` + `volume_event` + the canonical `_eval_volume` metrics. Discord shows a **CHAIN-LED** card (emergent support/resistance + chain strikes + combined 3m vol + notional + price targets) vs the **PRIMARY LEVEL** card.
+
+> **Phase 2 (planned):** countertrend reversal-conviction gate — stricter absolute/leadership/trend-fading evidence before an opposite-direction alert fires against a still-working trend (so weak early puts like AMZN 242.5P @ 575 are held as `COUNTERTREND_WATCH` until real conviction appears).
+
 ---
 
 ## A. Scheduling & startup

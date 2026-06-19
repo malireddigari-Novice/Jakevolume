@@ -129,8 +129,43 @@ def send_signal(sig: dict) -> None:
     sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
+    context = sig.get('signal_context')
     head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
     lines = [f"{arrow} **{head}**" + ("  ⭐" if gold else "")]
+
+    # ── §18 Chain-led emergent card ──
+    if context == 'CHAIN_LED_EMERGENT_ENTRY':
+        emergent_spot = sig.get('emergent_spot')
+        chain_strikes = sig.get('chain_strikes') or []
+        comb3m = sig.get('chain_combined_3m')
+        notional = sig.get('premium_notional')
+        side_word = 'CALL' if opt_type == 'CALL' else 'PUT'
+        loc_label = 'Emergent Support' if opt_type == 'CALL' else 'Emergent Resistance'
+        lines.append(f"Signal: CHAIN-LED {side_word}")
+        if emergent_spot is not None:
+            lines.append(f"{loc_label}: {emergent_spot:.2f}")
+        if chain_strikes:
+            lines.append("Chain: " + " + ".join(f"{_fmt_level(s)}{side_char}" for s in chain_strikes))
+        if comb3m:
+            lines.append(f"Combined 3m Vol: {int(comb3m):,}")
+        if trig_vol is not None:
+            lines.append(f"ATM Volume: {int(trig_vol):,}")
+        if notional:
+            lines.append(f"Premium Notional: ${int(notional):,}")
+        if low_dist is not None:
+            lines.append(f"Contract Low Distance: {low_dist:.2f}")
+        t1, t2 = sig.get('exit1_price'), sig.get('exit2_price')
+        if t1 is not None:
+            lines.append(f"Targets: 1/2 @ {_fmt_level(t1)}" + (f"  Rest @ {_fmt_level(t2)}" if t2 else ""))
+        prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
+        _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
+                    "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
+                    **({"timestamp": ts} if ts else {})}]})
+        logger.info("Discord: CHAIN-LED %s signal sent  %s", side_word, symbol)
+        return
+
+    # ── Primary-level card ──
+    lines.append("Signal: PRIMARY LEVEL")
     if spot is not None:
         lines.append(f"Spot: {spot:.2f}")
     lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())

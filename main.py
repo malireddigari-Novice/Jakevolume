@@ -445,6 +445,10 @@ def intraday_check(
                     logger.warning("%s: candidate logging failed", symbol, exc_info=True)
 
             for sig in signals:
+                # §6 — persist the chain-led emergent location first so the signal can FK it.
+                emergent = sig.pop('emergent', None)
+                if emergent is not None:
+                    sig['emergent_location_id'] = db.save_emergent_location(emergent)
                 sig_id = db.save_signal(sig)
                 sheets.log_signal(sig)
                 db.mark_signal_logged(sig_id)

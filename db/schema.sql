@@ -134,6 +134,12 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS confidence      VARCHAR(15);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_active_bars SMALLINT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS cluster_burst_bars  SMALLINT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS upgrade             BOOLEAN NOT NULL DEFAULT FALSE;
+-- §1 production signal context: PRIMARY_LEVEL_CONTINUATION /
+-- PRIMARY_LEVEL_COUNTERTREND_REVERSAL / CHAIN_LED_EMERGENT_ENTRY
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS signal_context        VARCHAR(36);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS emergent_location_id  BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS target1_oi_name       VARCHAR(4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS target2_oi_name       VARCHAR(4);
 -- Next-day-expiry (Tue/Thu) mode: interchangeable levels + OTM target strike
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS day_mode      VARCHAR(10);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS traded_strike NUMERIC(12,4);
@@ -828,3 +834,32 @@ CREATE TABLE IF NOT EXISTS gate_controls (
     UNIQUE (control_label, symbol, strike, alert_time)
 );
 CREATE INDEX IF NOT EXISTS idx_gate_controls_type ON gate_controls (control_type);
+
+-- ── §6 Emergent intraday locations (chain-led entry reference) ─────────────────
+CREATE TABLE IF NOT EXISTS emergent_locations (
+    id                BIGSERIAL PRIMARY KEY,
+    session_date      DATE        NOT NULL,
+    symbol            VARCHAR(10) NOT NULL,
+    location_type     VARCHAR(12),                 -- SUPPORT (calls) / RESISTANCE (puts)
+    location_spot     NUMERIC(12,4),               -- spot at the start of the qualifying chain event
+    direction         VARCHAR(10),                 -- BULLISH / BEARISH
+    event_start       TIMESTAMPTZ,
+    event_end         TIMESTAMPTZ,
+    atm_strike        NUMERIC(12,4),
+    itm_strike        NUMERIC(12,4),
+    otm_strike        NUMERIC(12,4),
+    atm_vol_3m        BIGINT,
+    itm_vol_3m        BIGINT,
+    otm_vol_3m        BIGINT,
+    combined_vol_3m   BIGINT,
+    atm_notional      NUMERIC(16,2),
+    combined_notional NUMERIC(16,2),
+    atm_low_dist      NUMERIC(8,4),
+    itm_low_dist      NUMERIC(8,4),
+    otm_low_dist      NUMERIC(8,4),
+    call_leadership   NUMERIC(6,3),
+    put_leadership    NUMERIC(6,3),
+    selected_strike   NUMERIC(12,4),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_emergent_date ON emergent_locations (session_date, symbol);

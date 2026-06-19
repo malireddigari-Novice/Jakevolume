@@ -418,6 +418,30 @@ def get_recent_bars(symbol: str, limit: int = 40) -> list:
 
 # ── Signals ───────────────────────────────────────────────────────────────────
 
+def save_emergent_location(loc: dict) -> Optional[int]:
+    """Insert a chain-led emergent location (§6); return its id (for the signal FK)."""
+    cols = ('session_date', 'symbol', 'location_type', 'location_spot', 'direction',
+            'event_start', 'event_end', 'atm_strike', 'itm_strike', 'otm_strike',
+            'atm_vol_3m', 'itm_vol_3m', 'otm_vol_3m', 'combined_vol_3m', 'atm_notional',
+            'combined_notional', 'atm_low_dist', 'itm_low_dist', 'otm_low_dist',
+            'call_leadership', 'put_leadership', 'selected_strike')
+    sql = (f"INSERT INTO emergent_locations ({','.join(cols)}) "
+           f"VALUES ({','.join('%(' + c + ')s' for c in cols)}) RETURNING id")
+    row = {c: loc.get(c) for c in cols}
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, row)
+            loc_id = cur.fetchone()[0]
+        conn.commit()
+        return loc_id
+    except Exception as exc:
+        logger.warning("save_emergent_location failed: %s", exc)
+        return None
+    finally:
+        _put(conn)
+
+
 def save_signal(signal: dict) -> int:
     """Insert a fired signal and return its new row id for downstream logging."""
     sql = """
@@ -428,6 +452,7 @@ def save_signal(signal: dict) -> int:
              prox_score, cluster_strength, strong_cluster, flow_shape,
              signal_shape, confidence, upgrade, cluster_active_bars, cluster_burst_bars,
              day_mode, traded_strike, target_level,
+             signal_context, emergent_location_id, target1_oi_name, target2_oi_name,
              atm_vol_1m, atm_spike_ratio, atm_vol_3m,
              itm_vol_1m, itm_spike_ratio, itm_vol_3m,
              spread_pct, low_dist, room_score, room_pct,
@@ -441,6 +466,7 @@ def save_signal(signal: dict) -> int:
              %(prox_score)s, %(cluster_strength)s, %(strong_cluster)s, %(flow_shape)s,
              %(signal_shape)s, %(confidence)s, %(upgrade)s, %(cluster_active_bars)s, %(cluster_burst_bars)s,
              %(day_mode)s, %(traded_strike)s, %(target_level)s,
+             %(signal_context)s, %(emergent_location_id)s, %(target1_oi_name)s, %(target2_oi_name)s,
              %(atm_vol_1m)s, %(atm_spike_ratio)s, %(atm_vol_3m)s,
              %(itm_vol_1m)s, %(itm_spike_ratio)s, %(itm_vol_3m)s,
              %(spread_pct)s, %(low_dist)s, %(room_score)s, %(room_pct)s,
