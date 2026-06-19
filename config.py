@@ -145,6 +145,25 @@ CHAIN_LEADERSHIP_MARGIN        = float(os.getenv('CHAIN_LEADERSHIP_MARGIN', '0.2
 CHAIN_EVENT_SHARE_MIN          = float(os.getenv('CHAIN_EVENT_SHARE_MIN', '0.35'))
 CHAIN_COMBINED_EVENT_SHARE_MIN = float(os.getenv('CHAIN_COMBINED_EVENT_SHARE_MIN', '0.45'))
 
+# ── Intraday trend tracker + countertrend reversal gate (§8-14, §20) ───────────
+# A signal opposing a strong, still-working, leadership-confirmed move must clear a
+# STRICTER gate than an ordinary continuation entry, else it is held as a watch.
+COUNTERTREND_GATE_ENABLED = os.getenv('COUNTERTREND_GATE_ENABLED', 'true').lower() == 'true'
+# Trend model (lightweight: established move% + leadership; VWAP is not a gate).
+ESTABLISHED_MOVE_PCT          = float(os.getenv('ESTABLISHED_MOVE_PCT', '0.01'))   # |spot−open|/open
+LEADERSHIP_FADE_RATIO         = float(os.getenv('LEADERSHIP_FADE_RATIO', '0.50'))  # ≤ this × session peak = fading
+FRESH_CONVICTION_LOOKBACK_MIN = int(os.getenv('FRESH_CONVICTION_LOOKBACK_MIN', '10'))
+TREND_PROGRESS_LOOKBACK_BARS  = int(os.getenv('TREND_PROGRESS_LOOKBACK_BARS', '5'))  # new high/low within N bars = working
+# Stricter countertrend absolute floors (§9) — per-symbol.
+COUNTERTREND_SINGLE_PRINT_FLOOR = {'NVDA': 1250, 'TSLA': 1250, 'default': 1000}
+COUNTERTREND_3M_FLOOR           = {'NVDA': 2250, 'TSLA': 2250, 'default': 1750}
+COUNTERTREND_5M_FLOOR           = {'NVDA': 3000, 'TSLA': 3000, 'default': 2500}
+# Stricter countertrend leadership (§11).
+COUNTERTREND_LEADERSHIP_MIN    = float(os.getenv('COUNTERTREND_LEADERSHIP_MIN', '0.80'))
+COUNTERTREND_LEADERSHIP_MARGIN = float(os.getenv('COUNTERTREND_LEADERSHIP_MARGIN', '0.25'))
+# §14 watch window — hold a sub-threshold countertrend event this long for promotion.
+COUNTERTREND_WATCH_MINUTES     = int(os.getenv('COUNTERTREND_WATCH_MINUTES', '30'))
+
 # Valid volume cluster: rolling 5-bar window.
 #   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0
 #   ActiveBars5  = bars in window with per-bar ratio ≥ 2.0      ≥ 3

@@ -165,7 +165,12 @@ def send_signal(sig: dict) -> None:
         return
 
     # ── Primary-level card ──
-    lines.append("Signal: PRIMARY LEVEL")
+    if context == 'PRIMARY_LEVEL_COUNTERTREND_REVERSAL':
+        side_word = 'PUT' if opt_type == 'PUT' else 'CALL'
+        lines.append(f"Signal: PRIMARY LEVEL {side_word}")
+        lines.append("Trigger: Countertrend Reversal Confirmed")
+    else:
+        lines.append("Signal: PRIMARY LEVEL")
     if spot is not None:
         lines.append(f"Spot: {spot:.2f}")
     lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())

@@ -39,6 +39,7 @@ from typing import Optional
 import config
 from analysis.flow_reversal import volume_event
 from analysis.volume_analytics import compute_leadership_scores
+from analysis.trend import IntradayTrend
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -274,6 +275,9 @@ class SignalDetector:
         self._completed_bar_fn = None
         self._completed_bar_cache: dict = {}
         self._pending_candidates: dict = {}
+        # §8-14 intraday trend tracker + countertrend watch set (reset daily).
+        self._trend = IntradayTrend()
+        self._countertrend_watch: dict = {}
         # §14 prior major volume events per contract key → [(volume, price), …].
         self._major_events: dict[str, list[tuple[int, float]]] = defaultdict(list)
         self._history_date: Optional[date] = None
@@ -338,6 +342,8 @@ class SignalDetector:
             self._major_events    = defaultdict(list)
             self._completed_bar_cache = {}
             self._pending_candidates  = {}
+            self._trend.reset()
+            self._countertrend_watch  = {}
 
         # Durable dedup: fold in directions already fired today (DB).
         if fired_today_fn is not None:
@@ -381,6 +387,12 @@ class SignalDetector:
 
             opt_data_map[(s, ot)] = data
             vol_deltas[(s, ot)]   = delta
+
+        # ── §8-14 Per-poll leadership + intraday trend update (computed once) ──
+        leadership = (compute_leadership_scores(symbol, opt_data_map, self._opt_vol_hist,
+                                                self._contract_low_dist)
+                      if opt_data_map else None)
+        self._trend.update(symbol, close_price, bar_time, leadership)
 
         # ── Opening-range thresholds (§15) — raised, never suppressed ──────────
         single_mult     = config.OPENING_RANGE_VOL_MULT      if opening_range else 1.0
@@ -524,6 +536,25 @@ class SignalDetector:
                 next_day_mode=next_day_mode, day_mode=day_mode,
                 trade_data=trade_data, traded_strike=traded_strike, target_level=target_level,
             )
+
+            # ── §8-12 Countertrend reversal-conviction gate ───────────────────
+            # A candidate that passed every normal gate but OPPOSES a strong, still-
+            # working, leadership-confirmed move must clear stricter evidence, else it
+            # is held as a watch (does not fire, does not consume the day's allowance).
+            ct_decision, ct_reason = 'CONTINUATION', None
+            if config.COUNTERTREND_GATE_ENABLED:
+                ct_decision, ct_reason = self._countertrend_gate(
+                    symbol, signal_type, atm, itm, leadership, bar_time)
+            if ct_decision == 'WATCH':
+                self._note_countertrend_watch(symbol, signal_type, label, signal, bar_time)
+                self._log_eval(symbol, label, strike, close_price, confirm_type,
+                               reason=ct_reason, dist=dist, atm=atm, low=atm_low, hv=hv_pctile)
+                continue
+            if ct_decision == 'REVERSAL':
+                signal['signal_context'] = 'PRIMARY_LEVEL_COUNTERTREND_REVERSAL'
+                signal['bias'] = 'Countertrend reversal'
+                signal['signal_shape'] = signal['flow_shape'] = 'COUNTERTREND_REVERSAL'
+
             candidates.append(signal)
             self._record_candidate(symbol, label, strike, close_price, confirm_type,
                                    reason='PASSED', dist=dist, atm=atm, low=atm_low)
@@ -558,7 +589,8 @@ class SignalDetector:
             for confirm_type in ('CALL', 'PUT'):
                 csig, creason = self._chain_led_entry(
                     symbol, confirm_type, opt_data_map, vol_deltas, levels,
-                    close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio)
+                    close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio,
+                    leadership=leadership)
                 if csig is not None:
                     st = csig['signal_type']
                     self._fired_today[(symbol, st, 'CHAIN_LED_EMERGENT_ENTRY')] = True
@@ -952,7 +984,7 @@ class SignalDetector:
 
     def _chain_led_entry(self, symbol, confirm_type, opt_data_map, vol_deltas, levels,
                          close_price, expiry, bars, bar_time, now, next_day_mode,
-                         hv_pctile, pc_ratio):
+                         hv_pctile, pc_ratio, leadership=None):
         """
         §3-7 — chain-led emergent entry. Coordinated ATM + adjacent-strike volume builds a
         new emergent support/resistance before spot reaches a primary level. Returns
@@ -1031,8 +1063,9 @@ class SignalDetector:
         if atm_m['persistent_bg']:
             return None, 'CHAIN_VOLUME_INSUFFICIENT'
 
-        # §4I directional leadership
-        ld = compute_leadership_scores(symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist)
+        # §4I directional leadership (computed once per poll, passed in)
+        ld = leadership if leadership is not None else compute_leadership_scores(
+            symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist)
         call_ld = (ld or {}).get('call_leadership', 0.0)
         put_ld  = (ld or {}).get('put_leadership', 0.0)
         lead, opp = (call_ld, put_ld) if confirm_type == 'CALL' else (put_ld, call_ld)
@@ -1104,6 +1137,65 @@ class SignalDetector:
         sig['chain_combined_3m'] = c3
         sig['emergent_spot'] = emergent_spot
         return sig, None
+
+    def _countertrend_gate(self, symbol, signal_type, atm, itm, leadership, bar_time):
+        """
+        §8-12 — verdict for a candidate vs the active intraday trend:
+          'CONTINUATION' — no active trend or aligned → ordinary signal,
+          'REVERSAL'     — opposes a still-working, leadership-confirmed move AND clears
+                           the stricter floors / chain / leadership / thesis gate → fire,
+          'WATCH'        — opposes but fails the stricter gate → hold, do not fire.
+        """
+        trend_dir = self._trend.active_direction(symbol)
+        if trend_dir is None or signal_type == trend_dir:
+            return 'CONTINUATION', None
+
+        def grp(d):
+            return d.get(symbol, d['default'])
+        ct_s, ct_3, ct_5 = (grp(config.COUNTERTREND_SINGLE_PRINT_FLOOR),
+                            grp(config.COUNTERTREND_3M_FLOOR), grp(config.COUNTERTREND_5M_FLOOR))
+        peak1m = atm.get('peak_1m') or 0
+        vol3m  = atm.get('vol_3m') or 0
+        vol5m  = atm.get('vol_5m') or 0
+        vol_ok   = peak1m >= ct_s or vol3m >= ct_3 or vol5m >= ct_5                    # §9
+        chain_ok = (bool(atm.get('valid')) and bool(itm.get('valid'))) or peak1m >= 1.5 * ct_s  # §10
+        call_ld = (leadership or {}).get('call_leadership', 0.0) or 0.0
+        put_ld  = (leadership or {}).get('put_leadership', 0.0) or 0.0
+        opp, same = (put_ld, call_ld) if signal_type == 'BEARISH' else (call_ld, put_ld)
+        lead_ok = (opp >= config.COUNTERTREND_LEADERSHIP_MIN
+                   and (opp - same) >= config.COUNTERTREND_LEADERSHIP_MARGIN)          # §11
+        thesis_ok = (self._trend.same_side_fading(symbol, trend_dir, bar_time)
+                     or not self._trend.still_working(symbol))                         # §12
+        if vol_ok and chain_ok and lead_ok and thesis_ok:
+            return 'REVERSAL', None
+        if not vol_ok:
+            reason = 'COUNTERTREND_VOLUME_INSUFFICIENT'
+        elif not chain_ok:
+            reason = 'COUNTERTREND_CHAIN_CONFIRMATION_MISSING'
+        elif not lead_ok:
+            reason = 'COUNTERTREND_LEADERSHIP_INSUFFICIENT'
+        else:
+            reason = 'ACTIVE_TREND_NOT_FADING'
+        return 'WATCH', reason
+
+    def _note_countertrend_watch(self, symbol, signal_type, label, signal, bar_time):
+        """§14 — record a countertrend watch once (in-memory, 30-min window). The per-poll
+        re-evaluation promotes it to a REVERSAL automatically when conviction appears; the
+        watch itself never fires a Discord alert nor consumes the day's direction allowance."""
+        key = (symbol, signal_type)
+        w = self._countertrend_watch.get(key)
+        if w and (bar_time - w['start']).total_seconds() / 60.0 > config.COUNTERTREND_WATCH_MINUTES:
+            w = None
+        if w is None:
+            self._countertrend_watch[key] = {
+                'start': bar_time, 'direction': signal_type, 'level': label,
+                'initial_volume': signal.get('atm_vol_1m'),
+                'initial_ratio': signal.get('atm_spike_ratio'),
+                'initial_notional': signal.get('premium_notional'),
+            }
+            logger.info("COUNTERTREND_WATCH_CREATED  %s %s @ %s  vol=%s ratio=%s",
+                        symbol, signal_type, label, signal.get('atm_vol_1m'),
+                        signal.get('atm_spike_ratio'))
 
     def _log_eval(self, symbol, label, strike, spot, confirm_type, *,
                   reason: str, dist: float, atm: dict = None,
