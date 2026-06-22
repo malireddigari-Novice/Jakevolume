@@ -340,6 +340,11 @@ BARS_TO_FETCH                = int(os.getenv('BARS_TO_FETCH', '40'))
 SESSION_BARS                 = int(os.getenv('SESSION_BARS', '400'))
 # Collect 1-min OHLCV for the 6 S/R level option contracts each poll (Schwab).
 COLLECT_LEVEL_BARS           = os.getenv('COLLECT_LEVEL_BARS', 'true').lower() == 'true'
+# Morning-snapshot 1-hour option-bar pull (Alpaca) for the 6 S/R level contracts.
+# Runs once per day alongside the OI briefing; persists OPT_HOURLY_LOOKBACK_DAYS of
+# 1Hour OHLCV per contract to option_hourly_bars for historical context/backtests.
+COLLECT_HOURLY_OPTION_BARS   = os.getenv('COLLECT_HOURLY_OPTION_BARS', 'true').lower() == 'true'
+OPT_HOURLY_LOOKBACK_DAYS     = int(os.getenv('OPT_HOURLY_LOOKBACK_DAYS', '10'))
 # Retention: keep only this many recent trading days of 1-min bar data
 # (price_bars + option_level_bars). Alerts/signals are never pruned.
 BAR_RETENTION_DAYS           = int(os.getenv('BAR_RETENTION_DAYS', '10'))

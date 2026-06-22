@@ -91,6 +91,37 @@ CREATE TABLE IF NOT EXISTS option_level_bars (
 CREATE INDEX IF NOT EXISTS idx_olb_symbol_date_time
     ON option_level_bars (symbol, level_date, bar_time DESC);
 
+-- ── 1-hour OHLCV history for each S/R level's option contract ───────────────
+-- Pulled once per trading day in morning_snapshot from Alpaca (1Hour bars over
+-- the trailing OPT_HOURLY_LOOKBACK_DAYS). One row per hourly candle per contract;
+-- snap_date is the morning the pull ran. ON CONFLICT (occ_symbol, bar_time) keeps
+-- the latest candle values so an overlapping next-day pull self-corrects. Pruned
+-- with the other bar data (by bar_time) so storage stays bounded.
+CREATE TABLE IF NOT EXISTS option_hourly_bars (
+    id          BIGSERIAL     PRIMARY KEY,
+    symbol      VARCHAR(10)   NOT NULL,
+    snap_date   DATE          NOT NULL,
+    level_type  VARCHAR(10)   NOT NULL CHECK (level_type IN ('SUPPORT','RESISTANCE')),
+    rank        SMALLINT      NOT NULL CHECK (rank BETWEEN 1 AND 10),
+    strike      NUMERIC(12,4) NOT NULL,
+    option_type VARCHAR(4)    NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    expiry      DATE          NOT NULL,
+    occ_symbol  VARCHAR(30)   NOT NULL,
+    bar_time    TIMESTAMPTZ   NOT NULL,
+    open        NUMERIC(12,4) NOT NULL,
+    high        NUMERIC(12,4) NOT NULL,
+    low         NUMERIC(12,4) NOT NULL,
+    close       NUMERIC(12,4) NOT NULL,
+    volume      BIGINT        NOT NULL,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (occ_symbol, bar_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohb_symbol_snap
+    ON option_hourly_bars (symbol, snap_date);
+CREATE INDEX IF NOT EXISTS idx_ohb_occ_time
+    ON option_hourly_bars (occ_symbol, bar_time DESC);
+
 -- ── Fired signals ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS signals (
     id                 BIGSERIAL    PRIMARY KEY,

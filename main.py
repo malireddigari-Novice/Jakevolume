@@ -183,6 +183,16 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
             except Exception:
                 logger.warning("%s: secondary OI watchlist failed", symbol, exc_info=True)
 
+            # ── 1-hour option bars for the 6 S/R level contracts (Alpaca) ──
+            # Recent hourly price/volume history for each watched OI contract,
+            # pulled once per day alongside the briefing. Alpaca-only (Schwab
+            # serves no option price-history); skipped if no Alpaca data client.
+            if adata is not None and config.COLLECT_HOURLY_OPTION_BARS:
+                try:
+                    _collect_hourly_option_bars(symbol, levels, expiry, today, adata)
+                except Exception:
+                    logger.warning("%s: hourly option-bar collection failed", symbol, exc_info=True)
+
             # ── Log to Google Sheets ──
             sheets.log_daily_levels(symbol, levels, pm_price, now)
             sheets.log_oi_snapshot(
@@ -563,6 +573,46 @@ def _collect_level_bars(symbol, levels, expiry, level_date, data_src,
 
     db.save_option_level_bars(rows)
     logger.debug("%s: saved %d option-level bars across %d levels", symbol, len(rows), len(levels))
+
+
+def _collect_hourly_option_bars(symbol, levels, expiry, snap_date, adata) -> None:
+    """
+    Pull and persist OPT_HOURLY_LOOKBACK_DAYS of 1-hour OHLCV for each S/R level's
+    option contract (Alpaca). Runs once per day in the morning snapshot, giving the
+    6 watched OI contracts recent hourly price/volume history for analysis/backtests.
+    Best-effort per contract: one contract's failure never blocks the others.
+    """
+    rows: list[dict] = []
+    for lv in levels:
+        strike      = float(lv['strike'])
+        option_type = lv['option_type']
+        occ         = occ_symbol(symbol, expiry, strike, option_type)
+        try:
+            hbars = adata.get_option_hourly_bars(occ)
+        except Exception:
+            logger.warning("%s: hourly option-bar fetch failed for %s", symbol, occ, exc_info=True)
+            continue
+        for b in hbars:
+            rows.append({
+                'symbol':      symbol,
+                'snap_date':   snap_date,
+                'level_type':  lv['level_type'],
+                'rank':        lv['rank'],
+                'strike':      strike,
+                'option_type': option_type,
+                'expiry':      expiry,
+                'occ_symbol':  occ,
+                'bar_time':    b['bar_time'],
+                'open':        b['open'],
+                'high':        b['high'],
+                'low':         b['low'],
+                'close':       b['close'],
+                'volume':      b['volume'],
+            })
+
+    db.save_option_hourly_bars(rows)
+    logger.info("%s: saved %d hourly option bars across %d levels",
+                symbol, len(rows), len(levels))
 
 
 # ── Desktop notification ──────────────────────────────────────────────────────

@@ -247,6 +247,19 @@ class AlpacaDataClient:
         bars = self._option_bars(occ_symbol, '1Min', self._today_start_utc())
         return bars[-count:]
 
+    def get_option_hourly_bars(self, occ_symbol: str,
+                               lookback_days: int = None) -> list[dict]:
+        """
+        1-hour OHLCV candles for `occ_symbol` over the trailing `lookback_days`
+        (default OPT_HOURLY_LOOKBACK_DAYS). Used by the morning snapshot to capture
+        recent hourly price/volume context for each S/R level contract. Returns the
+        same bar shape as get_option_bars: {bar_time(CST), open, high, low, close, volume}.
+        """
+        lookback_days = lookback_days or config.OPT_HOURLY_LOOKBACK_DAYS
+        start = (datetime.now(CST) - timedelta(days=lookback_days)).astimezone(
+            pytz.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return self._option_bars(occ_symbol, '1Hour', start)
+
     def get_option_history_range(self, occ_symbol: str,
                                  lookback_days: int = None) -> Optional[tuple[float, float]]:
         lookback_days = lookback_days or config.OPT_HIST_LOOKBACK_DAYS

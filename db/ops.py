@@ -330,6 +330,47 @@ def save_option_level_bars(rows: list) -> None:
         _put(conn)
 
 
+def save_option_hourly_bars(rows: list) -> None:
+    """
+    Bulk-upsert 1-hour OHLCV bars for S/R level option contracts (morning pull).
+
+    Each row dict must carry: symbol, snap_date, level_type, rank, strike,
+    option_type, expiry, occ_symbol, bar_time, open, high, low, close, volume.
+    ON CONFLICT (occ_symbol, bar_time) refreshes the candle (and snap_date) so an
+    overlapping next-day pull settles each hourly bar to its final values.
+    """
+    if not rows:
+        return
+    values = [
+        (
+            r['symbol'], r['snap_date'], r['level_type'], r['rank'], r['strike'],
+            r['option_type'], r['expiry'], r['occ_symbol'], r['bar_time'],
+            r['open'], r['high'], r['low'], r['close'], r['volume'],
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO option_hourly_bars
+            (symbol, snap_date, level_type, rank, strike, option_type, expiry,
+             occ_symbol, bar_time, open, high, low, close, volume)
+        VALUES %s
+        ON CONFLICT (occ_symbol, bar_time) DO UPDATE SET
+            snap_date = EXCLUDED.snap_date,
+            open      = EXCLUDED.open,
+            high      = EXCLUDED.high,
+            low       = EXCLUDED.low,
+            close     = EXCLUDED.close,
+            volume    = EXCLUDED.volume
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def prune_old_bars(keep_days: int = 10) -> dict:
     """
     Retain only the most recent `keep_days` trading days of 1-min bar data.
@@ -385,14 +426,23 @@ def prune_old_bars(keep_days: int = 10) -> dict:
             )
             sc = cur.rowcount
 
+            # Hourly option bars carry a trailing window per pull; prune by the
+            # candle's own date (like price_bars), not the pull's snap_date.
+            cur.execute(
+                "DELETE FROM option_hourly_bars "
+                "WHERE (bar_time AT TIME ZONE 'America/Chicago')::date < %s",
+                (cutoff,),
+            )
+            ohb = cur.rowcount
+
         conn.commit()
         logger.info(
             "prune_old_bars: kept %d trading days (>= %s); deleted price_bars=%d, "
-            "option_level_bars=%d, signal_candidates=%d",
-            keep_days, cutoff, pb, olb, sc,
+            "option_level_bars=%d, signal_candidates=%d, option_hourly_bars=%d",
+            keep_days, cutoff, pb, olb, sc, ohb,
         )
         return {'cutoff': cutoff, 'price_bars': pb, 'option_level_bars': olb,
-                'signal_candidates': sc}
+                'signal_candidates': sc, 'option_hourly_bars': ohb}
     finally:
         _put(conn)
 
