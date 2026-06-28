@@ -22,6 +22,30 @@ CREATE TABLE IF NOT EXISTS option_chain_snapshots (
 CREATE INDEX IF NOT EXISTS idx_ocs_symbol_date
     ON option_chain_snapshots (symbol, snap_date);
 
+-- ── Near-dated multi-expiry OI snapshots (weekend-gap detection) ───────────
+-- Deliberately separate from option_chain_snapshots: that table is normalized to
+-- the single nearest expiry and several queries (e.g. get_oi_changes_today) collapse
+-- by (strike, option_type) ignoring expiry. Storing multiple expiries here keeps the
+-- weekend-gap feature from corrupting the nearest-expiry buildup/watchlist logic.
+-- One row per (symbol, snap_date, expiry, strike, option_type); weekend gaps are
+-- computed at query time by comparing two snap_dates.
+CREATE TABLE IF NOT EXISTS near_oi_snapshots (
+    id               BIGSERIAL    PRIMARY KEY,
+    symbol           VARCHAR(10)  NOT NULL,
+    snap_date        DATE         NOT NULL,
+    snap_time        TIMESTAMPTZ  NOT NULL,
+    expiry_date      DATE         NOT NULL,
+    strike           NUMERIC(12,4) NOT NULL,
+    option_type      VARCHAR(4)   NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    open_interest    BIGINT       NOT NULL DEFAULT 0,
+    underlying_price NUMERIC(12,4),
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, snap_date, expiry_date, strike, option_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nos_symbol_date
+    ON near_oi_snapshots (symbol, snap_date);
+
 -- ── Daily OI levels (3 S + 3 R per symbol, computed at 08:00 CST) ──────────
 CREATE TABLE IF NOT EXISTS oi_levels (
     id            BIGSERIAL    PRIMARY KEY,

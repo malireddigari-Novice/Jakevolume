@@ -104,6 +104,7 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
 
     sentiments:    list[dict] = []
     all_oi_buildup: list[dict] = []   # top OI_BUILDUP rows across all symbols → briefing
+    weekend_gaps:  list[dict] = []    # per-symbol weekend/holiday OI gaps → briefing
 
     for symbol in config.SYMBOLS:
         try:
@@ -183,6 +184,26 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
             except Exception:
                 logger.warning("%s: secondary OI watchlist failed", symbol, exc_info=True)
 
+            # ── Weekend / post-holiday OI gaps (near-dated, multi-expiry) ──
+            # Snapshot every near-dated expiry daily into the isolated
+            # near_oi_snapshots table so the prior session is always on hand; on
+            # the first session after a multi-day market closure (gap >= 2 days),
+            # surface the biggest OI changes since then in the briefing.
+            if config.WEEKEND_OI_GAPS_ENABLED:
+                try:
+                    near_chains = schwab.get_near_dated_chains(symbol)
+                    db.save_near_oi_snapshots(symbol, today, now, near_chains)
+                    wk = db.get_weekend_oi_gaps(
+                        symbol, today,
+                        config.WEEKEND_GAP_MIN_CONTRACTS,
+                        config.WEEKEND_GAP_MIN_PCT,
+                        config.WEEKEND_GAP_TOP_N,
+                    )
+                    if wk['gaps'] and (wk.get('gap_days') or 0) >= 2:
+                        weekend_gaps.append({'symbol': symbol, **wk})
+                except Exception:
+                    logger.warning("%s: weekend OI gap detection failed", symbol, exc_info=True)
+
             # ── 1-hour option bars for the 6 S/R level contracts (Alpaca) ──
             # Recent hourly price/volume history for each watched OI contract,
             # pulled once per day alongside the briefing. Alpaca-only (Schwab
@@ -240,7 +261,7 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
         for s in sentiments
     ]
     top_buildup = sorted(all_oi_buildup, key=lambda x: x.get('oi_change') or 0, reverse=True)[:5]
-    discord_briefing(discord_results, now, oi_buildup=top_buildup)
+    discord_briefing(discord_results, now, oi_buildup=top_buildup, weekend_gaps=weekend_gaps)
 
     # Retention: keep only the most recent N trading days of 1-min bar data.
     # Runs once per trading day here; alerts/signals are never pruned.

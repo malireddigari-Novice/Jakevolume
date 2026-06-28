@@ -248,6 +248,29 @@ class SchwabClient:
             )
         return result
 
+    def get_near_dated_chains(self, symbol: str, days: int = None) -> list[dict]:
+        """
+        Return every near-dated expiry (within `days`, default config.NEAR_OI_EXPIRY_DAYS)
+        as a list of normalized per-expiry chains, nearest expiry first.
+
+        Each item: {expiry: date, underlying_price: float|None, calls, puts, all}.
+        Used for weekend-gap OI detection across this-week + next-week expirations
+        — independent of the single-nearest-expiry chain used for S/R levels.
+        Returns [] on any error so the caller can skip the feature gracefully.
+        """
+        if days is None:
+            days = config.NEAR_OI_EXPIRY_DAYS
+        if not self._client:
+            return []
+        raw = self._get_option_chain(symbol, days=days)
+        if raw is None:
+            return []
+        max_expiry = date.today() + timedelta(days=days)
+        chains = _normalize_chains_multi(raw, max_expiry)
+        logger.info("Schwab: %s near-dated chains within %dd — %d expiries",
+                    symbol, days, len(chains))
+        return chains
+
     def get_bars(self, symbol: str, count: int = None) -> list[dict]:
         """
         Return the latest `count` 1-minute OHLCV bars for an equity, oldest-first.
@@ -482,12 +505,14 @@ class SchwabClient:
         symbol: str,
         expiry: Optional[date] = None,
         max_retries: int = 4,
+        days: int = 7,
     ) -> Optional[dict]:
         """
         Call the Schwab option chain endpoint with exponential back-off on 429.
 
         If expiry is given, restricts to that single date.  Otherwise fetches
-        the next 7 days so the caller can pick the nearest available expiry.
+        the next `days` days (default 7) so the caller can pick the nearest
+        available expiry — or, with a wider window, several near-dated expiries.
         Returns the raw JSON dict on success, None on unrecoverable error.
         """
         for attempt in range(max_retries):
@@ -496,7 +521,7 @@ class SchwabClient:
                     from_date, to_date = expiry, expiry
                 else:
                     from_date = date.today()
-                    to_date   = from_date + timedelta(days=7)
+                    to_date   = from_date + timedelta(days=days)
                 resp = self._client.get_option_chain(
                     symbol,
                     contract_type=schwab.client.Client.Options.ContractType.ALL,
@@ -534,6 +559,68 @@ class SchwabClient:
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _exp_maps(data: dict) -> tuple[dict, dict]:
+    """Parse Schwab call/put ExpDateMaps into {expiry_date: [contract, ...]} buckets."""
+    calls_by_exp: dict[date, list] = {}
+    puts_by_exp:  dict[date, list] = {}
+    for opt_type, exp_map, bucket in [
+        ('CALL', data.get('callExpDateMap', {}), calls_by_exp),
+        ('PUT',  data.get('putExpDateMap',  {}), puts_by_exp),
+    ]:
+        for date_dte, strikes_map in exp_map.items():
+            exp_date = date.fromisoformat(date_dte.split(':')[0])
+            bucket.setdefault(exp_date, [])
+            for strike_str, contracts in strikes_map.items():
+                if not contracts:
+                    continue
+                c = contracts[0]
+                raw_iv = c.get('volatility')
+                iv = (float(raw_iv) / 100.0) if raw_iv is not None else None
+                bucket[exp_date].append({
+                    'strike':        float(strike_str),
+                    'expiry':        exp_date,
+                    'open_interest': int(c.get('openInterest', 0) or 0),
+                    'volume':        int(c.get('totalVolume', 0) or 0),
+                    'bid':           c.get('bid'),
+                    'ask':           c.get('ask'),
+                    'mark':          c.get('mark'),
+                    'delta':         c.get('delta'),
+                    'gamma':         c.get('gamma'),
+                    'theta':         c.get('theta'),
+                    'vega':          c.get('vega'),
+                    'rho':           c.get('rho'),
+                    'implied_vol':   iv,
+                })
+    return calls_by_exp, puts_by_exp
+
+
+def _normalize_chains_multi(data: dict, max_expiry: date) -> list[dict]:
+    """
+    Return ALL expiries that have both calls and puts and fall on/before max_expiry,
+    nearest first. Each item mirrors _normalize_chain's single-expiry shape plus an
+    'underlying_price' field. Used for multi-expiry weekend-gap OI snapshots.
+    """
+    calls_by_exp, puts_by_exp = _exp_maps(data)
+    und = data.get('underlyingPrice')
+    und = float(und) if und is not None else None
+
+    out: list[dict] = []
+    for exp in sorted(set(calls_by_exp) & set(puts_by_exp)):
+        if exp > max_expiry:
+            continue
+        calls = calls_by_exp[exp]
+        puts  = puts_by_exp[exp]
+        out.append({
+            'expiry':           exp,
+            'underlying_price': und,
+            'calls':            calls,
+            'puts':             puts,
+            'all':              [{'option_type': 'CALL', **c} for c in calls] +
+                                [{'option_type': 'PUT',  **p} for p in puts],
+        })
+    return out
+
 
 def _normalize_chain(data: dict) -> Optional[dict]:
     """

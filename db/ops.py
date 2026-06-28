@@ -120,9 +120,15 @@ def reconcile_oi_changes(symbol: str, snap_date: date) -> int:
         oi_change_pct      = oi_change / max(yesterday_oi, 1)
         volume_to_oi       = today_volume / max(yesterday_oi, 1)
 
-    Run once per morning after save_option_chain completes.  Rows with no prior-day
+    Run once per morning after save_option_chain completes.  Rows with no prior
     match (new strikes, first run) are left with NULL oi_change columns.
     Returns the number of rows updated.
+
+    "Prior session" is the most recent snap_date strictly before today that has
+    data — NOT a literal calendar `today - 1 day`. On a Monday that hard offset
+    pointed at Sunday (no snapshot), so every Monday (and post-holiday session)
+    silently reconciled nothing; this resolves to the real prior session (Friday),
+    making the change span the whole weekend/holiday.
     """
     sql = """
         UPDATE option_chain_snapshots AS t
@@ -141,7 +147,10 @@ def reconcile_oi_changes(symbol: str, snap_date: date) -> int:
                 symbol, expiry_date, strike, option_type, open_interest
             FROM option_chain_snapshots
             WHERE symbol    = %s
-              AND snap_date = %s - INTERVAL '1 day'
+              AND snap_date = (
+                  SELECT MAX(snap_date) FROM option_chain_snapshots
+                  WHERE symbol = %s AND snap_date < %s
+              )
             ORDER BY symbol, expiry_date, strike, option_type, snap_time DESC
         ) y
         WHERE t.symbol      = %s
@@ -154,7 +163,7 @@ def reconcile_oi_changes(symbol: str, snap_date: date) -> int:
     conn = _get()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (symbol, snap_date, symbol, snap_date))
+            cur.execute(sql, (symbol, symbol, snap_date, symbol, snap_date))
             count = cur.rowcount
         conn.commit()
         logger.info("OI change reconciled: %s %s — %d rows updated", symbol, snap_date, count)
@@ -704,6 +713,152 @@ def get_oi_changes_today(symbol: str, snap_date: date) -> dict:
     except Exception:
         logger.warning("get_oi_changes_today failed for %s %s", symbol, snap_date, exc_info=True)
         return {}
+    finally:
+        _put(conn)
+
+
+# ── Near-dated multi-expiry OI snapshots + weekend-gap detection ───────────────
+
+def save_near_oi_snapshots(
+    symbol: str,
+    snap_date: date,
+    snap_time: datetime,
+    chains: list,
+) -> None:
+    """
+    Persist raw OI for every near-dated expiry into near_oi_snapshots (one row per
+    contract). `chains` is a list of normalized per-expiry chains, each a dict with
+    'expiry' (date), 'underlying_price' (float|None), and 'all' (list of contract
+    dicts with strike/option_type/open_interest). Re-running the same morning is a
+    no-op (ON CONFLICT DO NOTHING on the natural key).
+    """
+    rows = []
+    for ch in chains:
+        expiry = ch['expiry']
+        und    = ch.get('underlying_price')
+        for c in ch.get('all', []):
+            rows.append((
+                symbol, snap_date, snap_time, expiry,
+                float(c['strike']), c['option_type'],
+                int(c.get('open_interest', 0) or 0), und,
+            ))
+    if not rows:
+        return
+    sql = """
+        INSERT INTO near_oi_snapshots
+            (symbol, snap_date, snap_time, expiry_date, strike, option_type,
+             open_interest, underlying_price)
+        VALUES %s
+        ON CONFLICT (symbol, snap_date, expiry_date, strike, option_type) DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, rows)
+        conn.commit()
+        logger.debug("Saved %d near-OI rows for %s (%d expiries)",
+                     len(rows), symbol, len(chains))
+    finally:
+        _put(conn)
+
+
+def get_prior_near_session(symbol: str, snap_date: date):
+    """Most recent near_oi_snapshots snap_date strictly before `snap_date`, or None."""
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(snap_date) FROM near_oi_snapshots "
+                "WHERE symbol = %s AND snap_date < %s",
+                (symbol, snap_date),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        _put(conn)
+
+
+def get_weekend_oi_gaps(
+    symbol: str,
+    snap_date: date,
+    min_contracts: int,
+    min_pct: float,
+    top_n: int,
+) -> dict:
+    """
+    Compare today's near-dated OI to the most recent prior session and return the
+    biggest qualifying gaps across all near-dated expiries.
+
+    A strike qualifies only if it clears BOTH floors: |oi_change| >= min_contracts
+    AND |oi_change_pct| >= min_pct. Survivors are ranked by |oi_change| descending
+    and truncated to top_n. New strikes with no prior row are skipped (no baseline).
+
+    Returns {'prior_session': date|None, 'gap_days': int|None, 'gaps': [ ... ]}
+    where each gap dict has: expiry, strike, option_type, open_interest,
+    prev_open_interest, oi_change, oi_change_pct. An empty 'gaps' list means no
+    qualifying gap (or no prior session to compare against yet).
+    """
+    prior = get_prior_near_session(symbol, snap_date)
+    if prior is None:
+        return {'prior_session': None, 'gap_days': None, 'gaps': []}
+
+    sql = """
+        WITH today AS (
+            SELECT DISTINCT ON (expiry_date, strike, option_type)
+                expiry_date, strike, option_type, open_interest
+            FROM near_oi_snapshots
+            WHERE symbol = %s AND snap_date = %s
+            ORDER BY expiry_date, strike, option_type, snap_time DESC
+        ),
+        prior AS (
+            SELECT DISTINCT ON (expiry_date, strike, option_type)
+                expiry_date, strike, option_type, open_interest
+            FROM near_oi_snapshots
+            WHERE symbol = %s AND snap_date = %s
+            ORDER BY expiry_date, strike, option_type, snap_time DESC
+        )
+        SELECT t.expiry_date, t.strike, t.option_type,
+               t.open_interest                         AS oi,
+               p.open_interest                         AS prev_oi,
+               t.open_interest - p.open_interest       AS oi_change,
+               ROUND((t.open_interest - p.open_interest)::numeric
+                     / GREATEST(p.open_interest, 1), 4) AS oi_change_pct
+        FROM today t
+        JOIN prior p
+          ON p.expiry_date = t.expiry_date
+         AND p.strike      = t.strike
+         AND p.option_type = t.option_type
+        WHERE ABS(t.open_interest - p.open_interest) >= %s
+          AND ABS(ROUND((t.open_interest - p.open_interest)::numeric
+                        / GREATEST(p.open_interest, 1), 4)) >= %s
+        ORDER BY ABS(t.open_interest - p.open_interest) DESC
+        LIMIT %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, snap_date, symbol, prior,
+                              min_contracts, min_pct, top_n))
+            gaps = [
+                {
+                    'expiry':            r[0],
+                    'strike':            float(r[1]),
+                    'option_type':       r[2],
+                    'open_interest':     int(r[3]),
+                    'prev_open_interest': int(r[4]),
+                    'oi_change':         int(r[5]),
+                    'oi_change_pct':     float(r[6]) if r[6] is not None else None,
+                }
+                for r in cur.fetchall()
+            ]
+        return {
+            'prior_session': prior,
+            'gap_days':      (snap_date - prior).days,
+            'gaps':          gaps,
+        }
+    except Exception:
+        logger.warning("get_weekend_oi_gaps failed for %s %s", symbol, snap_date, exc_info=True)
+        return {'prior_session': prior, 'gap_days': (snap_date - prior).days, 'gaps': []}
     finally:
         _put(conn)
 

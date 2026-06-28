@@ -290,7 +290,25 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
     }
 
 
-def send_morning_briefing(results: list, now: datetime, oi_buildup: list | None = None) -> None:
+def _weekend_gap_line(g: dict) -> str:
+    """One 'CALL $290 · Jul 03 · 18,400→41,200 (+22,800, +124%)' weekend-gap line."""
+    ch   = g.get('oi_change', 0) or 0
+    pct  = g.get('oi_change_pct')
+    pcts = f", {pct:+.0%}" if pct is not None else ""
+    sign = "+" if ch >= 0 else ""
+    return (
+        f"{g['option_type']} ${g['strike']:.0f} · {_fmt_expiry(g.get('expiry'))} · "
+        f"{g.get('prev_open_interest', 0):,}→{g.get('open_interest', 0):,} "
+        f"({sign}{ch:,}{pcts})"
+    )
+
+
+def send_morning_briefing(
+    results: list,
+    now: datetime,
+    oi_buildup: list | None = None,
+    weekend_gaps: list | None = None,
+) -> None:
     """
     Send the 8:20 AM morning briefing to Discord as one mobile-first embed per
     symbol — bias-colored border, stacked Support/Resistance fields with rank
@@ -300,6 +318,11 @@ def send_morning_briefing(results: list, now: datetime, oi_buildup: list | None 
     `results` is the list built in run_morning_snapshot.py / morning_snapshot():
     each item has keys: symbol, prev_close, pm_price, expiry, supports,
     resistances, sentiment (which carries bias + pc_ratio).
+
+    `weekend_gaps` (optional, first session after a weekend/holiday) is a list of
+    per-symbol dicts {symbol, prior_session, gap_days, gaps:[...]} — only symbols
+    with at least one qualifying gap. Rendered as one trailing 'Weekend OI Gaps'
+    embed, one field per symbol.
     """
     url = config.DISCORD_MORNING_WEBHOOK_URL or config.DISCORD_WEBHOOK_URL
     if not url or not results:
@@ -338,6 +361,30 @@ def send_morning_briefing(results: list, now: datetime, oi_buildup: list | None 
             'title': 'OI Buildup (overnight)',
             'color': 0x6E7781,
             'description': "\n".join(bu_lines) or '—',
+            'footer': footer,
+        })
+
+    # Weekend / post-holiday OI gaps: biggest OI changes since the prior session,
+    # across this-week + next-week expiries, one field per symbol.
+    wg = [w for w in (weekend_gaps or []) if w.get('gaps')]
+    if wg:
+        spans = {w['prior_session'] for w in wg if w.get('prior_session')}
+        since = (f"since {min(spans).strftime('%b %d')}" if len(spans) == 1
+                 else "since the prior session")
+        embeds.append({
+            'title': f'🟦 Weekend OI Gaps ({since})',
+            'color': 0x0969DA,
+            'description': (f"Largest near-dated OI changes over the {wg[0].get('gap_days', '?')}-day "
+                            "market closure (≥ thresholds, ranked)."),
+            'fields': [
+                {
+                    'name': (f"{w['symbol']}"
+                             + (f" — {w['gap_days']}d gap" if w.get('gap_days') else "")),
+                    'value': "\n".join(_weekend_gap_line(g) for g in w['gaps']) or '—',
+                    'inline': False,
+                }
+                for w in wg
+            ],
             'footer': footer,
         })
 

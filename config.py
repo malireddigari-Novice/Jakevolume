@@ -41,6 +41,19 @@ SECONDARY_OUTER_BAND_PCT   = float(os.getenv('SECONDARY_OUTER_BAND_PCT', '0.10')
 SECONDARY_OUTER_TOP_N      = int(os.getenv('SECONDARY_OUTER_TOP_N',      '3'))    # top-N outer-wall per side
 SECONDARY_OI_BUILDUP_TOP_N = int(os.getenv('SECONDARY_OI_BUILDUP_TOP_N', '5'))   # top-N by overnight oi_change
 
+# ── Weekend OI gaps ───────────────────────────────────────────────────────────
+# On the first session after a multi-day market closure (Monday, or post-holiday)
+# the OI change since the prior session spans the whole weekend. We snapshot the
+# near-dated multi-expiry chain daily into near_oi_snapshots, then on that first
+# session flag strikes whose OI jumped a lot over the gap. A strike qualifies only
+# if it clears BOTH thresholds (abs floor removes noisy low-OI strikes), then the
+# survivors are ranked biggest-first and the top-N reported per expiration.
+WEEKEND_OI_GAPS_ENABLED  = os.getenv('WEEKEND_OI_GAPS_ENABLED', 'true').lower() == 'true'
+WEEKEND_GAP_MIN_CONTRACTS = int(os.getenv('WEEKEND_GAP_MIN_CONTRACTS', '1000'))   # abs OI change floor
+WEEKEND_GAP_MIN_PCT       = float(os.getenv('WEEKEND_GAP_MIN_PCT', '0.25'))       # 25% change floor
+WEEKEND_GAP_TOP_N         = int(os.getenv('WEEKEND_GAP_TOP_N', '5'))             # top-N gaps reported
+NEAR_OI_EXPIRY_DAYS       = int(os.getenv('NEAR_OI_EXPIRY_DAYS', '14'))          # this week + next
+
 # ── Signal detection ──────────────────────────────────────────────────────────
 # Minimum minutes between signals on the same level (cooldown)
 SIGNAL_COOLDOWN_MINUTES      = int(os.getenv('SIGNAL_COOLDOWN_MINUTES', '30'))
