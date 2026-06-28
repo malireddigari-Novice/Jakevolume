@@ -241,17 +241,25 @@ def _fmt_expiry(expiry) -> str:
 
 def _level_lines(levels: list, prefix: str) -> str:
     """
-    Stacked rank-labelled lines ('S1: $295.00') in OI-rank order — rank 1 first.
+    Stacked rank-labelled lines ('R1: $277.50 — 12,400 OI') ordered by PROXIMITY
+    to spot — rank 1 = nearest level, rank 3 = furthest. A trailing ' *' marks the
+    strike holding the highest open interest on that side (the dominant OI wall).
 
-    Levels are NOT re-sorted by price: the ranks reflect OI strength, so the
-    values may not be numerically ordered. That is expected; preserve the rank.
+    Display ordering only: the persisted `rank` field (set in compute_oi_levels)
+    still reflects OI strength and drives the signal gates — it is left untouched.
+    Resistance strikes sit at/above spot and supports at/below, so nearest-first is
+    ascending strike for resistance ('R') and descending strike for support ('S').
     """
-    ranked = sorted(levels, key=lambda lv: lv.get('rank', 99))
-    if not ranked:
+    if not levels:
         return '—'
-    return "\n".join(
-        f"{prefix}{i}: ${lv['strike']:.2f}" for i, lv in enumerate(ranked[:3], start=1)
-    )
+    by_proximity = sorted(levels, key=lambda lv: lv['strike'], reverse=(prefix == 'S'))[:3]
+    max_oi = max((lv.get('open_interest', 0) or 0) for lv in by_proximity)
+    lines = []
+    for i, lv in enumerate(by_proximity, start=1):
+        oi   = lv.get('open_interest', 0) or 0
+        star = ' *' if oi and oi == max_oi else ''
+        lines.append(f"{prefix}{i}: ${lv['strike']:.2f} — {oi:,} OI{star}")
+    return "\n".join(lines)
 
 
 def _build_symbol_embed(r: dict, footer: dict) -> dict:

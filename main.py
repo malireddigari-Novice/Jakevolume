@@ -274,17 +274,28 @@ def _print_mag7_briefing(sentiments: list[dict], now) -> None:
     print(header)
     print(divider)
 
+    def _prox_cells(levels, reverse):
+        """3 strike cells ordered nearest→furthest; '*' marks the highest-OI strike."""
+        ordered = sorted(levels, key=lambda lv: lv['strike'], reverse=reverse)[:3]
+        max_oi  = max((lv.get('open_interest', 0) or 0 for lv in ordered), default=0)
+        cells   = []
+        for i in range(3):
+            if i < len(ordered):
+                oi   = ordered[i].get('open_interest', 0) or 0
+                star = "*" if oi and oi == max_oi else ""
+                cells.append(f"{ordered[i]['strike']:.1f}{star}")
+            else:
+                cells.append("  - ")
+        return cells
+
     for s in mag7_rows:
         sign = "+" if s['pm_change_pct'] >= 0 else ""
         lvls = s.get('levels', [])
-        sup  = sorted([l for l in lvls if l['level_type'] == 'SUPPORT'],    key=lambda x: x['rank'])
-        res  = sorted([l for l in lvls if l['level_type'] == 'RESISTANCE'], key=lambda x: x['rank'])
-        s1 = f"{sup[0]['strike']:.1f}" if len(sup) > 0 else "  - "
-        s2 = f"{sup[1]['strike']:.1f}" if len(sup) > 1 else "  - "
-        s3 = f"{sup[2]['strike']:.1f}" if len(sup) > 2 else "  - "
-        r1 = f"{res[0]['strike']:.1f}" if len(res) > 0 else "  - "
-        r2 = f"{res[1]['strike']:.1f}" if len(res) > 1 else "  - "
-        r3 = f"{res[2]['strike']:.1f}" if len(res) > 2 else "  - "
+        # Display by proximity: support nearest = highest strike, resistance
+        # nearest = lowest strike. Rank 1 = nearest; '*' = dominant OI wall.
+        # (The persisted `rank` is OI-based and unchanged — gates are unaffected.)
+        s1, s2, s3 = _prox_cells([l for l in lvls if l['level_type'] == 'SUPPORT'],    reverse=True)
+        r1, r2, r3 = _prox_cells([l for l in lvls if l['level_type'] == 'RESISTANCE'], reverse=False)
         print(
             f"  {s['symbol']:<6}  "
             f"{s['prev_close']:>8.2f}  "

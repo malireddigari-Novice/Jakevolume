@@ -106,18 +106,28 @@ hdr = (f"  {'SYM':<6}  {'Prev':>8}  {'PM':>8}  {'Chg%':>6}  {'Bias':<8}"
 print(hdr)
 print("  " + "-" * (W - 2))
 
+def _prox_cells(levels, reverse):
+    """3 strike cells ordered nearest→furthest; '*' marks the highest-OI strike."""
+    ordered = sorted(levels, key=lambda lv: lv['strike'], reverse=reverse)[:3]
+    max_oi  = max((lv.get('open_interest', 0) or 0 for lv in ordered), default=0)
+    cells   = []
+    for i in range(3):
+        if i < len(ordered):
+            oi   = ordered[i].get('open_interest', 0) or 0
+            star = "*" if oi and oi == max_oi else ""
+            cells.append(f"{ordered[i]['strike']:.1f}{star}")
+        else:
+            cells.append("  -  ")
+    return cells
+
 for r in results:
     s   = r['sentiment']
-    sup = r['supports']
-    res = r['resistances']
     sign = "+" if s['pm_change_pct'] >= 0 else ""
 
-    s1 = f"{sup[0]['strike']:.1f}" if len(sup) > 0 else "  -  "
-    s2 = f"{sup[1]['strike']:.1f}" if len(sup) > 1 else "  -  "
-    s3 = f"{sup[2]['strike']:.1f}" if len(sup) > 2 else "  -  "
-    r1 = f"{res[0]['strike']:.1f}" if len(res) > 0 else "  -  "
-    r2 = f"{res[1]['strike']:.1f}" if len(res) > 1 else "  -  "
-    r3 = f"{res[2]['strike']:.1f}" if len(res) > 2 else "  -  "
+    # Supports sit below spot (nearest = highest strike), resistances above
+    # (nearest = lowest strike). Rank 1 = nearest; '*' = dominant OI wall.
+    s1, s2, s3 = _prox_cells(r['supports'],    reverse=True)
+    r1, r2, r3 = _prox_cells(r['resistances'], reverse=False)
 
     print(
         f"  {r['symbol']:<6}  "

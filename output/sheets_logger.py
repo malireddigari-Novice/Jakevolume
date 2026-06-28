@@ -477,18 +477,30 @@ class SheetsLogger:
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _ranked(levels: list[dict], level_type: str) -> list[dict]:
-    return sorted(
-        [lv for lv in levels if lv['level_type'] == level_type],
-        key=lambda x: x['rank'],
-    )
+    """
+    One side's S/R levels ordered by PROXIMITY to spot (nearest first) — matches
+    the morning briefing's rank-1 = nearest display. Resistance strikes sit
+    at/above spot so nearest-first is ascending strike; supports sit at/below so
+    nearest-first is descending. The persisted `rank` field (OI strength, which
+    drives the signal gates) is read elsewhere and is intentionally NOT used here.
+    """
+    side = [lv for lv in levels if lv['level_type'] == level_type]
+    return sorted(side, key=lambda x: x['strike'], reverse=(level_type == 'SUPPORT'))
 
 
 def _level_cols(levels: list[dict], n: int) -> list:
-    """Flatten up to n levels into [strike, oi, strike, oi, …] columns."""
+    """
+    Flatten up to n levels into [strike, oi, strike, oi, …] columns, nearest first.
+    A trailing '*' on the strike marks the highest-OI strike on that side (the
+    dominant wall); non-marked strikes stay native numbers for charting/sorting.
+    """
+    max_oi = max((lv.get('open_interest', 0) or 0 for lv in levels[:n]), default=0)
     out = []
     for i in range(n):
         if i < len(levels):
-            out += [levels[i]['strike'], levels[i]['open_interest']]
+            oi     = levels[i].get('open_interest', 0) or 0
+            strike = f"{levels[i]['strike']}*" if oi and oi == max_oi else levels[i]['strike']
+            out += [strike, oi]
         else:
             out += ['', '']
     return out
