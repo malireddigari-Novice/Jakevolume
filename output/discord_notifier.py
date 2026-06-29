@@ -303,11 +303,42 @@ def _weekend_gap_line(g: dict) -> str:
     )
 
 
+def _open_positions_embed(summary: dict | None, footer: dict) -> dict | None:
+    """
+    Embed for the morning open-position check. Green 'flat' confirmation when there
+    is nothing open; a red carryover list otherwise, flag per position (EXPIRED /
+    UNTRACKED / TRACKED). Returns None when the check was skipped (summary is None).
+    """
+    if summary is None:
+        return None
+    if summary.get('flat'):
+        return {
+            'title': '✅ Open Positions — none',
+            'color': 0x1A7F37,
+            'description': 'Flat into the session — no open option positions in Alpaca.',
+            'footer': footer,
+        }
+    mark = {'EXPIRED': '⛔', 'UNTRACKED': '⚠️', 'TRACKED': '•'}
+    lines = [
+        f"{mark.get(p['flag'], '•')} {p['symbol']} {p['option_type']} ${p['strike']:.0f} · "
+        f"{_fmt_expiry(p['expiry'])} · qty {p['qty']} · ${p['current_price']:.2f} · "
+        f"uPL ${p['unrealized_pl']:+.0f} · {p['flag']}"
+        for p in summary['positions']
+    ]
+    return {
+        'title': '⚠️ Open Positions (carryover — review)',
+        'color': 0xCF222E,
+        'description': "\n".join(lines),
+        'footer': footer,
+    }
+
+
 def send_morning_briefing(
     results: list,
     now: datetime,
     oi_buildup: list | None = None,
     weekend_gaps: list | None = None,
+    open_positions: dict | None = None,
 ) -> None:
     """
     Send the 8:20 AM morning briefing to Discord as one mobile-first embed per
@@ -387,6 +418,11 @@ def send_morning_briefing(
             ],
             'footer': footer,
         })
+
+    # Open-position check: surface anything Alpaca still holds into the session.
+    op_embed = _open_positions_embed(open_positions, footer)
+    if op_embed:
+        embeds.append(op_embed)
 
     # Discord allows up to 10 embeds per webhook message; chunk to stay safe
     # (MAG-7 = 7 symbols, so this is normally a single call). The header content

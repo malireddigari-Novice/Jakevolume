@@ -35,6 +35,7 @@ from analysis.daily_review import analyze_daily_signals
 from analysis.nightly_pipeline import run_nightly_pipeline
 from analysis.flow_reversal import FlowReversalEngine, volume_event
 from analysis.volume_analytics import compute_leadership_scores
+from analysis.open_positions import collect_open_positions
 from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
@@ -261,7 +262,18 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
         for s in sentiments
     ]
     top_buildup = sorted(all_oi_buildup, key=lambda x: x.get('oi_change') or 0, reverse=True)[:5]
-    discord_briefing(discord_results, now, oi_buildup=top_buildup, weekend_gaps=weekend_gaps)
+
+    # Open-position check: surface anything Alpaca still holds into the session
+    # (normally flat post-EOD; non-empty flags a carryover/orphan to review).
+    open_pos = None
+    if config.BRIEFING_CHECK_OPEN_POSITIONS:
+        try:
+            open_pos = collect_open_positions(AlpacaClient(), today)
+        except Exception:
+            logger.warning("Morning briefing: open-position check failed", exc_info=True)
+
+    discord_briefing(discord_results, now, oi_buildup=top_buildup,
+                     weekend_gaps=weekend_gaps, open_positions=open_pos)
 
     # Retention: keep only the most recent N trading days of 1-min bar data.
     # Runs once per trading day here; alerts/signals are never pruned.

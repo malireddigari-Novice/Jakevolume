@@ -54,6 +54,10 @@ WEEKEND_GAP_MIN_PCT       = float(os.getenv('WEEKEND_GAP_MIN_PCT', '0.25'))     
 WEEKEND_GAP_TOP_N         = int(os.getenv('WEEKEND_GAP_TOP_N', '5'))             # top-N gaps reported
 NEAR_OI_EXPIRY_DAYS       = int(os.getenv('NEAR_OI_EXPIRY_DAYS', '14'))          # this week + next
 
+# Morning briefing: check Alpaca for any open option positions carried into the
+# session (normally flat post-EOD; surfaces carryover/orphans). Read-only.
+BRIEFING_CHECK_OPEN_POSITIONS = os.getenv('BRIEFING_CHECK_OPEN_POSITIONS', 'true').lower() == 'true'
+
 # ── Signal detection ──────────────────────────────────────────────────────────
 # Minimum minutes between signals on the same level (cooldown)
 SIGNAL_COOLDOWN_MINUTES      = int(os.getenv('SIGNAL_COOLDOWN_MINUTES', '30'))

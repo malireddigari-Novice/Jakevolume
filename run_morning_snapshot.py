@@ -26,6 +26,8 @@ from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot
 from analysis.sentiment import compute_sentiment
 from data.market_utils import now_cst, today_cst
 from data.schwab_client import SchwabClient
+from data.alpaca_client import AlpacaClient
+from analysis.open_positions import collect_open_positions
 from output.sheets_logger import SheetsLogger
 from output.discord_notifier import send_morning_briefing as discord_briefing
 
@@ -169,7 +171,14 @@ def main() -> None:
     print("=" * W)
     print()
 
-    discord_briefing(results, now, weekend_gaps=weekend_gaps)
+    open_pos = None
+    if config.BRIEFING_CHECK_OPEN_POSITIONS:
+        try:
+            open_pos = collect_open_positions(AlpacaClient(), today)
+        except Exception:
+            log.warning("Open-position check failed", exc_info=True)
+
+    discord_briefing(results, now, weekend_gaps=weekend_gaps, open_positions=open_pos)
 
 
 if __name__ == "__main__":
