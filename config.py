@@ -18,8 +18,8 @@ MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
 SESSION_TZ = 'America/Chicago'
 
 # ── Market schedule (all times in CST/CDT) ───────────────────────────────────
-SNAPSHOT_HOUR   = 8    # 08:20 CST — pre-market OI snapshot
-SNAPSHOT_MINUTE = 20
+SNAPSHOT_HOUR   = int(os.getenv('SNAPSHOT_HOUR',   '8'))    # 08:10 CST — pre-market OI snapshot
+SNAPSHOT_MINUTE = int(os.getenv('SNAPSHOT_MINUTE', '10'))
 MARKET_OPEN_HOUR    = 8    # 08:30 CST = 09:30 ET
 MARKET_OPEN_MINUTE  = 30
 MARKET_CLOSE_HOUR   = 15   # 15:00 CST = 16:00 ET

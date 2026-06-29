@@ -95,7 +95,8 @@ _reversal_engine = FlowReversalEngine()
 
 def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> None:
     """
-    Run the daily 08:20 CST setup. Option chains/OI come from Schwab (Alpaca has no
+    Run the daily pre-market setup (config.SNAPSHOT_HOUR:MINUTE CST, default 08:10).
+    Option chains/OI come from Schwab (Alpaca has no
     live OI); the SPOT anchor for S/R levels + sentiment prefers the Alpaca SIP quote
     mid (freshest pre-market price), falling back to Schwab, then prev close.
     """
