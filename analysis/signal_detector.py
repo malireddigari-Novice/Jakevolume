@@ -584,16 +584,22 @@ class SignalDetector:
             if ev['alert_fired'] is False and ev['level_label'] in fired_labels and ev['blocked_reason'] == 'PASSED':
                 ev['alert_fired'] = True
 
-        # ── §3-7 Chain-led emergent entries — additive, independent of level proximity ──
+        # ── §3-7 Chain-led emergent entries — an additional entry path, but still bound
+        # by the one-alert-per-direction-per-day rule: at most one CALL and one PUT
+        # alert per symbol per day ACROSS both this and the level-proximity path above
+        # (and across restarts, via the durable fired-today fold). Reversals are a
+        # separate path (flow_reversal) and are intentionally NOT gated here.
         if config.CHAIN_LED_ENTRY_ENABLED:
             for confirm_type in ('CALL', 'PUT'):
+                st = 'BULLISH' if confirm_type == 'CALL' else 'BEARISH'
+                if self._fired_today.get((symbol, st)):
+                    continue                      # this side already alerted today
                 csig, creason = self._chain_led_entry(
                     symbol, confirm_type, opt_data_map, vol_deltas, levels,
                     close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio,
                     leadership=leadership)
                 if csig is not None:
-                    st = csig['signal_type']
-                    self._fired_today[(symbol, st, 'CHAIN_LED_EMERGENT_ENTRY')] = True
+                    self._fired_today[(symbol, st)] = True
                     fired.append(csig)
                 elif creason:
                     logger.info("CHAIN-LED  %s %s  → %s", symbol, confirm_type, creason)
@@ -993,7 +999,9 @@ class SignalDetector:
         if not config.CHAIN_LED_ENTRY_ENABLED:
             return None, None
         signal_type = 'BULLISH' if confirm_type == 'CALL' else 'BEARISH'
-        if self._fired_today.get((symbol, signal_type, 'CHAIN_LED_EMERGENT_ENTRY')):
+        # Same one-per-direction-per-day key as the level-proximity path, so a
+        # chain-led alert never duplicates a side that already fired today.
+        if self._fired_today.get((symbol, signal_type)):
             return None, None
 
         ct = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
