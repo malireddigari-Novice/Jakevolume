@@ -408,6 +408,13 @@ class SignalDetector:
         near_thr = (config.NEAR_LEVEL_DIST_VOLATILE if symbol in config.VOLATILE_SYMBOLS
                     else config.NEAR_LEVEL_DIST_DEFAULT)
 
+        # Mandatory tightened production volume floors — stricter in the opening 15m.
+        # Applied to BOTH the primary-level path (_eval_volume) and the chain-led path.
+        peak1m_floor = (config.OPENING_PEAK_1M_VOLUME_MIN if opening_range
+                        else config.PEAK_1M_VOLUME_MIN)
+        vol3m_floor  = (config.OPENING_VOLUME_3M_MIN if opening_range
+                        else config.VOLUME_3M_MIN)
+
         candidates: list[dict] = []
 
         for level in levels:
@@ -448,7 +455,8 @@ class SignalDetector:
             atm = self._eval_volume(symbol, list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
                                     min_single_vol, min_cluster_vol, cluster_ratio_min,
                                     excitation_min, mark=atm_data.get('mark'), is_atm=True,
-                                    next_day_mode=next_day_mode, completed_vol=atm_completed)
+                                    next_day_mode=next_day_mode, completed_vol=atm_completed,
+                                    peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
 
             if itm_key:
                 itm_data  = opt_data_map[itm_key]
@@ -460,12 +468,14 @@ class SignalDetector:
                 itm = self._eval_volume(symbol, list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
                                         min_single_vol, min_cluster_vol, cluster_ratio_min,
                                         excitation_min, mark=itm_data.get('mark'), is_atm=False,
-                                        next_day_mode=next_day_mode, completed_vol=itm_completed)
+                                        next_day_mode=next_day_mode, completed_vol=itm_completed,
+                                        peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
             else:
                 itm_data, itm_delta, itm_low = {}, 0, None
                 itm = self._eval_volume(symbol, [], 0, None, min_single_vol, min_cluster_vol,
                                         cluster_ratio_min, excitation_min,
-                                        next_day_mode=next_day_mode)
+                                        next_day_mode=next_day_mode,
+                                        peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
 
             valid_volume = atm['valid'] or itm['valid']
 
@@ -597,7 +607,8 @@ class SignalDetector:
                 csig, creason = self._chain_led_entry(
                     symbol, confirm_type, opt_data_map, vol_deltas, levels,
                     close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio,
-                    leadership=leadership)
+                    leadership=leadership,
+                    peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
                 if csig is not None:
                     self._fired_today[(symbol, st)] = True
                     fired.append(csig)
@@ -622,6 +633,8 @@ class SignalDetector:
         is_atm: bool = False,
         next_day_mode: bool = False,
         completed_vol: Optional[int] = None,
+        peak1m_floor: Optional[int] = None,
+        vol3m_floor: Optional[int] = None,
     ) -> dict:
         """
         PRODUCTION VOLUME GATE (two-path) — absolute volume is the binding
@@ -731,7 +744,14 @@ class SignalDetector:
                   and near_low_ctx and event_share >= share_min
                   and not persistent_bg and notional_ok)
 
-        valid = bool(path_a or path_b)
+        # ── Mandatory tightened floor (§ tighten patch) — binds BOTH paths ────
+        # An event must clear at least one absolute floor regardless of ratio or the
+        # dominant path. Opening-window floors (stricter) are passed by the caller.
+        pk_floor = peak1m_floor if peak1m_floor is not None else config.PEAK_1M_VOLUME_MIN
+        v3_floor = vol3m_floor  if vol3m_floor  is not None else config.VOLUME_3M_MIN
+        mandatory_floor_ok = (peak1m >= pk_floor) or (vol3m >= v3_floor)
+
+        valid = bool(mandatory_floor_ok and (path_a or path_b))
         path  = 'A' if path_a else ('B' if path_b else None)
 
         # ── Gold-standard quality label (§5) ──────────────────────────────────
@@ -750,15 +770,17 @@ class SignalDetector:
                   and event_share >= config.SINGLE_PRINT_EVENT_SHARE_MIN
                   and round(peak1m * (mark or 0.0) * 100.0) >= notional_min)
         pending = bool(
-            not valid and not base_vol_ok and bar_status == 'PARTIAL'
+            not valid and not mandatory_floor_ok and bar_status == 'PARTIAL'
             and config.CONTEXTUAL_LEVEL_CONVICTION_ENABLED and ctx_ok
-            and peak1m >= (1.0 - config.PENDING_VOLUME_TOLERANCE_PCT) * config.SINGLE_PRINT_BASE_FLOOR)
+            and peak1m >= (1.0 - config.PENDING_VOLUME_TOLERANCE_PCT) * pk_floor)
 
         # ── Block reason (§6 spam first, then the specific failing condition) ──
         if valid:
             block_reason = 'OK'
         elif pending:
             block_reason = 'PENDING_VOLUME_CONFIRMATION'
+        elif not mandatory_floor_ok:
+            block_reason = 'RESEARCH_ONLY_SUBTHRESHOLD_EVENT'     # below tightened floor
         elif not base_vol_ok:
             block_reason = 'INSUFFICIENT_CONVICTION_VOLUME'       # small vol + (any) ratio
         elif persistent_bg:
@@ -786,6 +808,8 @@ class SignalDetector:
             'delta': delta, 'spike_ratio': single_ratio,
             'vol': vol5m, 'ratio': window_ratio,
             'peak_1m': peak1m, 'vol_3m': vol3m, 'vol_5m': vol5m,
+            'peak1m_floor': pk_floor, 'vol3m_floor': v3_floor,
+            'mandatory_floor_ok': mandatory_floor_ok,
             'event_share': event_share, 'persistent_bg': persistent_bg,
             'premium_notional': premium_notional,
             'observed_vol': observed_vol, 'completed_vol': completed_vol,
@@ -990,7 +1014,8 @@ class SignalDetector:
 
     def _chain_led_entry(self, symbol, confirm_type, opt_data_map, vol_deltas, levels,
                          close_price, expiry, bars, bar_time, now, next_day_mode,
-                         hv_pctile, pc_ratio, leadership=None):
+                         hv_pctile, pc_ratio, leadership=None,
+                         peak1m_floor=None, vol3m_floor=None):
         """
         §3-7 — chain-led emergent entry. Coordinated ATM + adjacent-strike volume builds a
         new emergent support/resistance before spot reaches a primary level. Returns
@@ -1038,6 +1063,13 @@ class SignalDetector:
         # §4C combined absolute volume (ITM+ATM+OTM)
         c1, c3, c5 = (sum(x['peak1m'] for x in chain), sum(x['vol3m'] for x in chain),
                       sum(x['vol5m'] for x in chain))
+
+        # Mandatory tightened floor (§ tighten patch) — the combined chain event must
+        # clear the same absolute floor as the primary path (opening-aware, binding).
+        pk_floor = peak1m_floor if peak1m_floor is not None else config.PEAK_1M_VOLUME_MIN
+        v3_floor = vol3m_floor  if vol3m_floor  is not None else config.VOLUME_3M_MIN
+        if not (c1 >= pk_floor or c3 >= v3_floor):
+            return None, 'RESEARCH_ONLY_SUBTHRESHOLD_EVENT'
         if confirm_type == 'CALL':
             f1, f3, f5 = (config.CHAIN_CALL_COMBINED_1M_FLOOR, config.CHAIN_CALL_COMBINED_3M_FLOOR,
                           config.CHAIN_CALL_COMBINED_5M_FLOOR)

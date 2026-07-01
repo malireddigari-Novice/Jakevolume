@@ -103,6 +103,18 @@ SINGLE_PRINT_BASE_FLOOR = int(os.getenv('SINGLE_PRINT_BASE_FLOOR', '500'))    # 
 THREE_MINUTE_BASE_FLOOR = int(os.getenv('THREE_MINUTE_BASE_FLOOR', '1000'))   # 3-min window
 FIVE_MINUTE_BASE_FLOOR  = int(os.getenv('FIVE_MINUTE_BASE_FLOOR',  '1250'))   # 5-min window
 
+# ── Mandatory production volume floors (tightened) ────────────────────────────
+# A production event (primary-level OR chain-led, call OR put) must clear at least
+# one absolute floor: peak_1m >= PEAK_1M_VOLUME_MIN OR volume_3m >= VOLUME_3M_MIN.
+# These are BINDING: a high ratio or the dominant-absolute path never overrides
+# them. Stricter during the first 15 minutes after the open. Below-floor events are
+# never traded — they are stored research-only (RESEARCH_ONLY_SUBTHRESHOLD_EVENT)
+# and still outcome-scored. Env-overridable so the floors can be reverted live.
+PEAK_1M_VOLUME_MIN         = int(os.getenv('PEAK_1M_VOLUME_MIN',         '1000'))
+VOLUME_3M_MIN              = int(os.getenv('VOLUME_3M_MIN',              '2000'))
+OPENING_PEAK_1M_VOLUME_MIN = int(os.getenv('OPENING_PEAK_1M_VOLUME_MIN', '1250'))
+OPENING_VOLUME_3M_MIN      = int(os.getenv('OPENING_VOLUME_3M_MIN',      '2500'))
+
 # Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
 DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
 DOMINANT_3M           = {'NVDA': 1750, 'TSLA': 1750, 'default': 1250}
