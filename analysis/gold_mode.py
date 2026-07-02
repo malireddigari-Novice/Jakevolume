@@ -21,6 +21,7 @@ Reversals are handled by analysis/flow_reversal and are exempt from this gate.
 import logging
 
 import config
+from analysis.intent_validation import is_directional_demand
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +102,26 @@ def classify(sig) -> dict:
             'value_region': vr, 'clow_region': cr}
 
 
-# Staged deeper checks — non-blocking in P1 (return True). Tightened later.
-def _intent_ok(sig) -> bool:   # TODO(P2): directional-intent validation (§5-§8)
-    return True
+# ── P2 deeper checks — directional intent (§5-§8) + opposite-side veto (§9) ──
+# Reversals are exempt (they carry their own activation proof via flow_reversal).
+_REVERSAL_EXEMPT = {COUNTERTREND_REVERSAL}
 
 
-def _veto_ok(sig) -> bool:     # TODO(P2): opposite-side leadership veto (§9)
-    return True
+def _intent_ok(sig) -> bool:
+    """Require a validated LIKELY_DIRECTIONAL_*_DEMAND verdict (§8). Absent = not
+    confirmed = blocked (default NO_TRADE). Reversals and disabled mode pass."""
+    if not config.INTENT_VALIDATION_ENABLED:
+        return True
+    if sig.get('gold_subtype') in _REVERSAL_EXEMPT:
+        return True
+    return is_directional_demand(sig.get('intent_class'))
+
+
+def _veto_ok(sig) -> bool:
+    """Block when the opposite side shows dominant validated demand (§9)."""
+    if not config.OPPOSITE_SIDE_VETO_ENABLED:
+        return True
+    return not sig.get('opp_veto')
 
 
 def production_allowed(sig) -> bool:

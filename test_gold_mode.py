@@ -55,11 +55,16 @@ s_res  = sig(hv_pctile=0.80, low_dist=2.0); gm.classify(s_res)
 ck("OFF pass-through GOLD",     gm.production_allowed(s_gold) is True)
 ck("OFF pass-through RESEARCH", gm.production_allowed(s_res) is True)
 
-# gate — ON = Gold only
+# gate — ON = Gold only. Scope to the P1 STRUCTURAL gate; P2's intent/veto have
+# their own suite (test_intent_validation.py), so disable them here.
 config.GOLD_ONLY_PRODUCTION_MODE = True
-ck("ON allows GOLD",   gm.production_allowed(s_gold) is True)
-ck("ON blocks RESEARCH", gm.production_allowed(s_res) is False)
+config.INTENT_VALIDATION_ENABLED = False
+config.OPPOSITE_SIDE_VETO_ENABLED = False
+ck("ON allows GOLD (structural)", gm.production_allowed(s_gold) is True)
+ck("ON blocks RESEARCH",          gm.production_allowed(s_res) is False)
 config.GOLD_ONLY_PRODUCTION_MODE = False
+config.INTENT_VALIDATION_ENABLED = True
+config.OPPOSITE_SIDE_VETO_ENABLED = True
 
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")
 sys.exit(1 if fails else 0)

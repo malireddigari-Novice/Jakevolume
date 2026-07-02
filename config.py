@@ -147,6 +147,10 @@ HV_REGION_NEUTRAL_MAX    = float(os.getenv('HV_REGION_NEUTRAL_MAX',    '0.65'))
 CLOW_GOLD_MAX       = float(os.getenv('CLOW_GOLD_MAX',       '1.25'))
 CLOW_STRONG_MAX     = float(os.getenv('CLOW_STRONG_MAX',     '1.50'))
 CLOW_ACCEPTABLE_MAX = float(os.getenv('CLOW_ACCEPTABLE_MAX', '1.75'))
+# Directional-intent validation (§5-§9, P2) tolerances
+INTENT_PREMIUM_HOLD_PCT   = float(os.getenv('INTENT_PREMIUM_HOLD_PCT',   '-0.10'))  # premium may dip ≤10% and still "hold"
+INTENT_SPOT_CONTRADICT_PCT= float(os.getenv('INTENT_SPOT_CONTRADICT_PCT', '0.003')) # spot move that counts as contradicting the thesis
+LEADERSHIP_VETO_MARGIN    = float(os.getenv('LEADERSHIP_VETO_MARGIN',     '0.15'))  # opposite side must lead by this to veto
 
 # Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
 DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
