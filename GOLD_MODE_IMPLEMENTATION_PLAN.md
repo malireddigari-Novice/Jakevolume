@@ -144,3 +144,55 @@ INTENT_PREMIUM_HOLD_PCT   = <tune>   # e.g. mark must hold >= -X% over confirm b
 - The morning briefing, weekend-gap, open-position, and proximity-level work already
   shipped are untouched.
 - With the master flag OFF, production behavior is identical to today.
+
+---
+
+# Addendum — July 1 case-study patch (folded into the phases above)
+
+The July-1 audit (NVDA 195C, MSFT 380C/385P/387.5P, TSLA 425P/425C/430P) is the same
+Gold effort, deepened with concrete cases. Mapping:
+
+**Already shipped (live):**
+- Revised volume floors — `peak_1m>=1000 OR vol_3m>=2000`, opening 1250/2500 (commit a4f381d).
+- Target integrity — origin level can never be a target (commit 89605f3); §10/§20.
+- One-per-side dedup (commit dcde3bf) underpins §8 same-direction handling.
+
+**New/refined requirements folded into phases:**
+- **Exceptional single-strike route (Route B)** — `peak_1m>=2000` substitutes for adjacent
+  confirmation when ≤2 strikes from ATM + notional + value + activation + no opposite
+  dominance. → P3 (chain-led). *Additive path — must be flag-gated + tested (would have
+  caught MSFT 380C / TSLA 425C).*
+- **No retrospective threshold qualification** — production eligibility is decided from
+  info available at the decision timestamp; a bar that revises above the floor later is a
+  FRESH decision at the CURRENT price/spot/ATM, never backdated to the earlier cheap fill.
+  Labels: `SUBTHRESHOLD_PARTIAL_EVENT` → `REVISED_BAR_THRESHOLD_CROSSED`. → P5 (with §17
+  latency + price-source audit). *TSLA 425P case.*
+- **Alert-price / paper-fill synchronization** — store event-bar OHLC + bid/ask/mid/last at
+  threshold-cross AND at signal-commit; paper fill = realistic executable near the ask at
+  commit time; flag any price outside the event bar's range. → P5. *NVDA $1.20-vs-$0.89–1.03.*
+- **Flow DETECTED vs ACTIVATED** — detection (exceptional concentrated volume) is separate
+  from activation (premium/IV hold-or-expand + underlying responds + leadership grows).
+  Production requires ACTIVATED; countertrend requires stricter activation. This IS the §5–§9
+  intent-validation subsystem. → P2. *MSFT 385P 12:24 = detected-not-activated.*
+- **Near-target exits** — exit runner when within `max($0.50, target*0.0025)` of target AND
+  opposite concentrated flow AND leadership fades/price rejects. → P4. *NVDA ~200 runner.*
+- **Fresh ATM per event + superior later-event recognition** — recompute ATM every event;
+  never reuse the earlier strike; a later independent, better-timed, current-strike event is
+  `IMPROVED_TIMING_AND_STRIKE_OPPORTUNITY` / same-dir upgrade; a post-extension opposite
+  event is `CONFIRMED_INTRADAY_REVERSAL_PUT`. → P4. *MSFT 385P→387.5P, TSLA 425P→430P.*
+- **MAE-before-MFE scoring** — daily report must show MAE-before-MFE and penalize severe
+  early drawdown, not credit eventual peak. `signal_outcomes` already has mfe/mae +
+  time_to_mfe/time_to_mae to derive ordering. → P5 (analytics).
+- **Developer audit output (§13)** — per studied event, the exact gate-by-gate decision
+  chain (subscribed? spot? ATM? distance; observed/threshold/completed/revised vol; notional;
+  EventShare; value region; low-dist; leadership; premium/IV/underlying response; exact gate
+  + rejection; completed-bar reeval?; blocked-by-earlier?; primary-proximity required?; price
+  sources). → P5 diagnostic tool.
+
+**Acceptance suite — the 8 July-1 control tests become the P6 gate (in `test_gold_mode.py`):**
+1 NVDA195C→GOLD_PRIMARY_LEVEL_CALL · 2 MSFT380C→GOLD_CHAIN_LED/EXCEPTIONAL_SINGLE_STRIKE
+(no primary-proximity req) · 3 MSFT385P@12:24→COUNTERTREND_PUT_WATCH (not entry) ·
+4 MSFT387.5P@15:11→IMPROVED_TIMING_AND_STRIKE_OPPORTUNITY · 5 TSLA425P@501→SUBTHRESHOLD_PARTIAL_EVENT
+(no alert; no backdate) · 6 TSLA422.5C→CHAIN_LED_CALL_WATCH · 7 TSLA425C@2.46K→GOLD_CHAIN_LED/
+EXCEPTIONAL_SINGLE_STRIKE · 8 TSLA430P@2.34K post-extension→CONFIRMED_INTRADAY_REVERSAL_PUT.
+NVDA 195C is a REQUIRED positive regression; TSLA 425P a REQUIRED negative.
