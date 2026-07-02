@@ -37,6 +37,7 @@ from analysis.flow_reversal import FlowReversalEngine, volume_event
 from analysis.volume_analytics import compute_leadership_scores
 from analysis.open_positions import collect_open_positions
 from analysis import gold_mode
+from analysis.intent_gate import IntentGate
 from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
@@ -90,6 +91,10 @@ logger = logging.getLogger('jakevolume.main')
 
 # Per-symbol flow-leadership reversal engine (spec §19), shared across polls.
 _reversal_engine = FlowReversalEngine()
+
+# Deferred Gold-entry intent gate (P2). Only active when GOLD_ONLY_PRODUCTION_MODE
+# AND INTENT_VALIDATION_ENABLED; holds pending candidates awaiting confirmation.
+_intent_gate = IntentGate()
 
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
@@ -500,55 +505,71 @@ def intraday_check(
                 except Exception:
                     logger.warning("%s: candidate logging failed", symbol, exc_info=True)
 
+            # Per-minute call/put leadership snapshot — computed once, reused for the
+            # intent observations (below) and the §41 stored series.
+            poll_leadership = None
+            if option_quotes:
+                try:
+                    poll_leadership = compute_leadership_scores(
+                        symbol, option_quotes, detector._opt_vol_hist,
+                        low_dist_fn=detector._contract_low_dist)
+                except Exception:
+                    logger.warning("%s: volume leadership scoring failed", symbol, exc_info=True)
+
             # §4 merge primary+chain into one signal (only when Gold-mode is on;
             # the one-per-direction dedup already prevents same-side duplicates).
             if config.GOLD_ONLY_PRODUCTION_MODE:
                 signals = gold_mode.merge(signals)
 
-            for sig in signals:
-                # §6 — persist the chain-led emergent location first so the signal can FK it.
-                emergent = sig.pop('emergent', None)
-                if emergent is not None:
-                    sig['emergent_location_id'] = db.save_emergent_location(emergent)
+            gold_intent = (config.GOLD_ONLY_PRODUCTION_MODE
+                           and config.INTENT_VALIDATION_ENABLED)
 
-                # §1/§18/§19 — Gold gate. Annotate always (research value); it only
-                # gates Discord + paper trade. Pass-through when GOLD_ONLY_PRODUCTION_MODE
-                # is off, so live behavior is unchanged until it is deliberately enabled.
-                production_ok = gold_mode.annotate_and_gate(sig)
-
-                sig_id = db.save_signal(sig)          # stored for research AND production
-                sheets.log_signal(sig)
-                db.mark_signal_logged(sig_id)
-
-                if not production_ok:
-                    logger.info("GOLD-MODE research-only: %s %s ctx=%s grade=%s vr=%s clow=%s",
-                                symbol, sig.get('signal_type'), sig.get('signal_context'),
-                                sig.get('gold_grade'), sig.get('value_region'),
-                                sig.get('clow_region'))
-                    continue                          # §19: no Discord, no paper trade
-
-                _notify_signal(sig)
-                # WATCH-only alerts and cluster upgrades are recorded + notified
-                # but never auto-traded (an upgrade's original alert already entered)
-                if (alpaca and config.ALPACA_ENABLED
-                        and sig.get('confidence') != 'WATCH'
-                        and not sig.get('upgrade')):
-                    _execute_trade(sig, sig_id, alpaca, sheets)
+            if gold_intent:
+                # §4-§9 Deferred Gold entry: a candidate is NOT alerted on its event
+                # bar — it registers PENDING and is promoted only when the next 1-3
+                # bars confirm directional demand and the opposite side does not veto.
+                def _obs(side, strike):
+                    q = option_quotes.get((float(strike), side), {}) if option_quotes else {}
+                    return {'mark': q.get('mark'), 'iv': q.get('implied_vol'),
+                            'spot': underlying_price,
+                            'call_leadership': (poll_leadership or {}).get('call_leadership', 0.0),
+                            'put_leadership':  (poll_leadership or {}).get('put_leadership', 0.0)}
+                stepped = _intent_gate.step(symbol, _obs)              # advance pending
+                routed  = _intent_gate.classify_new(symbol, signals, _obs)
+                for sig in routed['emit'] + stepped['emit']:
+                    gold_mode.annotate_and_gate(sig)                  # stamp production fields
+                    sid = _persist_signal(sig, sheets)
+                    _emit_production(sig, sid, alpaca, sheets)
+                for sig in routed['research'] + stepped['research']:
+                    gold_mode.annotate_and_gate(sig)
+                    _persist_signal(sig, sheets)
+                    logger.info("GOLD-MODE research-only: %s %s grade=%s intent=%s veto=%s",
+                                symbol, sig.get('signal_type'), sig.get('gold_grade'),
+                                sig.get('intent_class'), sig.get('opp_veto'))
+                if routed['deferred']:
+                    logger.info("GOLD-MODE deferred %d candidate(s) awaiting intent: %s",
+                                len(routed['deferred']), symbol)
+            else:
+                for sig in signals:
+                    # §1/§18/§19 — Gold gate. Pass-through when the mode is off, so
+                    # live behavior is unchanged until it is deliberately enabled.
+                    production_ok = gold_mode.annotate_and_gate(sig)
+                    sig_id = _persist_signal(sig, sheets)
+                    if not production_ok:
+                        logger.info("GOLD-MODE research-only: %s %s ctx=%s grade=%s vr=%s clow=%s",
+                                    symbol, sig.get('signal_type'), sig.get('signal_context'),
+                                    sig.get('gold_grade'), sig.get('value_region'),
+                                    sig.get('clow_region'))
+                        continue                      # §19: no Discord, no paper trade
+                    _emit_production(sig, sig_id, alpaca, sheets)
 
             # §41 Per-minute call/put leadership scores (stored for all symbols every poll).
-            # Uses the same scoring formula as the Flow Reversal Engine so both series
-            # are comparable when analysing which side dominated before an alert fired.
-            if option_quotes:
+            if poll_leadership:
                 try:
-                    scores = compute_leadership_scores(
-                        symbol, option_quotes, detector._opt_vol_hist,
-                        low_dist_fn=detector._contract_low_dist,
-                    )
-                    if scores:
-                        db.save_volume_leadership(symbol, bars[-1]['bar_time'],
-                                                  today, underlying_price, scores)
+                    db.save_volume_leadership(symbol, bars[-1]['bar_time'],
+                                              today, underlying_price, poll_leadership)
                 except Exception:
-                    logger.warning("%s: volume leadership scoring failed", symbol, exc_info=True)
+                    logger.warning("%s: volume leadership save failed", symbol, exc_info=True)
 
             # Exit monitoring — check R1/R2 or S1/S2 targets for open trades
             if alpaca and config.ALPACA_ENABLED:
@@ -681,6 +702,26 @@ def _collect_hourly_option_bars(symbol, levels, expiry, snap_date, adata) -> Non
 
 
 # ── Desktop notification ──────────────────────────────────────────────────────
+
+def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
+    """Persist a signal (emergent FK + DB + Sheets + logged flag); return its id."""
+    emergent = sig.pop('emergent', None)
+    if emergent is not None:
+        sig['emergent_location_id'] = db.save_emergent_location(emergent)
+    sig_id = db.save_signal(sig)
+    sheets.log_signal(sig)
+    db.mark_signal_logged(sig_id)
+    return sig_id
+
+
+def _emit_production(sig: dict, sig_id: int, alpaca, sheets: SheetsLogger) -> None:
+    """Fire the production actions for a signal: Discord + (non-WATCH/non-upgrade) trade."""
+    _notify_signal(sig)
+    if (alpaca and config.ALPACA_ENABLED
+            and sig.get('confidence') != 'WATCH'
+            and not sig.get('upgrade')):
+        _execute_trade(sig, sig_id, alpaca, sheets)
+
 
 def _notify_signal(sig: dict) -> None:
     """Best-effort desktop + Discord notification when a signal fires.

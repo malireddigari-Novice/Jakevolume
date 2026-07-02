@@ -131,33 +131,43 @@ class IntentValidator:
     """
 
     def __init__(self) -> None:
-        self._pending: dict = {}   # (symbol, side, strike) -> {event, followups}
+        self._pending: dict = {}   # (symbol, side, strike) -> {event, followups, payload}
 
-    def register(self, symbol: str, side: str, strike: float, event_obs: dict) -> None:
-        self._pending[(symbol, side, float(strike))] = {'event': event_obs, 'followups': []}
+    def register(self, symbol: str, side: str, strike: float,
+                 event_obs: dict, payload=None) -> None:
+        self._pending[(symbol, side, float(strike))] = {
+            'event': event_obs, 'followups': [], 'payload': payload}
+
+    def pending_items(self, symbol: str) -> list:
+        """(side, strike) of all pending candidates for `symbol` (snapshot copy)."""
+        return [(s, k) for (sym, s, k) in list(self._pending) if sym == symbol]
 
     def observe(self, symbol: str, side: str, strike: float, obs: dict) -> dict:
         """
         Append a follow-up observation and return the current status:
-          {'status': 'PENDING'|'CONFIRMED'|'REJECTED'|'EXPIRED', 'intent_class': str}
+          {'status': 'PENDING'|'CONFIRMED'|'REJECTED'|'EXPIRED',
+           'intent_class': str|None, 'payload', 'event_obs', 'last_obs'}
         CONFIRMED only when a LIKELY_DIRECTIONAL_*_DEMAND is reached within the window.
+        Terminal statuses (CONFIRMED/REJECTED/EXPIRED) drop the candidate.
         """
         key = (symbol, side, float(strike))
         p = self._pending.get(key)
         if p is None:
-            return {'status': 'EXPIRED', 'intent_class': None}
+            return {'status': 'EXPIRED', 'intent_class': None,
+                    'payload': None, 'event_obs': None, 'last_obs': obs}
         p['followups'].append(obs)
         n = len(p['followups'])
+        base = {'payload': p['payload'], 'event_obs': p['event'], 'last_obs': obs}
         if n < config.INTENT_CONFIRMATION_BARS_MIN:
-            return {'status': 'PENDING', 'intent_class': None}
+            return {'status': 'PENDING', 'intent_class': None, **base}
         ic = classify_intent(side, p['event'], p['followups'])
         if is_directional_demand(ic):
             self._pending.pop(key, None)
-            return {'status': 'CONFIRMED', 'intent_class': ic}
+            return {'status': 'CONFIRMED', 'intent_class': ic, **base}
         if n >= config.INTENT_CONFIRMATION_BARS_MAX:
             self._pending.pop(key, None)
-            return {'status': 'REJECTED', 'intent_class': ic}
-        return {'status': 'PENDING', 'intent_class': ic}
+            return {'status': 'REJECTED', 'intent_class': ic, **base}
+        return {'status': 'PENDING', 'intent_class': ic, **base}
 
     def drop(self, symbol: str, side: str, strike: float) -> None:
         self._pending.pop((symbol, side, float(strike)), None)
