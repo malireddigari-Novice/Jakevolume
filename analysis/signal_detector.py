@@ -206,6 +206,7 @@ def compute_exit_targets(
     spot: float,
     levels: list,
     position_only: bool = False,
+    origin_level: Optional[float] = None,
 ) -> tuple[Optional[float], Optional[float]]:
     """
     Exit-target ladder — take the NEXT levels the trade moves into, skipping a level
@@ -230,13 +231,21 @@ def compute_exit_targets(
     the move side → Exit2 is None. `position_only` is retained for call-site compatibility
     (the ladder always spans all levels regardless).
 
+    Target integrity (§10/§20): the originating level can NEVER be a target. A CALL's
+    targets must be strictly above BOTH the entry spot AND the origin level; a PUT's
+    strictly below both. `origin_level` is the entry level price; when given it moves
+    the ladder floor/ceiling out to max(spot, origin) / min(spot, origin) so the origin
+    strike (which often sits just past spot) can no longer be selected as Exit1.
+
     Returns (exit1, exit2) as underlying price levels, either may be None.
     """
     if signal_type == 'BULLISH':
-        ladder = sorted(float(l['strike']) for l in levels if float(l['strike']) > spot)
+        floor_px = max(spot, origin_level) if origin_level is not None else spot
+        ladder = sorted(float(l['strike']) for l in levels if float(l['strike']) > floor_px)
         room   = lambda lv: (lv - spot) / spot if spot > 0 else 0.0
     else:
-        ladder = sorted((float(l['strike']) for l in levels if float(l['strike']) < spot),
+        ceil_px = min(spot, origin_level) if origin_level is not None else spot
+        ladder = sorted((float(l['strike']) for l in levels if float(l['strike']) < ceil_px),
                         reverse=True)
         room   = lambda lv: (spot - lv) / spot if spot > 0 else 0.0
 
@@ -1332,7 +1341,7 @@ class SignalDetector:
         # Exit targets — shifted one level out (skip the too-close nearest level).
         # Roles are frozen (no flipping), so use the frozen SUPPORT/RESISTANCE types.
         exit1_price, exit2_price = compute_exit_targets(
-            signal_type, spot, levels, position_only=False)
+            signal_type, spot, levels, position_only=False, origin_level=strike)
 
         bias = 'Call-side bias' if level_type == 'SUPPORT' else 'Put-side bias'
 
