@@ -516,6 +516,7 @@ def save_signal(signal: dict) -> int:
              itm_vol_1m, itm_spike_ratio, itm_vol_3m,
              spread_pct, low_dist, room_score, room_pct,
              pc_ratio, pc_conviction, option_hl_flag,
+             gold_grade, gold_subtype, value_region, clow_region,
              opt_vol_delta, avg_volume_20, spike_volume, consecutive_spikes)
         VALUES
             (%(symbol)s, %(signal_time)s, %(signal_type)s, %(bias)s,
@@ -530,9 +531,13 @@ def save_signal(signal: dict) -> int:
              %(itm_vol_1m)s, %(itm_spike_ratio)s, %(itm_vol_3m)s,
              %(spread_pct)s, %(low_dist)s, %(room_score)s, %(room_pct)s,
              %(pc_ratio)s, %(pc_conviction)s, %(option_hl_flag)s,
+             %(gold_grade)s, %(gold_subtype)s, %(value_region)s, %(clow_region)s,
              %(opt_vol_delta)s, %(avg_volume_20)s, %(spike_volume)s, %(consecutive_spikes)s)
         RETURNING id
     """
+    # Gold fields are optional (reversal-flip and other callers omit them).
+    for _k in ('gold_grade', 'gold_subtype', 'value_region', 'clow_region'):
+        signal.setdefault(_k, None)
     conn = _get()
     try:
         with conn.cursor() as cur:

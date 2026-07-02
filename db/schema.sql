@@ -213,6 +213,19 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_ratio        NUMERIC(8,4);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS pc_conviction   VARCHAR(15);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS option_hl_flag  VARCHAR(15);
 
+-- ── Gold-only production mode (P1) ─────────────────────────────────────────────
+-- signal_context widened to hold Gold subtypes; gold_grade routes production vs
+-- research-only; value/clow regions (§12/§13); intent/veto reserved for P2.
+ALTER TABLE signals ALTER COLUMN signal_context TYPE VARCHAR(48);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS gold_grade      VARCHAR(12);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS gold_subtype    VARCHAR(48);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS value_region    VARCHAR(28);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS clow_region     VARCHAR(40);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS intent_class    VARCHAR(40);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS opp_veto        VARCHAR(48);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS call_leadership NUMERIC(6,4);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS put_leadership  NUMERIC(6,4);
+
 CREATE INDEX IF NOT EXISTS idx_sig_symbol_time
     ON signals (symbol, signal_time DESC);
 

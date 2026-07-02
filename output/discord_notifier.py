@@ -133,6 +133,13 @@ def send_signal(sig: dict) -> None:
     head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
     lines = [f"{arrow} **{head}**" + ("  ⭐" if gold else "")]
 
+    # Gold-mode classification line (only surfaced while the mode is active, so the
+    # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
+    if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
+        _vr = sig.get('value_region')
+        lines.append(f"Gold: {sig.get('gold_subtype')} [{sig.get('gold_grade')}]"
+                     + (f" · {_vr}" if _vr else ""))
+
     # ── §18 Chain-led emergent card ──
     if context == 'CHAIN_LED_EMERGENT_ENTRY':
         emergent_spot = sig.get('emergent_spot')

@@ -115,6 +115,39 @@ VOLUME_3M_MIN              = int(os.getenv('VOLUME_3M_MIN',              '2000')
 OPENING_PEAK_1M_VOLUME_MIN = int(os.getenv('OPENING_PEAK_1M_VOLUME_MIN', '1250'))
 OPENING_VOLUME_3M_MIN      = int(os.getenv('OPENING_VOLUME_3M_MIN',      '2500'))
 
+# ── Gold-only production mode (§ Gold spec / July-1 patch) — P1 foundation ────
+# MASTER SWITCH. When true, only Gold-classified events create Discord alerts +
+# paper trades; everything else is stored research-only (§19). Default FALSE:
+# production behavior is unchanged until the control-test suite (P6) passes and it
+# is deliberately enabled. All values env-overridable.
+GOLD_ONLY_PRODUCTION_MODE             = os.getenv('GOLD_ONLY_PRODUCTION_MODE', 'false').lower() == 'true'
+GOLD_PRIMARY_ENABLED                  = os.getenv('GOLD_PRIMARY_ENABLED', 'true').lower() == 'true'
+GOLD_CHAIN_LED_ENABLED                = os.getenv('GOLD_CHAIN_LED_ENABLED', 'true').lower() == 'true'
+PRIMARY_CHAIN_MERGE_ENABLED           = os.getenv('PRIMARY_CHAIN_MERGE_ENABLED', 'true').lower() == 'true'
+INTENT_VALIDATION_ENABLED             = os.getenv('INTENT_VALIDATION_ENABLED', 'true').lower() == 'true'
+INTENT_CONFIRMATION_BARS_MIN          = int(os.getenv('INTENT_CONFIRMATION_BARS_MIN', '1'))
+INTENT_CONFIRMATION_BARS_MAX          = int(os.getenv('INTENT_CONFIRMATION_BARS_MAX', '3'))
+OPPOSITE_SIDE_VETO_ENABLED            = os.getenv('OPPOSITE_SIDE_VETO_ENABLED', 'true').lower() == 'true'
+OPENING_FULL_CHAIN_SCAN_ENABLED       = os.getenv('OPENING_FULL_CHAIN_SCAN_ENABLED', 'true').lower() == 'true'
+HISTORICAL_VALUE_REGION_MODEL_ENABLED = os.getenv('HISTORICAL_VALUE_REGION_MODEL_ENABLED', 'true').lower() == 'true'
+SAME_DIRECTION_UPGRADE_ENABLED        = os.getenv('SAME_DIRECTION_UPGRADE_ENABLED', 'true').lower() == 'true'
+MAX_SAME_DIRECTION_UPGRADES_PER_DAY   = int(os.getenv('MAX_SAME_DIRECTION_UPGRADES_PER_DAY', '1'))
+COUNTERTREND_STRICT_MODE              = os.getenv('COUNTERTREND_STRICT_MODE', 'true').lower() == 'true'
+ESTABLISHED_MOVE_PCT                  = float(os.getenv('ESTABLISHED_MOVE_PCT', '0.01'))
+LEADERSHIP_FADE_RATIO                 = float(os.getenv('LEADERSHIP_FADE_RATIO', '0.50'))
+FRESH_CONVICTION_LOOKBACK_MIN         = int(os.getenv('FRESH_CONVICTION_LOOKBACK_MIN', '10'))
+TREND_PROGRESS_LOOKBACK_BARS          = int(os.getenv('TREND_PROGRESS_LOOKBACK_BARS', '5'))
+GOLD_EXCEPTIONAL_SINGLE_1M            = int(os.getenv('GOLD_EXCEPTIONAL_SINGLE_1M', '2000'))  # Route B (P3)
+GOLD_MIN_PREMIUM_NOTIONAL             = int(os.getenv('GOLD_MIN_PREMIUM_NOTIONAL', '0'))      # 0 = reuse existing notional gate until tuned
+# Historical-value regions (§12) — percentile upper bounds
+HV_REGION_EXCELLENT_MAX  = float(os.getenv('HV_REGION_EXCELLENT_MAX',  '0.25'))
+HV_REGION_ACCEPTABLE_MAX = float(os.getenv('HV_REGION_ACCEPTABLE_MAX', '0.45'))
+HV_REGION_NEUTRAL_MAX    = float(os.getenv('HV_REGION_NEUTRAL_MAX',    '0.65'))
+# Contract-low-distance regions (§13) — upper bounds
+CLOW_GOLD_MAX       = float(os.getenv('CLOW_GOLD_MAX',       '1.25'))
+CLOW_STRONG_MAX     = float(os.getenv('CLOW_STRONG_MAX',     '1.50'))
+CLOW_ACCEPTABLE_MAX = float(os.getenv('CLOW_ACCEPTABLE_MAX', '1.75'))
+
 # Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
 DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
 DOMINANT_3M           = {'NVDA': 1750, 'TSLA': 1750, 'default': 1250}

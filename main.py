@@ -36,6 +36,7 @@ from analysis.nightly_pipeline import run_nightly_pipeline
 from analysis.flow_reversal import FlowReversalEngine, volume_event
 from analysis.volume_analytics import compute_leadership_scores
 from analysis.open_positions import collect_open_positions
+from analysis import gold_mode
 from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
@@ -499,14 +500,33 @@ def intraday_check(
                 except Exception:
                     logger.warning("%s: candidate logging failed", symbol, exc_info=True)
 
+            # §4 merge primary+chain into one signal (only when Gold-mode is on;
+            # the one-per-direction dedup already prevents same-side duplicates).
+            if config.GOLD_ONLY_PRODUCTION_MODE:
+                signals = gold_mode.merge(signals)
+
             for sig in signals:
                 # §6 — persist the chain-led emergent location first so the signal can FK it.
                 emergent = sig.pop('emergent', None)
                 if emergent is not None:
                     sig['emergent_location_id'] = db.save_emergent_location(emergent)
-                sig_id = db.save_signal(sig)
+
+                # §1/§18/§19 — Gold gate. Annotate always (research value); it only
+                # gates Discord + paper trade. Pass-through when GOLD_ONLY_PRODUCTION_MODE
+                # is off, so live behavior is unchanged until it is deliberately enabled.
+                production_ok = gold_mode.annotate_and_gate(sig)
+
+                sig_id = db.save_signal(sig)          # stored for research AND production
                 sheets.log_signal(sig)
                 db.mark_signal_logged(sig_id)
+
+                if not production_ok:
+                    logger.info("GOLD-MODE research-only: %s %s ctx=%s grade=%s vr=%s clow=%s",
+                                symbol, sig.get('signal_type'), sig.get('signal_context'),
+                                sig.get('gold_grade'), sig.get('value_region'),
+                                sig.get('clow_region'))
+                    continue                          # §19: no Discord, no paper trade
+
                 _notify_signal(sig)
                 # WATCH-only alerts and cluster upgrades are recorded + notified
                 # but never auto-traded (an upgrade's original alert already entered)
