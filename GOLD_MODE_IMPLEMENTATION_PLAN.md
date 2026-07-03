@@ -196,3 +196,67 @@ Gold effort, deepened with concrete cases. Mapping:
 (no alert; no backdate) · 6 TSLA422.5C→CHAIN_LED_CALL_WATCH · 7 TSLA425C@2.46K→GOLD_CHAIN_LED/
 EXCEPTIONAL_SINGLE_STRIKE · 8 TSLA430P@2.34K post-extension→CONFIRMED_INTRADAY_REVERSAL_PUT.
 NVDA 195C is a REQUIRED positive regression; TSLA 425P a REQUIRED negative.
+
+---
+
+# Addendum 2 — Event-Time ATM / Opening Flow patch → new phase **P-ET** (before P3)
+
+**Why a new phase, and why it comes first.** This patch's core requirement is not a
+gate tweak: today the engine computes ATM, strike-distance, and quotes at *bar-close /
+poll time*, but the patch demands **freezing them at the instant volume crosses the
+threshold** (§1, §2, §3, §14) and tracking **rolling-seconds** volume (§4). This is the
+TSLA-425P failure mode: a contract that was ATM at the opening flow but is deep ITM
+before the 1-min bar finishes — evaluated at bar-close it can be wrongly excluded.
+Event-time capture is a **prerequisite** for correct Route B (§8) and opening-flow
+(§2/§3/§9), so it is sequenced **ahead of P3**.
+
+## P-ET deliverables (new)
+- **Event-time state capture (§1):** on threshold-cross, snapshot `spot_at_event_start`,
+  `spot_at_threshold_cross`, `atm_strike_at_event`, `strike_distance_from_atm_at_event`,
+  bid/ask/mid/last at threshold, and `rolling_60s/180s/completed_1m/revised_1m`. Persist
+  on the candidate/signal (new `signal_event_state` table or signal columns).
+- **Eligibility by event-time distance (§1/§14):** strike eligibility uses
+  `strike_distance_from_atm_at_event`, NOT at evaluation. Store `selection_reason`.
+- **Rolling-seconds volume (§4):** per-contract rolling 60s/180s trackers (vs today's
+  1-min bar deltas); `volume_pass = 60s>=1000 OR 180s>=2000`, floors still binding; fire
+  when the rolling threshold is crossed without waiting for bar-close (store the completed
+  + revised bar for audit).
+- **Opening universe + registry (§2/§3):** subscribe ATM±5 in the first 15 min;
+  `OPENING_EVENT_WATCH_VOLUME`/`_TTL` registry that freezes the event-time ATM relationship
+  and keeps a contract active after it moves ITM/OTM.
+- **No-retrospective-qualification (§5):** eligibility decided at `decision_timestamp`;
+  a bar that revises over the floor later is a FRESH decision at the current quote/spot/ATM,
+  never backdated. Labels `SUBTHRESHOLD_PARTIAL_EVENT` → `REVISED_BAR_THRESHOLD_CROSSED`.
+
+## Full section → phase map (this patch)
+| § | Item | Phase | State today |
+|---|------|-------|-------------|
+| 1 event-time state | **P-ET** | not built |
+| 2 opening ATM±5 window | **P-ET** | not built |
+| 3 opening event registry | **P-ET** | not built |
+| 4 rolling 60/180s (floors live) | **P-ET** | floors LIVE; rolling-seconds not built |
+| 5 no-retro-qualification | **P-ET** | not built |
+| 6 two independent paths | done | ✅ live |
+| 7 Gold primary definition | P1 + P-ET (event-time ATM) + P2 | P1 live / intent dormant |
+| 8 chain-led Route A / **Route B** | RouteA ✅ · **Route B → P3** (needs P-ET) | Route B not built |
+| 9 opening directional story | **P3** (needs P-ET) | not built |
+| 10 two-sided candidate tracking | **P3** | partial (both sides scanned) |
+| 11 trend/countertrend classification | **P4** | partial |
+| 12 countertrend-strict Gold | **P4** | flag only |
+| 13 flow detected vs activated | **P2** | built, dormant |
+| 14 fresh ATM + selection_reason | **P-ET** (event-time) | eval-time only |
+| 15 same-direction superior event | **P4** | label only |
+| 16 primary+chain merge | P1 | ✅ built |
+| 17 Gold ⭐ rule | P1+P2+P-ET | partial |
+| 18 TSLA 7/2 audit output | **P5** | not built |
+| 19 regression controls | **P6** | 2 of ~9 |
+| 20 composite production rule | all | partial |
+
+## Revised phase order
+**P1 ✅ → P2 ✅ (dormant) → P-ET (event-time capture) → P3 (Route B + opening story, now
+unblocked) → P4 (superior-event + countertrend-strict) → P5 (latency + price-sync + audit
+output + MAE-before-MFE) → P6 (all control tests, then enable intent live).**
+
+Live today = P1 structural gate + tightened floors (a small slice). P-ET is the next
+build and the highest-leverage one — it fixes the event-time correctness the case
+studies keep hitting.
