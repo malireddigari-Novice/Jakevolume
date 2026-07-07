@@ -260,3 +260,62 @@ output + MAE-before-MFE) → P6 (all control tests, then enable intent live).**
 Live today = P1 structural gate + tightened floors (a small slice). P-ET is the next
 build and the highest-leverage one — it fixes the event-time correctness the case
 studies keep hitting.
+
+---
+
+# Addendum 3 — Primary-level Breakout/Breakdown + continuation → phase **P-BD**
+
+**Core new capability.** Primary OI levels are not only reversal zones — they also
+produce *continuation* when price accepts through them. Today the detector hard-codes
+the side from the level type (`signal_detector.check()` ~L417):
+`confirm_type = PUT if RESISTANCE else CALL` — i.e. only **support→CALL (bounce)** and
+**resistance→PUT (rejection)**. P-BD adds the missing two: **resistance→CALL (breakout)**
+and **support→PUT (breakdown)**, gated by an *acceptance* test so it never fires on a
+mere touch. This is why the AAPL-310C breakout above R1 would be missed today.
+
+## P-BD deliverables (new)
+- **Level-interaction classifier (§1/§4):** per level touch/cross, label BOUNCE /
+  REJECTION / BREAKOUT / BREAKDOWN / FALSE_BREAKOUT / FALSE_BREAKDOWN / MIXED. Decision
+  tree: CALL@support→bounce, CALL@resistance→breakout, PUT@resistance→rejection,
+  PUT@support→breakdown.
+- **Acceptance rule (§3):** a breakout/breakdown requires spot to *accept* past the level —
+  1 completed 1-min bar close beyond it, OR beyond by `max(BREAKOUT_LEVEL_BUFFER_ABS,
+  level*BREAKOUT_LEVEL_BUFFER_PCT)`, OR a reclaim/fail with premium continuing to expand.
+  Config: `BREAKOUT_ACCEPTANCE_BARS=1`, `BREAKOUT_LEVEL_BUFFER_PCT=0.001`,
+  `BREAKOUT_LEVEL_BUFFER_ABS=0.25`.
+- **False-breakout/breakdown block (§10):** cross without activation (premium fades +
+  opposite flow + spot falls back) → `FALSE_BREAKOUT_WATCH` / `FALSE_BREAKDOWN_WATCH`, no alert.
+- **Breakout/breakdown targets (§12):** extend `compute_exit_targets` — breakout-call
+  targets strictly *above* max(spot, breakout level, origin); breakdown-put strictly below.
+  (Builds on the origin-level target-integrity fix already shipped.)
+- **New subtypes + Discord (§13/§14):** `PRIMARY_LEVEL_BOUNCE_CALL / REJECTION_PUT /
+  BREAKOUT_CALL / BREAKDOWN_PUT`, merged `PRIMARY_AND_CHAIN_CONFIRMED_*`, and their
+  `GOLD_*` forms in `gold_mode`; card shows Level Type / Level Action / Acceptance /
+  Flow State / Intent.
+- **Structural context on chain-led events (§6):** tag near_support / near_resistance /
+  breaking_above / breaking_below / rejecting / bouncing — WITHOUT making primary
+  proximity a requirement for chain-led (§6 stays independent).
+
+## Section → coverage (this patch)
+| § | Item | Where | State |
+|---|------|-------|-------|
+| 1,3,4 breakout/breakdown classification + acceptance | **P-BD** | not built (detector hard-codes side) |
+| 2 AAPL 310C case | P-BD test | — |
+| 5 primary+chain merge (breakout variants) | P1 merge + **P-BD** labels | partial |
+| 6 chain-led independent + structural context | ✅ independent · context **P-BD** | partial |
+| 7 volume floors mandatory | ✅ live | done |
+| 8 event-time ATM | **P-ET** | not built |
+| 9 flow detected vs activated | **P2** | built, dormant |
+| 10 false breakout/breakdown | **P-BD** | not built |
+| 11 countertrend protection | **P4** | partial |
+| 12 breakout/breakdown targets | **P-BD** (extends shipped target-integrity) | not built |
+| 13 Gold subtypes | P1 + **P-BD** | partial |
+| 14 Discord subtype labels | **P-BD** | partial |
+| 15 regression tests (AAPL310C, NVDA195C, TSLA425P/412.5C, MSFT380C/385P) | **P6** | 2 of ~7 |
+| 16 final rule | all | partial |
+
+## Sequencing
+P-BD **depends on P-ET** (acceptance + event-time ATM) and reads P2 activation, so it
+slots **after P-ET, overlapping P3**. Order: P1 ✅ → P2 ✅(dormant) → **P-ET → P-BD /
+P3 → P4 → P5 → P6**. Nothing new goes live until its phase is built + the control tests
+(incl. AAPL 310C breakout) pass.
