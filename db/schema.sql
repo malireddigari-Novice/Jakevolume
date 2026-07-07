@@ -220,7 +220,11 @@ ALTER TABLE signals ALTER COLUMN signal_context TYPE VARCHAR(48);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS gold_grade      VARCHAR(12);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS gold_subtype    VARCHAR(48);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS value_region    VARCHAR(28);
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS clow_region     VARCHAR(40);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS clow_region     VARCHAR(48);
+-- Fix P1 undersize: 'ACCEPTABLE_ONLY_WITH_EXCEPTIONAL_EVIDENCE' is 41 chars and
+-- overflowed the original VARCHAR(40), crashing save_signal (and the whole
+-- intraday_check for that symbol) for any signal with low_dist in (1.50, 1.75].
+ALTER TABLE signals ALTER COLUMN clow_region TYPE VARCHAR(48);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS intent_class    VARCHAR(40);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS opp_veto        VARCHAR(48);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS call_leadership NUMERIC(6,4);
