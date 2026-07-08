@@ -151,6 +151,13 @@ CLOW_ACCEPTABLE_MAX = float(os.getenv('CLOW_ACCEPTABLE_MAX', '1.75'))
 INTENT_PREMIUM_HOLD_PCT   = float(os.getenv('INTENT_PREMIUM_HOLD_PCT',   '-0.10'))  # premium may dip ≤10% and still "hold"
 INTENT_SPOT_CONTRADICT_PCT= float(os.getenv('INTENT_SPOT_CONTRADICT_PCT', '0.003')) # spot move that counts as contradicting the thesis
 LEADERSHIP_VETO_MARGIN    = float(os.getenv('LEADERSHIP_VETO_MARGIN',     '0.15'))  # opposite side must lead by this to veto
+# Event-time capture (P-ET) — freeze ATM/spot/quotes at the threshold-cross instant so
+# strike eligibility uses the state WHEN flow occurred, not at bar-close (fixes fast
+# opening moves running away from the initiating contract). Default off until wired.
+EVENT_TIME_ELIGIBILITY_ENABLED = os.getenv('EVENT_TIME_ELIGIBILITY_ENABLED', 'false').lower() == 'true'
+OPENING_STRIKE_WINDOW          = int(os.getenv('OPENING_STRIKE_WINDOW',          '5'))   # ATM ± N strikes in the opening 15m
+OPENING_EVENT_WATCH_VOLUME     = int(os.getenv('OPENING_EVENT_WATCH_VOLUME',     '500'))  # r60 that registers a watch event
+OPENING_EVENT_CONTRACT_TTL_MIN = int(os.getenv('OPENING_EVENT_CONTRACT_TTL_MIN', '30'))   # keep a registered contract alive this long
 
 # Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
 DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
