@@ -549,6 +549,37 @@ def save_signal(signal: dict) -> int:
         _put(conn)
 
 
+def save_signal_event_state(signal_id: int, es) -> None:
+    """Persist a signal's frozen event-time state (P-ET). No-op when es is None."""
+    if es is None:
+        return
+    sql = """
+        INSERT INTO signal_event_state
+            (signal_id, symbol, contract_strike, option_type,
+             event_start_time, spot_at_event_start, atm_strike_at_event_start,
+             strike_distance_at_event, threshold_cross_time, spot_at_threshold_cross,
+             atm_strike_at_threshold_cross, bid_at_threshold, ask_at_threshold,
+             last_at_threshold, r60_at_threshold, r180_at_threshold,
+             observed_volume_at_decision, decision_timestamp)
+        VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s)
+        ON CONFLICT (signal_id) DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                signal_id, es.symbol, es.strike, es.option_type,
+                es.event_start_time, es.spot_at_event_start, es.atm_strike_at_event_start,
+                es.strike_distance_at_event, es.threshold_cross_time, es.spot_at_threshold_cross,
+                es.atm_strike_at_threshold_cross, es.bid_at_threshold, es.ask_at_threshold,
+                es.last_at_threshold, es.r60_at_threshold, es.r180_at_threshold,
+                es.observed_volume_at_decision, es.decision_timestamp,
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_morning_sentiment(
     symbol: str,
     snap_date: date,

@@ -708,7 +708,13 @@ def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
     emergent = sig.pop('emergent', None)
     if emergent is not None:
         sig['emergent_location_id'] = db.save_emergent_location(emergent)
+    event_state = sig.pop('event_state', None)   # P-ET: not a signals column
     sig_id = db.save_signal(sig)
+    if event_state is not None:
+        try:
+            db.save_signal_event_state(sig_id, event_state)
+        except Exception:
+            logger.warning("save_signal_event_state failed for %s", sig.get('symbol'), exc_info=True)
     sheets.log_signal(sig)
     db.mark_signal_logged(sig_id)
     return sig_id

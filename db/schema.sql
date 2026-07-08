@@ -233,6 +233,29 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS put_leadership  NUMERIC(6,4);
 CREATE INDEX IF NOT EXISTS idx_sig_symbol_time
     ON signals (symbol, signal_time DESC);
 
+-- ── Event-time state per signal (P-ET) — market state frozen at threshold-cross ──
+CREATE TABLE IF NOT EXISTS signal_event_state (
+    signal_id                     BIGINT PRIMARY KEY REFERENCES signals(id),
+    symbol                        VARCHAR(10),
+    contract_strike               NUMERIC(12,4),
+    option_type                   VARCHAR(4),
+    event_start_time              TIMESTAMPTZ,
+    spot_at_event_start           NUMERIC(12,4),
+    atm_strike_at_event_start     NUMERIC(12,4),
+    strike_distance_at_event      NUMERIC(12,4),
+    threshold_cross_time          TIMESTAMPTZ,
+    spot_at_threshold_cross       NUMERIC(12,4),
+    atm_strike_at_threshold_cross NUMERIC(12,4),
+    bid_at_threshold              NUMERIC(12,4),
+    ask_at_threshold              NUMERIC(12,4),
+    last_at_threshold             NUMERIC(12,4),
+    r60_at_threshold              BIGINT,
+    r180_at_threshold             BIGINT,
+    observed_volume_at_decision   BIGINT,
+    decision_timestamp            TIMESTAMPTZ,
+    created_at                    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
 CREATE TABLE IF NOT EXISTS morning_sentiment (
     id          BIGSERIAL    PRIMARY KEY,

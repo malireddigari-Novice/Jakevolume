@@ -40,6 +40,8 @@ import config
 from analysis.flow_reversal import volume_event
 from analysis.volume_analytics import compute_leadership_scores
 from analysis.trend import IntradayTrend
+from analysis.event_state import EventRegistry
+from analysis.rolling_volume import RollingVolume
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -293,6 +295,9 @@ class SignalDetector:
         # §73 per-poll candidate-evaluation log (every level, blocked or passed) — the
         # caller persists `last_candidates` to signal_candidates after each check().
         self.last_candidates: list[dict] = []
+        # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
+        self._event_reg = EventRegistry()
+        self._rvol: dict[_OptKey, RollingVolume] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -353,6 +358,8 @@ class SignalDetector:
             self._pending_candidates  = {}
             self._trend.reset()
             self._countertrend_watch  = {}
+            self._event_reg.reset()
+            self._rvol = {}
 
         # Durable dedup: fold in directions already fired today (DB).
         if fired_today_fn is not None:
@@ -372,6 +379,16 @@ class SignalDetector:
         opt_data_map: dict[tuple[float, str], dict] = {}
         vol_deltas:   dict[tuple[float, str], int]  = {}
 
+        # P-ET: current ATM per side (frozen into each contract's EventState on watch
+        # cross). Entire block is a no-op unless EVENT_TIME_ELIGIBILITY_ENABLED.
+        _et_on = config.EVENT_TIME_ELIGIBILITY_ENABLED
+        _atm_call = _atm_put = None
+        if _et_on:
+            _cs = [s for (s, ot) in option_quotes if ot == 'CALL']
+            _ps = [s for (s, ot) in option_quotes if ot == 'PUT']
+            _atm_call = min(_cs, key=lambda s: abs(s - close_price)) if _cs else None
+            _atm_put  = min(_ps, key=lambda s: abs(s - close_price)) if _ps else None
+
         for (s, ot), data in option_quotes.items():
             opt_key: _OptKey = (symbol, s, ot)
             cur_vol  = int(data.get('volume', 0) or 0)
@@ -388,6 +405,24 @@ class SignalDetector:
             self._prev_opt_vol[opt_key] = cur_vol
             self._opt_last_bar[opt_key] = bar_time
             self._opt_vol_hist[opt_key].append(delta)
+
+            # P-ET: feed rolling volume + event-time registry for every subscribed
+            # contract (freezes ATM/spot/quotes at watch/threshold cross). Gated.
+            if _et_on:
+                rv = self._rvol.get(opt_key)
+                if rv is None:
+                    rv = RollingVolume()
+                    self._rvol[opt_key] = rv
+                rv.observe_delta(delta)
+                _atm = _atm_call if ot == 'CALL' else _atm_put
+                if _atm is not None:
+                    self._event_reg.observe(
+                        symbol, s, ot, now=bar_time, spot=close_price, atm_strike=_atm,
+                        r60=rv.r60(), r180=rv.r180(),
+                        floor_60=config.PEAK_1M_VOLUME_MIN, floor_180=config.VOLUME_3M_MIN,
+                        bid=data.get('bid'), ask=data.get('ask'), last=data.get('mark'),
+                        watch_vol=config.OPENING_EVENT_WATCH_VOLUME,
+                        ttl_min=config.OPENING_EVENT_CONTRACT_TTL_MIN)
 
             mark = data.get('mark')
             if mark is not None and mark > 0:
@@ -1438,6 +1473,11 @@ class SignalDetector:
             'spike_volume':       None,
             'consecutive_spikes': None,
         }
+
+        # P-ET: attach the contract's frozen event-time state (for persistence + later
+        # event-time eligibility). None when disabled or no event was registered.
+        if config.EVENT_TIME_ELIGIBILITY_ENABLED:
+            signal['event_state'] = self._event_reg.get(symbol, traded_strike, confirm_type)
 
         strike_note = (f"  [{day_mode} strike={traded_strike:.2f}→tgt {target_level:.2f}]"
                        if next_day_mode and target_level is not None else "")
