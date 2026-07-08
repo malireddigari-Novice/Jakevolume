@@ -825,8 +825,14 @@ def _execute_trade(sig: dict, sig_id: int, alpaca: AlpacaClient, sheets: SheetsL
         logger.warning("Alpaca: trade skipped for %s — no exit target available", symbol)
         return
 
-    exit1_qty = qty // 2
-    exit2_qty = qty - exit1_qty   # remaining (handles odd numbers)
+    # Split the position half/half across the two targets. A 1-contract position
+    # cannot be split (qty//2 == 0, which Alpaca rejects as "qty must be > 0"), so
+    # exit the whole thing at target 1 and leave the second leg empty.
+    if qty < 2:
+        exit1_qty, exit2_qty = qty, 0
+    else:
+        exit1_qty = qty // 2
+        exit2_qty = qty - exit1_qty   # remaining (handles odd numbers)
 
     logger.info(
         "Alpaca: %s %s  entry=$%.2f  exit1=%s@%s  exit2=%s@%s",
@@ -1112,6 +1118,12 @@ def check_exits(
                     label    = f"Exit 1/2 @ {r1_label}  |  Stop → {stop_str} (breakeven)"
                     sheets.log_trade_exit(order, dict(trade), label, underlying_price)
 
+                    # Single-leg position (qty < 2): exit1 sold the whole thing, so
+                    # there is no second leg — mark it complete so it stops being
+                    # monitored (and we never send a 0-qty exit2 order).
+                    if (trade.get('exit2_qty') or 0) <= 0:
+                        db.mark_exit2_filled(trade['id'], now)
+
                     # Opposite-side volume validation — may trigger early exit2
                     exit2_qty = trade.get('exit2_qty') or 0
                     if exit2_qty > 0 and option_quotes:
@@ -1144,7 +1156,9 @@ def check_exits(
                             )
 
         # ── Exit 2 — after exit 1 filled; price target OR opposite-side vol ──
-        elif trade['exit1_filled'] and not trade['exit2_filled'] and trade.get('exit2_underlying'):
+        # (exit2_qty > 0 guard: a single-leg qty<2 trade has no second leg.)
+        elif (trade['exit1_filled'] and not trade['exit2_filled']
+              and trade.get('exit2_underlying') and (trade.get('exit2_qty') or 0) > 0):
             target2  = float(trade['exit2_underlying'])
             target1  = float(trade['exit1_underlying']) if trade.get('exit1_underlying') else 0.0
             r2_label = 'R2' if sig_type == 'BULLISH' else 'S2'
