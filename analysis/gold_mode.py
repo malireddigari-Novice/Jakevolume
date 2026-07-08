@@ -58,6 +58,18 @@ def subtype_for_interaction(interaction: str):
     return _INTERACTION_SUBTYPE.get(interaction)
 
 
+def improved_timing_qualifies(*, same_direction: bool, stronger_volume: bool,
+                              better_value: bool, current_atm: bool, activation_clear: bool,
+                              thesis_valid: bool, no_opposite_leadership_change: bool) -> bool:
+    """
+    §15/§8 — a later, independent, materially better same-direction event may fire as
+    HIGH_CONVICTION_SAME_DIRECTION_UPGRADE even though the side already alerted today
+    (the one sanctioned exception to the one-per-side dedup). All conditions required.
+    """
+    return all((same_direction, stronger_volume, better_value, current_atm,
+                activation_clear, thesis_valid, no_opposite_leadership_change))
+
+
 # ── Value-location classifiers (§12 / §13) ────────────────────────────────────
 
 def value_region(pctile):

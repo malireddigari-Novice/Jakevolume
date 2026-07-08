@@ -14,6 +14,33 @@ control tests (AAPL 310C breakout, TSLA 425P opening) validate it.
 from typing import Optional
 
 
+def classify_opening_story(*, call_vol, put_vol, call_prem_chg, put_prem_chg,
+                           call_lead, put_lead, spot_chg) -> str:
+    """
+    §9/§11 opening directional story from both-sided chain aggregates. Distinguishes
+    directional demand from supply/non-directional flow — a large put event with fading
+    put premium while spot rises and calls lead is PUT_SUPPLY_BULLISH, not put demand.
+    """
+    cv, pv = (call_vol or 0), (put_vol or 0)
+    call_demand = call_lead >= put_lead and call_prem_chg >= 0 and spot_chg >= 0
+    put_demand  = put_lead >= call_lead and put_prem_chg >= 0 and spot_chg <= 0
+    # Supply requires the side to be the LARGER (dominant-volume) event whose premium
+    # is nonetheless fading while spot moves against it and the other side leads.
+    put_supply  = pv >= cv and put_prem_chg < 0 and spot_chg > 0 and call_lead > put_lead
+    call_supply = cv >= pv and call_prem_chg < 0 and spot_chg < 0 and put_lead > call_lead
+    if put_supply:
+        return 'OPENING_PUT_SUPPLY_BULLISH'
+    if call_supply:
+        return 'OPENING_CALL_SUPPLY_BEARISH'
+    if call_demand and not put_demand:
+        return 'OPENING_CALL_DEMAND_DOMINANT'
+    if put_demand and not call_demand:
+        return 'OPENING_PUT_DEMAND_DOMINANT'
+    if not call_demand and not put_demand:
+        return 'OPENING_NO_CONVICTION'
+    return 'OPENING_MIXED'
+
+
 def strike_increment(option_quotes: dict, default: float = 2.5) -> float:
     """Smallest positive gap between adjacent strikes in the chain (fallback `default`)."""
     ks = sorted({float(s) for (s, _ot) in option_quotes})
