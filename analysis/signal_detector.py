@@ -42,6 +42,7 @@ from analysis.volume_analytics import compute_leadership_scores
 from analysis.trend import IntradayTrend
 from analysis.event_state import EventRegistry
 from analysis.rolling_volume import RollingVolume
+from analysis.opening_scan import scan_opening
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -298,6 +299,7 @@ class SignalDetector:
         # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
         self._event_reg = EventRegistry()
         self._rvol: dict[_OptKey, RollingVolume] = {}
+        self.last_opening_candidates: list[dict] = []   # event-time opening scan (research)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -437,6 +439,23 @@ class SignalDetector:
                                                 self._contract_low_dist)
                       if opt_data_map else None)
         self._trend.update(symbol, close_price, bar_time, leadership)
+
+        # P-ET step 5: opening ATM±N event-time scan (research-only, gated). Surfaces
+        # contracts that crossed the floor at event time within ATM±window strikes AT
+        # THAT MOMENT — kept eligible even if spot ran away. Logged/recorded, not fired.
+        self.last_opening_candidates = []
+        if _et_on and opening_range:
+            try:
+                self.last_opening_candidates = scan_opening(
+                    symbol, option_quotes, self._event_reg,
+                    window_strikes=config.OPENING_STRIKE_WINDOW)
+                for c in self.last_opening_candidates:
+                    logger.info("OPENING-SCAN eligible (event-time): %s %s $%.2f  "
+                                "dist=%s strikes  %s",
+                                symbol, c['option_type'], c['strike'],
+                                c['dist_strikes'], c['no_retro'])
+            except Exception:
+                logger.warning("%s: opening scan failed", symbol, exc_info=True)
 
         # ── Opening-range thresholds (§15) — raised, never suppressed ──────────
         single_mult     = config.OPENING_RANGE_VOL_MULT      if opening_range else 1.0
