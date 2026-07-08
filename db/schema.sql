@@ -252,9 +252,13 @@ CREATE TABLE IF NOT EXISTS signal_event_state (
     r60_at_threshold              BIGINT,
     r180_at_threshold             BIGINT,
     observed_volume_at_decision   BIGINT,
+    final_revised_volume          BIGINT,
     decision_timestamp            TIMESTAMPTZ,
+    no_retro_label                VARCHAR(32),
     created_at                    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS final_revised_volume BIGINT;
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS no_retro_label       VARCHAR(32);
 
 -- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
 CREATE TABLE IF NOT EXISTS morning_sentiment (

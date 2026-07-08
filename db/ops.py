@@ -560,8 +560,9 @@ def save_signal_event_state(signal_id: int, es) -> None:
              strike_distance_at_event, threshold_cross_time, spot_at_threshold_cross,
              atm_strike_at_threshold_cross, bid_at_threshold, ask_at_threshold,
              last_at_threshold, r60_at_threshold, r180_at_threshold,
-             observed_volume_at_decision, decision_timestamp)
-        VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s)
+             observed_volume_at_decision, final_revised_volume, decision_timestamp,
+             no_retro_label)
+        VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s)
         ON CONFLICT (signal_id) DO NOTHING
     """
     conn = _get()
@@ -573,7 +574,8 @@ def save_signal_event_state(signal_id: int, es) -> None:
                 es.strike_distance_at_event, es.threshold_cross_time, es.spot_at_threshold_cross,
                 es.atm_strike_at_threshold_cross, es.bid_at_threshold, es.ask_at_threshold,
                 es.last_at_threshold, es.r60_at_threshold, es.r180_at_threshold,
-                es.observed_volume_at_decision, es.decision_timestamp,
+                es.observed_volume_at_decision, es.final_revised_volume, es.decision_timestamp,
+                es.no_retro_label(),
             ))
         conn.commit()
     finally:

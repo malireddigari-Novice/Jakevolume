@@ -43,14 +43,33 @@ class EventState:
     last_at_threshold: Optional[float] = None
     r60_at_threshold: Optional[int] = None
     r180_at_threshold: Optional[int] = None
-    observed_volume_at_decision: Optional[int] = None
-    decision_timestamp: Optional[datetime] = None
+    observed_volume_at_decision: Optional[int] = None   # volume seen at first WATCH cross
+    final_revised_volume: Optional[int] = None          # r180 at the qualifying THRESHOLD cross
+    decision_timestamp: Optional[datetime] = None       # == threshold_cross_time
 
     def strike_distance_strikes(self, increment: float) -> Optional[int]:
         """Event-time distance expressed in strikes, given the chain's strike increment."""
         if not increment or increment <= 0:
             return None
         return round(self.strike_distance_at_event / increment)
+
+    def no_retro_label(self) -> str:
+        """
+        §5 no-retrospective-qualification audit label, derived from the lifecycle:
+          SUBTHRESHOLD_PARTIAL_EVENT   — watched but never crossed the production floor
+          REVISED_BAR_THRESHOLD_CROSSED — crossed on a LATER poll than the watch, i.e. it
+                                          was sub-floor at first sight and qualified only
+                                          after the bar revised up (a FRESH decision — the
+                                          signal fires at that poll's current price, never
+                                          backdated to the cheaper watch-time quote)
+          QUALIFIED_AT_DECISION        — crossed on the same poll it was first watched
+        """
+        if not self.crossed:
+            return 'SUBTHRESHOLD_PARTIAL_EVENT'
+        if self.threshold_cross_time and self.event_start_time \
+                and self.threshold_cross_time > self.event_start_time:
+            return 'REVISED_BAR_THRESHOLD_CROSSED'
+        return 'QUALIFIED_AT_DECISION'
 
 
 class EventRegistry:
@@ -87,6 +106,7 @@ class EventRegistry:
                 atm_strike_at_event_start=atm_strike,
                 strike_distance_at_event=abs(float(strike) - atm_strike),
                 ttl_expires_at=now + timedelta(minutes=ttl_min),
+                observed_volume_at_decision=r60,   # §5 volume at first sight (may be sub-floor)
             )
             self._states[key] = st
 
@@ -98,7 +118,7 @@ class EventRegistry:
             st.atm_strike_at_threshold_cross = atm_strike
             st.bid_at_threshold, st.ask_at_threshold, st.last_at_threshold = bid, ask, last
             st.r60_at_threshold, st.r180_at_threshold = r60, r180
-            st.observed_volume_at_decision = r60
+            st.final_revised_volume = r180
             st.decision_timestamp = now
         return st
 

@@ -41,7 +41,8 @@ r = reg.observe('TSLA', 425.0, 'PUT', now=t2, spot=427.0, atm_strike=427.5,
                 r60=800, r180=2100, bid=2.6, ask=2.8, last=2.7, **COMMON)
 ck("threshold cross -> crossed", r.crossed is True)
 ck("decision timestamp stamped", r.decision_timestamp == t2)
-ck("observed_volume_at_decision = 800", r.observed_volume_at_decision == 800)
+ck("observed_volume_at_decision = watch value 600", r.observed_volume_at_decision == 600)
+ck("final_revised_volume = threshold r180 2100", r.final_revised_volume == 2100)
 ck("threshold ask stamped", r.ask_at_threshold == 2.8)
 
 # Spot runs away: contract now 2.5 strikes ITM (spot 431.25, ATM 431.25) — but the
@@ -61,6 +62,23 @@ r = reg.observe('TSLA', 425.0, 'PUT', now=t4, spot=431.0, atm_strike=431.0,
                 r60=100, r180=100, **COMMON)
 ck("expired after TTL -> None", r is None)
 ck("registry empty after prune", reg.get('TSLA', 425.0, 'PUT') is None)
+
+# ── §5 no-retrospective-qualification labels ──
+r = EventRegistry().observe('X', 50.0, 'CALL', now=t0, spot=50, atm_strike=50,
+                            r60=1500, r180=1500, **COMMON)   # crosses on first sight
+ck("same-poll cross -> QUALIFIED_AT_DECISION", r.no_retro_label() == 'QUALIFIED_AT_DECISION')
+
+reg3 = EventRegistry()
+reg3.observe('Y', 60.0, 'PUT', now=t0, spot=60, atm_strike=60, r60=600, r180=600, **COMMON)  # sub-floor watch
+r = reg3.observe('Y', 60.0, 'PUT', now=t0 + timedelta(minutes=1), spot=60, atm_strike=60,
+                 r60=1200, r180=1200, **COMMON)              # crosses on a LATER poll
+ck("watch-then-cross -> REVISED_BAR_THRESHOLD_CROSSED", r.no_retro_label() == 'REVISED_BAR_THRESHOLD_CROSSED')
+ck("observed_at_decision = watch value 600", r.observed_volume_at_decision == 600)
+ck("final_revised = cross r180 1200",        r.final_revised_volume == 1200)
+
+r = EventRegistry().observe('Z', 70.0, 'CALL', now=t0, spot=70, atm_strike=70,
+                            r60=600, r180=600, **COMMON)      # watch only, never crosses floor
+ck("watch-only -> SUBTHRESHOLD_PARTIAL_EVENT", r.no_retro_label() == 'SUBTHRESHOLD_PARTIAL_EVENT')
 
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")
 sys.exit(1 if fails else 0)
