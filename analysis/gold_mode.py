@@ -31,8 +31,27 @@ GOLD_CHAIN_LED        = 'GOLD_CHAIN_LED'
 PRIMARY_AND_CHAIN     = 'PRIMARY_AND_CHAIN_CONFIRMED'
 SAME_DIR_UPGRADE      = 'HIGH_CONVICTION_SAME_DIRECTION_UPGRADE'
 COUNTERTREND_REVERSAL = 'CONFIRMED_COUNTERTREND_REVERSAL'
+# P-BD primary-level continuation subtypes
+GOLD_PRIMARY_BOUNCE_CALL   = 'GOLD_PRIMARY_BOUNCE_CALL'
+GOLD_PRIMARY_REJECTION_PUT = 'GOLD_PRIMARY_REJECTION_PUT'
+GOLD_PRIMARY_BREAKOUT_CALL = 'GOLD_PRIMARY_BREAKOUT_CALL'
+GOLD_PRIMARY_BREAKDOWN_PUT = 'GOLD_PRIMARY_BREAKDOWN_PUT'
 _GOLD_SUBTYPES = {GOLD_PRIMARY_LEVEL, GOLD_CHAIN_LED, PRIMARY_AND_CHAIN,
-                  SAME_DIR_UPGRADE, COUNTERTREND_REVERSAL}
+                  SAME_DIR_UPGRADE, COUNTERTREND_REVERSAL,
+                  GOLD_PRIMARY_BOUNCE_CALL, GOLD_PRIMARY_REJECTION_PUT,
+                  GOLD_PRIMARY_BREAKOUT_CALL, GOLD_PRIMARY_BREAKDOWN_PUT}
+# Map a breakout.classify_interaction() result to its Gold subtype.
+_INTERACTION_SUBTYPE = {
+    'BOUNCE_CALL':   GOLD_PRIMARY_BOUNCE_CALL,
+    'REJECTION_PUT': GOLD_PRIMARY_REJECTION_PUT,
+    'BREAKOUT_CALL': GOLD_PRIMARY_BREAKOUT_CALL,
+    'BREAKDOWN_PUT': GOLD_PRIMARY_BREAKDOWN_PUT,
+}
+
+
+def subtype_for_interaction(interaction: str):
+    """Gold subtype for a breakout.classify_interaction() label, or None if not actionable."""
+    return _INTERACTION_SUBTYPE.get(interaction)
 
 
 # ── Value-location classifiers (§12 / §13) ────────────────────────────────────
@@ -86,6 +105,11 @@ def classify(sig) -> dict:
     and the opening story (P3) tighten this further in later phases.
     """
     subtype = _subtype_from_context(sig)
+    # P-BD: a classified level interaction (bounce/rejection/breakout/breakdown)
+    # refines the primary subtype when present.
+    _mapped = subtype_for_interaction(sig.get('level_action'))
+    if _mapped:
+        subtype = _mapped
     vr = value_region(sig.get('hv_pctile'))
     cr = contract_low_region(sig.get('low_dist'))
     # Missing (None) regions are treated as non-blocking here — the existing

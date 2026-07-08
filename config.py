@@ -159,6 +159,15 @@ OPENING_STRIKE_WINDOW          = int(os.getenv('OPENING_STRIKE_WINDOW',         
 OPENING_EVENT_WATCH_VOLUME     = int(os.getenv('OPENING_EVENT_WATCH_VOLUME',     '500'))  # r60 that registers a watch event
 OPENING_EVENT_CONTRACT_TTL_MIN = int(os.getenv('OPENING_EVENT_CONTRACT_TTL_MIN', '30'))   # keep a registered contract alive this long
 
+# Breakout/breakdown continuation (P-BD) — primary levels also produce continuation
+# when price ACCEPTS through them (resistance->CALL breakout, support->PUT breakdown),
+# not only bounces/rejections. Acceptance = a completed bar beyond the level, OR beyond
+# by max(BREAKOUT_LEVEL_BUFFER_ABS, level*BREAKOUT_LEVEL_BUFFER_PCT). Default off.
+BREAKOUT_BREAKDOWN_ENABLED = os.getenv('BREAKOUT_BREAKDOWN_ENABLED', 'false').lower() == 'true'
+BREAKOUT_ACCEPTANCE_BARS   = int(os.getenv('BREAKOUT_ACCEPTANCE_BARS', '1'))
+BREAKOUT_LEVEL_BUFFER_PCT  = float(os.getenv('BREAKOUT_LEVEL_BUFFER_PCT', '0.001'))
+BREAKOUT_LEVEL_BUFFER_ABS  = float(os.getenv('BREAKOUT_LEVEL_BUFFER_ABS', '0.25'))
+
 # Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
 DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
 DOMINANT_3M           = {'NVDA': 1750, 'TSLA': 1750, 'default': 1250}
