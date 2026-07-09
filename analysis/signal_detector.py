@@ -651,8 +651,13 @@ class SignalDetector:
             self._record_candidate(symbol, label, strike, close_price, confirm_type,
                                    reason='PASSED', dist=dist, atm=atm, low=atm_low)
 
-        if not candidates:
-            return []
+        # NOTE: do NOT early-return when `candidates` is empty. The chain-led /
+        # Route-B emergent path (below) is designed to fire independent of any
+        # primary level — it must run even on polls where no level candidate
+        # exists. An earlier `if not candidates: return []` here made chain-led
+        # unreachable unless a level candidate coincided on the same poll, which
+        # defeated its purpose (non-level ATM flow like TSLA 395P @ 09:05 on
+        # 2026-07-09 was never evaluated). The code below is empty-safe.
 
         # One alert this bar per direction. Across in-range levels keep the
         # strongest: highest-OI level (lowest rank) then largest ATM volume.
