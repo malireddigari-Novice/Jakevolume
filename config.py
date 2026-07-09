@@ -158,6 +158,12 @@ EVENT_TIME_ELIGIBILITY_ENABLED = os.getenv('EVENT_TIME_ELIGIBILITY_ENABLED', 'fa
 OPENING_STRIKE_WINDOW          = int(os.getenv('OPENING_STRIKE_WINDOW',          '5'))   # ATM ± N strikes in the opening 15m
 OPENING_EVENT_WATCH_VOLUME     = int(os.getenv('OPENING_EVENT_WATCH_VOLUME',     '500'))  # r60 that registers a watch event
 OPENING_EVENT_CONTRACT_TTL_MIN = int(os.getenv('OPENING_EVENT_CONTRACT_TTL_MIN', '30'))   # keep a registered contract alive this long
+# Fix (2), Option C — promote opening-window event-time-eligible contracts to PRODUCTION
+# (not just research logging). A candidate fires only when the both-sided opening story is
+# demand-dominant on its side, priced at commit time (no retrospective qualification), and
+# it clears the full chain-led/Route-B economic + veto + Gold gates. Default OFF — ships
+# dark; validate on replay before enabling.
+OPENING_SCAN_PRODUCTION_ENABLED = os.getenv('OPENING_SCAN_PRODUCTION_ENABLED', 'false').lower() == 'true'
 
 # Breakout/breakdown continuation (P-BD) — primary levels also produce continuation
 # when price ACCEPTS through them (resistance->CALL breakout, support->PUT breakdown),
