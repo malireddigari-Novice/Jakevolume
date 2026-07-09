@@ -255,10 +255,22 @@ CREATE TABLE IF NOT EXISTS signal_event_state (
     final_revised_volume          BIGINT,
     decision_timestamp            TIMESTAMPTZ,
     no_retro_label                VARCHAR(32),
+    bid_at_commit                 NUMERIC(12,4),
+    ask_at_commit                 NUMERIC(12,4),
+    mid_at_commit                 NUMERIC(12,4),
+    paper_fill_price              NUMERIC(12,4),
+    paper_fill_method             VARCHAR(20),
+    price_moved_from_event        BOOLEAN,
     created_at                    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS final_revised_volume BIGINT;
 ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS no_retro_label       VARCHAR(32);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS bid_at_commit          NUMERIC(12,4);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS ask_at_commit          NUMERIC(12,4);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS mid_at_commit          NUMERIC(12,4);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS paper_fill_price       NUMERIC(12,4);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS paper_fill_method      VARCHAR(20);
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS price_moved_from_event  BOOLEAN;
 
 -- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
 CREATE TABLE IF NOT EXISTS morning_sentiment (

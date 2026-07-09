@@ -38,6 +38,7 @@ from analysis.volume_analytics import compute_leadership_scores
 from analysis.open_positions import collect_open_positions
 from analysis import gold_mode
 from analysis.intent_gate import IntentGate
+from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
 from data.market_utils import (
     now_cst, today_cst,
@@ -711,6 +712,19 @@ def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
     event_state = sig.pop('event_state', None)   # P-ET: not a signals column
     sig_id = db.save_signal(sig)
     if event_state is not None:
+        # §1/§13 stamp commit-time quotes + realistic paper fill + price-moved flag.
+        b, a = sig.get('opt_bid'), sig.get('opt_ask')
+        event_state.bid_at_commit = b
+        event_state.ask_at_commit = a
+        event_state.mid_at_commit = round((b + a) / 2, 4) if (b and a) else None
+        event_state.paper_fill_price = sig.get('price_to_enter')
+        event_state.paper_fill_method = sig.get('paper_fill_method')
+        event_state.price_moved_from_event = price_moved_from_event(
+            sig.get('price_to_enter'), event_state.last_at_threshold)
+        if event_state.price_moved_from_event:
+            logger.info("PRICE-MOVED %s %s: fill=%s far from event ref=%s",
+                        sig.get('symbol'), sig.get('option_type'),
+                        sig.get('price_to_enter'), event_state.last_at_threshold)
         try:
             db.save_signal_event_state(sig_id, event_state)
         except Exception:

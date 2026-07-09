@@ -46,6 +46,7 @@ from analysis.opening_scan import scan_opening
 from analysis import breakout as _breakout
 from analysis.route_b import route_b_qualifies
 from analysis.gold_mode import contract_low_region
+from analysis.paper_fill import executable_fill as _executable_fill
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -1430,8 +1431,9 @@ class SignalDetector:
         opt_mark = trade_data.get('mark')
         opt_bid  = trade_data.get('bid')
         opt_ask  = trade_data.get('ask')
-        price_to_enter = round(opt_ask, 2) if opt_ask else None
-        price_to_exit  = round(opt_ask * 2, 2) if opt_ask else None
+        # §1/§13 realistic executable fill at commit (near the ask) + method label.
+        price_to_enter, paper_fill_method = _executable_fill(opt_bid, opt_ask, opt_mark)
+        price_to_exit  = round(price_to_enter * 2, 2) if price_to_enter else None
 
         option_hl_flag: Optional[str] = None
         day_high = trade_data.get('day_high')
@@ -1474,6 +1476,7 @@ class SignalDetector:
             'opt_ask':          opt_ask,
             'price_to_enter':   price_to_enter,
             'price_to_exit':    price_to_exit,
+            'paper_fill_method': paper_fill_method,
             'prox_score':       1.0,              # binary near-level → always 1.0
             'cluster_strength': cluster_strength,
             'strong_cluster':   atm_itm_confirm,

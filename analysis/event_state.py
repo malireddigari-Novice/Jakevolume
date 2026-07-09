@@ -46,6 +46,13 @@ class EventState:
     observed_volume_at_decision: Optional[int] = None   # volume seen at first WATCH cross
     final_revised_volume: Optional[int] = None          # r180 at the qualifying THRESHOLD cross
     decision_timestamp: Optional[datetime] = None       # == threshold_cross_time
+    # ── §1/§13 commit-time quotes + paper fill (stamped by main at emit) ──
+    bid_at_commit: Optional[float] = None
+    ask_at_commit: Optional[float] = None
+    mid_at_commit: Optional[float] = None
+    paper_fill_price: Optional[float] = None
+    paper_fill_method: Optional[str] = None
+    price_moved_from_event: Optional[bool] = None
 
     def strike_distance_strikes(self, increment: float) -> Optional[int]:
         """Event-time distance expressed in strikes, given the chain's strike increment."""
