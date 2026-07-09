@@ -725,8 +725,13 @@ def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
             logger.info("PRICE-MOVED %s %s: fill=%s far from event ref=%s",
                         sig.get('symbol'), sig.get('option_type'),
                         sig.get('price_to_enter'), event_state.last_at_threshold)
+        # §17 latency — stamp commit time on the same CST bar clock, expose the
+        # profile on the sig for the Discord card, and persist it.
+        event_state.commit_time = now_cst()
+        sig['latency'] = event_state.latency_profile()
         try:
             db.save_signal_event_state(sig_id, event_state)
+            db.save_signal_latency(sig_id, event_state)
         except Exception:
             logger.warning("save_signal_event_state failed for %s", sig.get('symbol'), exc_info=True)
     sheets.log_signal(sig)

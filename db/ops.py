@@ -562,9 +562,9 @@ def save_signal_event_state(signal_id: int, es) -> None:
              last_at_threshold, r60_at_threshold, r180_at_threshold,
              observed_volume_at_decision, final_revised_volume, decision_timestamp,
              no_retro_label, bid_at_commit, ask_at_commit, mid_at_commit,
-             paper_fill_price, paper_fill_method, price_moved_from_event)
+             paper_fill_price, paper_fill_method, price_moved_from_event, commit_time)
         VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,
-                %s,%s,%s, %s,%s,%s)
+                %s,%s,%s, %s,%s,%s, %s)
         ON CONFLICT (signal_id) DO NOTHING
     """
     conn = _get()
@@ -579,6 +579,32 @@ def save_signal_event_state(signal_id: int, es) -> None:
                 es.observed_volume_at_decision, es.final_revised_volume, es.decision_timestamp,
                 es.no_retro_label(), es.bid_at_commit, es.ask_at_commit, es.mid_at_commit,
                 es.paper_fill_price, es.paper_fill_method, es.price_moved_from_event,
+                es.commit_time,
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def save_signal_latency(signal_id: int, es) -> None:
+    """Persist a signal's §17 flow-event → alert latency profile. No-op when es is None."""
+    if es is None:
+        return
+    prof = es.latency_profile()
+    sql = """
+        INSERT INTO signal_latency
+            (signal_id, symbol, event_start_time, threshold_cross_time, commit_time,
+             bar_wait_secs, commit_lag_secs, total_latency_secs)
+        VALUES (%s,%s,%s,%s,%s, %s,%s,%s)
+        ON CONFLICT (signal_id) DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                signal_id, es.symbol, es.event_start_time, es.threshold_cross_time,
+                es.commit_time, prof['bar_wait_secs'], prof['commit_lag_secs'],
+                prof['total_latency_secs'],
             ))
         conn.commit()
     finally:

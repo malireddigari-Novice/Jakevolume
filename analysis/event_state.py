@@ -53,6 +53,30 @@ class EventState:
     paper_fill_price: Optional[float] = None
     paper_fill_method: Optional[str] = None
     price_moved_from_event: Optional[bool] = None
+    # ── §17 latency — commit/emit time stamped by main at emit ──
+    commit_time: Optional[datetime] = None
+
+    def latency_profile(self) -> dict:
+        """
+        §17 latency segments in seconds, from event-time capture to signal commit.
+        None-safe and tz-tolerant (all EventState stamps share the detector's CST bar
+        clock; commit_time is stamped on the same clock at emit):
+          bar_wait_secs   — WATCH cross → THRESHOLD cross (bar-revision / floor wait)
+          commit_lag_secs — THRESHOLD cross → commit (poll-loop + persistence lag)
+          total_latency_secs — WATCH cross → commit (end-to-end flow-to-alert)
+        """
+        def _sec(a, b):
+            if a is None or b is None:
+                return None
+            # tolerate an aware/naive mismatch by dropping tzinfo on both
+            if (a.tzinfo is None) != (b.tzinfo is None):
+                a, b = a.replace(tzinfo=None), b.replace(tzinfo=None)
+            return round((a - b).total_seconds(), 1)
+        return {
+            'bar_wait_secs':      _sec(self.threshold_cross_time, self.event_start_time),
+            'commit_lag_secs':    _sec(self.commit_time, self.decision_timestamp),
+            'total_latency_secs': _sec(self.commit_time, self.event_start_time),
+        }
 
     def strike_distance_strikes(self, increment: float) -> Optional[int]:
         """Event-time distance expressed in strikes, given the chain's strike increment."""

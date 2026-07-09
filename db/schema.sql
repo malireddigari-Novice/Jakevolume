@@ -271,6 +271,20 @@ ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS mid_at_commit          N
 ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS paper_fill_price       NUMERIC(12,4);
 ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS paper_fill_method      VARCHAR(20);
 ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS price_moved_from_event  BOOLEAN;
+ALTER TABLE signal_event_state ADD COLUMN IF NOT EXISTS commit_time             TIMESTAMPTZ;
+
+-- ── §17 Signal latency (flow-event → alert timing per signal) ────────────────
+CREATE TABLE IF NOT EXISTS signal_latency (
+    signal_id             BIGINT PRIMARY KEY REFERENCES signals(id),
+    symbol                VARCHAR(10),
+    event_start_time      TIMESTAMPTZ,
+    threshold_cross_time  TIMESTAMPTZ,
+    commit_time           TIMESTAMPTZ,
+    bar_wait_secs         NUMERIC(10,1),   -- WATCH → THRESHOLD cross
+    commit_lag_secs       NUMERIC(10,1),   -- THRESHOLD cross → commit
+    total_latency_secs    NUMERIC(10,1),   -- WATCH cross → commit (end-to-end)
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
 CREATE TABLE IF NOT EXISTS morning_sentiment (

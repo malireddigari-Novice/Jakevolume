@@ -133,6 +133,16 @@ def send_signal(sig: dict) -> None:
     head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
     lines = [f"{arrow} **{head}**" + ("  ⭐" if gold else "")]
 
+    def _latency_line():
+        """§17 flow-event → alert latency, one compact line; None when no profile."""
+        lat = sig.get('latency') or {}
+        total = lat.get('total_latency_secs')
+        if total is None:
+            return None
+        bar_wait = lat.get('bar_wait_secs')
+        seg = f" (bar {bar_wait:.0f}s)" if bar_wait is not None else ""
+        return f"Latency: {total:.0f}s event→alert{seg}"
+
     # Gold-mode classification line (only surfaced while the mode is active, so the
     # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
     if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
@@ -164,6 +174,9 @@ def send_signal(sig: dict) -> None:
         t1, t2 = sig.get('exit1_price'), sig.get('exit2_price')
         if t1 is not None:
             lines.append(f"Targets: 1/2 @ {_fmt_level(t1)}" + (f"  Rest @ {_fmt_level(t2)}" if t2 else ""))
+        _lat = _latency_line()
+        if _lat:
+            lines.append(_lat)
         prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
         _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
                     "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
@@ -205,6 +218,10 @@ def send_signal(sig: dict) -> None:
         lines.append(f"Exit 1/2 @ {_fmt_level(exit1)}")
     if exit2 is not None:
         lines.append(f"Exit rest @ {_fmt_level(exit2)}")
+
+    _lat = _latency_line()
+    if _lat:
+        lines.append(_lat)
 
     prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     payload = {
