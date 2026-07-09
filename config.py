@@ -18,8 +18,8 @@ MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
 SESSION_TZ = 'America/Chicago'
 
 # ── Market schedule (all times in CST/CDT) ───────────────────────────────────
-SNAPSHOT_HOUR   = 8    # 08:20 CST — pre-market OI snapshot
-SNAPSHOT_MINUTE = 20
+SNAPSHOT_HOUR   = int(os.getenv('SNAPSHOT_HOUR',   '8'))    # 08:10 CST — pre-market OI snapshot
+SNAPSHOT_MINUTE = int(os.getenv('SNAPSHOT_MINUTE', '10'))
 MARKET_OPEN_HOUR    = 8    # 08:30 CST = 09:30 ET
 MARKET_OPEN_MINUTE  = 30
 MARKET_CLOSE_HOUR   = 15   # 15:00 CST = 16:00 ET
@@ -34,6 +34,29 @@ SIGNAL_WARMUP_MINUTES = int(os.getenv('SIGNAL_WARMUP_MINUTES', '5'))
 # Strikes considered "near ATM": ± ATM_RANGE_PCT of current price
 ATM_RANGE_PCT  = float(os.getenv('ATM_RANGE_PCT', '0.05'))   # 5 %
 TOP_N_LEVELS   = int(os.getenv('TOP_N_LEVELS', '3'))          # 3 S + 3 R
+
+# §11-§16 Secondary OI Watchlist — three tiers beyond the primary S1-R3 levels.
+SECONDARY_WATCHLIST_TOP_N  = int(os.getenv('SECONDARY_WATCHLIST_TOP_N',  '5'))    # extra ranks per side (S4-S8, R4-R8)
+SECONDARY_OUTER_BAND_PCT   = float(os.getenv('SECONDARY_OUTER_BAND_PCT', '0.10')) # outer wall band ±10%
+SECONDARY_OUTER_TOP_N      = int(os.getenv('SECONDARY_OUTER_TOP_N',      '3'))    # top-N outer-wall per side
+SECONDARY_OI_BUILDUP_TOP_N = int(os.getenv('SECONDARY_OI_BUILDUP_TOP_N', '5'))   # top-N by overnight oi_change
+
+# ── Weekend OI gaps ───────────────────────────────────────────────────────────
+# On the first session after a multi-day market closure (Monday, or post-holiday)
+# the OI change since the prior session spans the whole weekend. We snapshot the
+# near-dated multi-expiry chain daily into near_oi_snapshots, then on that first
+# session flag strikes whose OI jumped a lot over the gap. A strike qualifies only
+# if it clears BOTH thresholds (abs floor removes noisy low-OI strikes), then the
+# survivors are ranked biggest-first and the top-N reported per expiration.
+WEEKEND_OI_GAPS_ENABLED  = os.getenv('WEEKEND_OI_GAPS_ENABLED', 'true').lower() == 'true'
+WEEKEND_GAP_MIN_CONTRACTS = int(os.getenv('WEEKEND_GAP_MIN_CONTRACTS', '1000'))   # abs OI change floor
+WEEKEND_GAP_MIN_PCT       = float(os.getenv('WEEKEND_GAP_MIN_PCT', '0.25'))       # 25% change floor
+WEEKEND_GAP_TOP_N         = int(os.getenv('WEEKEND_GAP_TOP_N', '5'))             # top-N gaps reported
+NEAR_OI_EXPIRY_DAYS       = int(os.getenv('NEAR_OI_EXPIRY_DAYS', '14'))          # this week + next
+
+# Morning briefing: check Alpaca for any open option positions carried into the
+# session (normally flat post-EOD; surfaces carryover/orphans). Read-only.
+BRIEFING_CHECK_OPEN_POSITIONS = os.getenv('BRIEFING_CHECK_OPEN_POSITIONS', 'true').lower() == 'true'
 
 # ── Signal detection ──────────────────────────────────────────────────────────
 # Minimum minutes between signals on the same level (cooldown)
@@ -63,6 +86,165 @@ OPT_PRIOR_LOOKBACK = int(os.getenv('OPT_PRIOR_LOOKBACK', '10'))
 # Valid single print: 1-min volume ≥ floor AND ratio ≥ 8× AND contract near lows.
 OPT_SINGLE_PRINT_RATIO   = float(os.getenv('OPT_SINGLE_PRINT_RATIO', '8.0'))
 OPT_MIN_SINGLE_PRINT_VOL = {'TSLA': 750, 'NVDA': 750, 'default': 300}
+
+# ── Production volume gate (two-path) — §18 ───────────────────────────────────
+# Volume is gated on ABSOLUTE size (ratio alone is NEVER sufficient) via two paths:
+#   Path A DOMINANT ABSOLUTE — a very large event qualifies on size + concentration.
+#   Path B CONTEXTUAL LEVEL CONVICTION — moderate size qualifies only with extreme
+#     ratio + exact primary OI level + correct ATM/1-ITM contract + near contract low
+#     + concentrated event + meaningful premium notional.
+# Preserves gold-standard setups (e.g. NVDA 210P ≈ 500 contracts at R1, at its low,
+# 45× ratio, ~$86k notional) while blocking small-volume / huge-ratio spam.
+TRUE_CONVICTION_GATE_ENABLED        = os.getenv('TRUE_CONVICTION_GATE_ENABLED', 'true').lower() == 'true'
+CONTEXTUAL_LEVEL_CONVICTION_ENABLED = os.getenv('CONTEXTUAL_LEVEL_CONVICTION_ENABLED', 'true').lower() == 'true'
+
+# Path B base floors (moderate absolute volume — also the spam floor, §6).
+SINGLE_PRINT_BASE_FLOOR = int(os.getenv('SINGLE_PRINT_BASE_FLOOR', '500'))    # peak 1-min
+THREE_MINUTE_BASE_FLOOR = int(os.getenv('THREE_MINUTE_BASE_FLOOR', '1000'))   # 3-min window
+FIVE_MINUTE_BASE_FLOOR  = int(os.getenv('FIVE_MINUTE_BASE_FLOOR',  '1250'))   # 5-min window
+
+# ── Mandatory production volume floors (tightened) ────────────────────────────
+# A production event (primary-level OR chain-led, call OR put) must clear at least
+# one absolute floor: peak_1m >= PEAK_1M_VOLUME_MIN OR volume_3m >= VOLUME_3M_MIN.
+# These are BINDING: a high ratio or the dominant-absolute path never overrides
+# them. Stricter during the first 15 minutes after the open. Below-floor events are
+# never traded — they are stored research-only (RESEARCH_ONLY_SUBTHRESHOLD_EVENT)
+# and still outcome-scored. Env-overridable so the floors can be reverted live.
+PEAK_1M_VOLUME_MIN         = int(os.getenv('PEAK_1M_VOLUME_MIN',         '1000'))
+VOLUME_3M_MIN              = int(os.getenv('VOLUME_3M_MIN',              '2000'))
+OPENING_PEAK_1M_VOLUME_MIN = int(os.getenv('OPENING_PEAK_1M_VOLUME_MIN', '1250'))
+OPENING_VOLUME_3M_MIN      = int(os.getenv('OPENING_VOLUME_3M_MIN',      '2500'))
+
+# ── Gold-only production mode (§ Gold spec / July-1 patch) — P1 foundation ────
+# MASTER SWITCH. When true, only Gold-classified events create Discord alerts +
+# paper trades; everything else is stored research-only (§19). Default FALSE:
+# production behavior is unchanged until the control-test suite (P6) passes and it
+# is deliberately enabled. All values env-overridable.
+GOLD_ONLY_PRODUCTION_MODE             = os.getenv('GOLD_ONLY_PRODUCTION_MODE', 'false').lower() == 'true'
+GOLD_PRIMARY_ENABLED                  = os.getenv('GOLD_PRIMARY_ENABLED', 'true').lower() == 'true'
+GOLD_CHAIN_LED_ENABLED                = os.getenv('GOLD_CHAIN_LED_ENABLED', 'true').lower() == 'true'
+PRIMARY_CHAIN_MERGE_ENABLED           = os.getenv('PRIMARY_CHAIN_MERGE_ENABLED', 'true').lower() == 'true'
+INTENT_VALIDATION_ENABLED             = os.getenv('INTENT_VALIDATION_ENABLED', 'true').lower() == 'true'
+INTENT_CONFIRMATION_BARS_MIN          = int(os.getenv('INTENT_CONFIRMATION_BARS_MIN', '1'))
+INTENT_CONFIRMATION_BARS_MAX          = int(os.getenv('INTENT_CONFIRMATION_BARS_MAX', '3'))
+OPPOSITE_SIDE_VETO_ENABLED            = os.getenv('OPPOSITE_SIDE_VETO_ENABLED', 'true').lower() == 'true'
+OPENING_FULL_CHAIN_SCAN_ENABLED       = os.getenv('OPENING_FULL_CHAIN_SCAN_ENABLED', 'true').lower() == 'true'
+HISTORICAL_VALUE_REGION_MODEL_ENABLED = os.getenv('HISTORICAL_VALUE_REGION_MODEL_ENABLED', 'true').lower() == 'true'
+SAME_DIRECTION_UPGRADE_ENABLED        = os.getenv('SAME_DIRECTION_UPGRADE_ENABLED', 'true').lower() == 'true'
+MAX_SAME_DIRECTION_UPGRADES_PER_DAY   = int(os.getenv('MAX_SAME_DIRECTION_UPGRADES_PER_DAY', '1'))
+COUNTERTREND_STRICT_MODE              = os.getenv('COUNTERTREND_STRICT_MODE', 'true').lower() == 'true'
+ESTABLISHED_MOVE_PCT                  = float(os.getenv('ESTABLISHED_MOVE_PCT', '0.01'))
+LEADERSHIP_FADE_RATIO                 = float(os.getenv('LEADERSHIP_FADE_RATIO', '0.50'))
+FRESH_CONVICTION_LOOKBACK_MIN         = int(os.getenv('FRESH_CONVICTION_LOOKBACK_MIN', '10'))
+TREND_PROGRESS_LOOKBACK_BARS          = int(os.getenv('TREND_PROGRESS_LOOKBACK_BARS', '5'))
+GOLD_EXCEPTIONAL_SINGLE_1M            = int(os.getenv('GOLD_EXCEPTIONAL_SINGLE_1M', '2000'))  # Route B (P3)
+GOLD_MIN_PREMIUM_NOTIONAL             = int(os.getenv('GOLD_MIN_PREMIUM_NOTIONAL', '0'))      # 0 = reuse existing notional gate until tuned
+# Historical-value regions (§12) — percentile upper bounds
+HV_REGION_EXCELLENT_MAX  = float(os.getenv('HV_REGION_EXCELLENT_MAX',  '0.25'))
+HV_REGION_ACCEPTABLE_MAX = float(os.getenv('HV_REGION_ACCEPTABLE_MAX', '0.45'))
+HV_REGION_NEUTRAL_MAX    = float(os.getenv('HV_REGION_NEUTRAL_MAX',    '0.65'))
+# Contract-low-distance regions (§13) — upper bounds
+CLOW_GOLD_MAX       = float(os.getenv('CLOW_GOLD_MAX',       '1.25'))
+CLOW_STRONG_MAX     = float(os.getenv('CLOW_STRONG_MAX',     '1.50'))
+CLOW_ACCEPTABLE_MAX = float(os.getenv('CLOW_ACCEPTABLE_MAX', '1.75'))
+# Directional-intent validation (§5-§9, P2) tolerances
+INTENT_PREMIUM_HOLD_PCT   = float(os.getenv('INTENT_PREMIUM_HOLD_PCT',   '-0.10'))  # premium may dip ≤10% and still "hold"
+INTENT_SPOT_CONTRADICT_PCT= float(os.getenv('INTENT_SPOT_CONTRADICT_PCT', '0.003')) # spot move that counts as contradicting the thesis
+LEADERSHIP_VETO_MARGIN    = float(os.getenv('LEADERSHIP_VETO_MARGIN',     '0.15'))  # opposite side must lead by this to veto
+# Event-time capture (P-ET) — freeze ATM/spot/quotes at the threshold-cross instant so
+# strike eligibility uses the state WHEN flow occurred, not at bar-close (fixes fast
+# opening moves running away from the initiating contract). Default off until wired.
+EVENT_TIME_ELIGIBILITY_ENABLED = os.getenv('EVENT_TIME_ELIGIBILITY_ENABLED', 'false').lower() == 'true'
+OPENING_STRIKE_WINDOW          = int(os.getenv('OPENING_STRIKE_WINDOW',          '5'))   # ATM ± N strikes in the opening 15m
+OPENING_EVENT_WATCH_VOLUME     = int(os.getenv('OPENING_EVENT_WATCH_VOLUME',     '500'))  # r60 that registers a watch event
+OPENING_EVENT_CONTRACT_TTL_MIN = int(os.getenv('OPENING_EVENT_CONTRACT_TTL_MIN', '30'))   # keep a registered contract alive this long
+
+# Breakout/breakdown continuation (P-BD) — primary levels also produce continuation
+# when price ACCEPTS through them (resistance->CALL breakout, support->PUT breakdown),
+# not only bounces/rejections. Acceptance = a completed bar beyond the level, OR beyond
+# by max(BREAKOUT_LEVEL_BUFFER_ABS, level*BREAKOUT_LEVEL_BUFFER_PCT). Default off.
+BREAKOUT_BREAKDOWN_ENABLED = os.getenv('BREAKOUT_BREAKDOWN_ENABLED', 'false').lower() == 'true'
+BREAKOUT_ACCEPTANCE_BARS   = int(os.getenv('BREAKOUT_ACCEPTANCE_BARS', '1'))
+BREAKOUT_LEVEL_BUFFER_PCT  = float(os.getenv('BREAKOUT_LEVEL_BUFFER_PCT', '0.001'))
+BREAKOUT_LEVEL_BUFFER_ABS  = float(os.getenv('BREAKOUT_LEVEL_BUFFER_ABS', '0.25'))
+
+# Path A dominant floors (per-symbol — NVDA/TSLA trade heavier).
+DOMINANT_SINGLE_PRINT = {'NVDA': 1000, 'TSLA': 1000, 'default': 750}
+DOMINANT_3M           = {'NVDA': 1750, 'TSLA': 1750, 'default': 1250}
+DOMINANT_5M           = {'NVDA': 2500, 'TSLA': 2500, 'default': 1750}
+
+# Relative volume (Path B context only — never sufficient on its own).
+CONTEXTUAL_SINGLE_PRINT_RATIO = float(os.getenv('CONTEXTUAL_SINGLE_PRINT_RATIO', '8.0'))
+CONTEXTUAL_MULTI_BAR_RATIO    = float(os.getenv('CONTEXTUAL_MULTI_BAR_RATIO',    '3.0'))
+
+# Event-concentration share by shape (§10) — share of recent window taken by the event.
+SINGLE_PRINT_EVENT_SHARE_MIN = float(os.getenv('SINGLE_PRINT_EVENT_SHARE_MIN', '0.35'))
+THREE_MINUTE_EVENT_SHARE_MIN = float(os.getenv('THREE_MINUTE_EVENT_SHARE_MIN', '0.40'))
+FIVE_MINUTE_EVENT_SHARE_MIN  = float(os.getenv('FIVE_MINUTE_EVENT_SHARE_MIN',  '0.45'))
+DOMINANT_EVENT_SHARE_MIN     = float(os.getenv('DOMINANT_EVENT_SHARE_MIN',     '0.45'))
+
+# Premium notional floor (§11): TriggerVolume × OptionMark × 100.
+MINIMUM_PREMIUM_NOTIONAL_0DTE        = int(os.getenv('MINIMUM_PREMIUM_NOTIONAL_0DTE',        '50000'))
+MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY = int(os.getenv('MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY', '75000'))
+
+# Path B contract-value location (§4E): hard ≤ 1.50, preferred (gold-standard) ≤ 1.25.
+CONTEXTUAL_LOW_DIST_MAX = float(os.getenv('CONTEXTUAL_LOW_DIST_MAX', '1.50'))
+GOLD_STANDARD_LOW_DIST  = float(os.getenv('GOLD_STANDARD_LOW_DIST',  '1.25'))
+
+# Partial-bar pending (§7-8): hold a candidate whose partial volume is within this
+# fraction of the floor and re-evaluate on the completed 1-min bar.
+PENDING_VOLUME_TOLERANCE_PCT = float(os.getenv('PENDING_VOLUME_TOLERANCE_PCT', '0.20'))
+
+# Chain evidence (§12) — computed and logged, NOT a hard gate by default.
+CHAIN_DOMINANCE_HARD_GATE_ENABLED = os.getenv('CHAIN_DOMINANCE_HARD_GATE_ENABLED', 'false').lower() == 'true'
+
+# ── Chain-led emergent entry path (§20) ───────────────────────────────────────
+# Allow CALL/PUT alerts when coordinated ATM + adjacent-strike volume builds a new
+# emergent support/resistance BEFORE spot reaches a morning OI level. Additive to the
+# primary-level path; requires stronger multi-strike evidence instead of proximity.
+CHAIN_LED_ENTRY_ENABLED           = os.getenv('CHAIN_LED_ENTRY_ENABLED', 'true').lower() == 'true'
+CHAIN_CONFIRMATION_WINDOW_MINUTES = int(os.getenv('CHAIN_CONFIRMATION_WINDOW_MINUTES', '5'))
+# Combined volume across {1 ITM, ATM, 1 OTM} of the confirm side (§4C / §5).
+CHAIN_CALL_COMBINED_1M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_1M_FLOOR', '1000'))
+CHAIN_CALL_COMBINED_3M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_3M_FLOOR', '1500'))
+CHAIN_CALL_COMBINED_5M_FLOOR = int(os.getenv('CHAIN_CALL_COMBINED_5M_FLOOR', '2000'))
+CHAIN_PUT_COMBINED_1M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_1M_FLOOR', '1000'))
+CHAIN_PUT_COMBINED_3M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_3M_FLOOR', '1500'))
+CHAIN_PUT_COMBINED_5M_FLOOR  = int(os.getenv('CHAIN_PUT_COMBINED_5M_FLOOR', '2000'))
+# Individual-strike quality (§4D): ATM and adjacent floors.
+CHAIN_ATM_1M_MIN      = int(os.getenv('CHAIN_ATM_1M_MIN', '500'))
+CHAIN_ATM_3M_MIN      = int(os.getenv('CHAIN_ATM_3M_MIN', '1000'))
+CHAIN_ADJACENT_1M_MIN = int(os.getenv('CHAIN_ADJACENT_1M_MIN', '350'))
+CHAIN_ADJACENT_3M_MIN = int(os.getenv('CHAIN_ADJACENT_3M_MIN', '700'))
+# Economic size (§4F), contract-value location (§4E/§4J), leadership (§4I), concentration (§4G).
+CHAIN_COMBINED_NOTIONAL_MIN     = int(os.getenv('CHAIN_COMBINED_NOTIONAL_MIN', '100000'))
+CHAIN_ATM_NOTIONAL_MIN          = int(os.getenv('CHAIN_ATM_NOTIONAL_MIN', '50000'))
+CHAIN_ATM_LOW_DISTANCE_MAX      = float(os.getenv('CHAIN_ATM_LOW_DISTANCE_MAX', '1.50'))
+CHAIN_ADJACENT_LOW_DISTANCE_MAX = float(os.getenv('CHAIN_ADJACENT_LOW_DISTANCE_MAX', '1.75'))
+CHAIN_SELECTED_LOW_DISTANCE_MAX = float(os.getenv('CHAIN_SELECTED_LOW_DISTANCE_MAX', '1.75'))
+CHAIN_LEADERSHIP_MIN           = float(os.getenv('CHAIN_LEADERSHIP_MIN', '0.75'))
+CHAIN_LEADERSHIP_MARGIN        = float(os.getenv('CHAIN_LEADERSHIP_MARGIN', '0.20'))
+CHAIN_EVENT_SHARE_MIN          = float(os.getenv('CHAIN_EVENT_SHARE_MIN', '0.35'))
+CHAIN_COMBINED_EVENT_SHARE_MIN = float(os.getenv('CHAIN_COMBINED_EVENT_SHARE_MIN', '0.45'))
+
+# ── Intraday trend tracker + countertrend reversal gate (§8-14, §20) ───────────
+# A signal opposing a strong, still-working, leadership-confirmed move must clear a
+# STRICTER gate than an ordinary continuation entry, else it is held as a watch.
+COUNTERTREND_GATE_ENABLED = os.getenv('COUNTERTREND_GATE_ENABLED', 'true').lower() == 'true'
+# Trend model (lightweight: established move% + leadership; VWAP is not a gate).
+ESTABLISHED_MOVE_PCT          = float(os.getenv('ESTABLISHED_MOVE_PCT', '0.01'))   # |spot−open|/open
+LEADERSHIP_FADE_RATIO         = float(os.getenv('LEADERSHIP_FADE_RATIO', '0.50'))  # ≤ this × session peak = fading
+FRESH_CONVICTION_LOOKBACK_MIN = int(os.getenv('FRESH_CONVICTION_LOOKBACK_MIN', '10'))
+TREND_PROGRESS_LOOKBACK_BARS  = int(os.getenv('TREND_PROGRESS_LOOKBACK_BARS', '5'))  # new high/low within N bars = working
+# Stricter countertrend absolute floors (§9) — per-symbol.
+COUNTERTREND_SINGLE_PRINT_FLOOR = {'NVDA': 1250, 'TSLA': 1250, 'default': 1000}
+COUNTERTREND_3M_FLOOR           = {'NVDA': 2250, 'TSLA': 2250, 'default': 1750}
+COUNTERTREND_5M_FLOOR           = {'NVDA': 3000, 'TSLA': 3000, 'default': 2500}
+# Stricter countertrend leadership (§11).
+COUNTERTREND_LEADERSHIP_MIN    = float(os.getenv('COUNTERTREND_LEADERSHIP_MIN', '0.80'))
+COUNTERTREND_LEADERSHIP_MARGIN = float(os.getenv('COUNTERTREND_LEADERSHIP_MARGIN', '0.25'))
+# §14 watch window — hold a sub-threshold countertrend event this long for promotion.
+COUNTERTREND_WATCH_MINUTES     = int(os.getenv('COUNTERTREND_WATCH_MINUTES', '30'))
 
 # Valid volume cluster: rolling 5-bar window.
 #   WindowRatio5 = WindowVol5 / (window * max(AvgPrior10, 10))  ≥ 3.0
@@ -164,8 +346,9 @@ STAIRSTEP_ACTIVE_MIN       = int(os.getenv('STAIRSTEP_ACTIVE_MIN', '3'))
 STAIRSTEP_LOW_DIST_MAX     = float(os.getenv('STAIRSTEP_LOW_DIST_MAX', '2.0'))
 
 # §13 Historical value percentile — (mark-HistLow)/(HistHigh-HistLow) over the
-# current day + prior sessions. Block an alert when the contract is too rich.
-HIST_VALUE_PCTILE_MAX = float(os.getenv('HIST_VALUE_PCTILE_MAX', '0.60'))
+# FULL stored option history (all prior sessions). Require the contract at/near
+# its relative historical low: block unless it sits in the bottom third of range.
+HIST_VALUE_PCTILE_MAX = float(os.getenv('HIST_VALUE_PCTILE_MAX', '0.33'))
 
 # §14 Short-cover risk — a fresh major volume event that mirrors an earlier event
 # of similar size but at a much lower price looks like shorts covering, not new
@@ -198,6 +381,35 @@ CS_THRESHOLD_RANK3 = float(os.getenv('CS_THRESHOLD_RANK3', '0.65'))  # S3/R3
 # Step 9: Spread filter — block if (ask-bid)/mid > 50%
 MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.50'))
 
+# ── Flow Leadership Reversal Engine (V1) ──────────────────────────────────────
+# After a position opens, watch the OPPOSITE side; if it produces a concentrated
+# volume event (burst out of a quiet background, contract near its low) while the
+# same side fades, exit the position + alert. V1 does NOT auto-open the opposite
+# trade — it closes the current (paper) position, alerts, and records the
+# hypothetical opposite entry for measurement (spec §14/§19).
+# DISABLED (2026-07-06): the reversal engine flipped into near-worthless far-OTM
+# penny options (e.g. NVDA 200C @ $0.01, qty 860) and is not useful at this time.
+# Turned off by default — this gates the ENTIRE reversal chain in main.py
+# (evaluate -> _handle_reversal -> _flip_entry -> send_reversal_alert). The shared
+# volume_event() helper in flow_reversal.py stays (the detector's volume gate uses
+# it). Set FLOW_REVERSAL_ENABLED=true to re-enable.
+FLOW_REVERSAL_ENABLED   = os.getenv('FLOW_REVERSAL_ENABLED', 'false').lower() == 'true'
+# Auto-flip: on a confirmed reversal, OPEN the opposite paper trade. Off by default
+# (and moot while FLOW_REVERSAL_ENABLED is false).
+FLOW_REVERSAL_AUTO_FLIP = os.getenv('FLOW_REVERSAL_AUTO_FLIP', 'false').lower() == 'true'
+REVERSAL_MAX_PER_DAY    = int(os.getenv('REVERSAL_MAX_PER_DAY', '3'))  # per-symbol flip cap (anti-churn)
+REVERSAL_BURST_RATIO    = float(os.getenv('REVERSAL_BURST_RATIO', '3.0'))   # EventAvg / PreEventVol
+REVERSAL_EVENT_SHARE    = float(os.getenv('REVERSAL_EVENT_SHARE', '0.40'))  # 5-bar / 20-bar volume
+REVERSAL_ACTIVE_BARS    = int(os.getenv('REVERSAL_ACTIVE_BARS', '2'))       # bars >= 2x PreEventVol
+REVERSAL_NEAR_LOW_MAX   = float(os.getenv('REVERSAL_NEAR_LOW_MAX', '1.75')) # contract-low qualifier
+REVERSAL_WINDOW_MIN     = int(os.getenv('REVERSAL_WINDOW_MIN', '15'))       # flow-transition window
+REVERSAL_FADE_WINDOW_MIN= int(os.getenv('REVERSAL_FADE_WINDOW_MIN', '10'))  # same-side fade lookback
+REVERSAL_FADE_RATIO     = float(os.getenv('REVERSAL_FADE_RATIO', '0.50'))   # vol <= 0.5x peak = fading
+REVERSAL_DOMINANT_BURST = float(os.getenv('REVERSAL_DOMINANT_BURST', '5.0'))
+REVERSAL_DOMINANT_SHARE = float(os.getenv('REVERSAL_DOMINANT_SHARE', '0.60'))
+REVERSAL_LEADERSHIP_MIN = float(os.getenv('REVERSAL_LEADERSHIP_MIN', '0.75'))  # opp leadership floor
+REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) # opp - same
+
 # Step 10: Target room thresholds (nearest opposing level distance from spot)
 TARGET_ROOM_HIGH = float(os.getenv('TARGET_ROOM_HIGH', '0.0075'))  # score 1.00 (≥0.75%)
 TARGET_ROOM_MID  = float(os.getenv('TARGET_ROOM_MID',  '0.0050'))  # score 0.70 (≥0.50%)
@@ -215,6 +427,11 @@ BARS_TO_FETCH                = int(os.getenv('BARS_TO_FETCH', '40'))
 SESSION_BARS                 = int(os.getenv('SESSION_BARS', '400'))
 # Collect 1-min OHLCV for the 6 S/R level option contracts each poll (Schwab).
 COLLECT_LEVEL_BARS           = os.getenv('COLLECT_LEVEL_BARS', 'true').lower() == 'true'
+# Morning-snapshot 1-hour option-bar pull (Alpaca) for the 6 S/R level contracts.
+# Runs once per day alongside the OI briefing; persists OPT_HOURLY_LOOKBACK_DAYS of
+# 1Hour OHLCV per contract to option_hourly_bars for historical context/backtests.
+COLLECT_HOURLY_OPTION_BARS   = os.getenv('COLLECT_HOURLY_OPTION_BARS', 'true').lower() == 'true'
+OPT_HOURLY_LOOKBACK_DAYS     = int(os.getenv('OPT_HOURLY_LOOKBACK_DAYS', '10'))
 # Retention: keep only this many recent trading days of 1-min bar data
 # (price_bars + option_level_bars). Alerts/signals are never pruned.
 BAR_RETENTION_DAYS           = int(os.getenv('BAR_RETENTION_DAYS', '10'))
@@ -291,7 +508,7 @@ ALPACA_SECRET_KEY   = os.getenv('ALPACA_SECRET_KEY', '')
 ALPACA_PAPER        = os.getenv('ALPACA_PAPER',   'true').lower()  == 'true'
 ALPACA_ENABLED      = os.getenv('ALPACA_ENABLED', 'false').lower() == 'true'
 TRADE_PCT           = float(os.getenv('TRADE_PCT', '0.01'))   # 1 % of portfolio value per trade
-MAX_OPEN_POSITIONS  = int(os.getenv('MAX_OPEN_POSITIONS', '3'))
+MAX_OPEN_POSITIONS  = int(os.getenv('MAX_OPEN_POSITIONS', '8'))
 FLIP_ENABLED        = os.getenv('FLIP_ENABLED', 'false').lower() == 'true'
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -306,4 +523,19 @@ SHEET_NAMES = {
     'morning_sentiment': 'Morning_Sentiment',
     'levels_comparison': 'Levels_Comparison',
     'paper_trades':      'Paper_Trades',
+    'review':            'Signal_Review',
 }
+
+# Set DISCORD_REVIEW_WEBHOOK_URL for the daily post-close review (falls back to the
+# morning briefing webhook, then the main signal webhook).
+DISCORD_REVIEW_WEBHOOK_URL = os.getenv('DISCORD_REVIEW_WEBHOOK_URL', '')
+
+# ── Claude Nightly Pipeline (§81-§83) ─────────────────────────────────────────
+# Anthropic API key — get one at console.anthropic.com.
+# Leave blank to disable the nightly research pipeline entirely.
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+# Model used for the nightly research analysis. Haiku is fast and cheap; upgrade
+# to claude-sonnet-4-6 for deeper analysis on high-signal days.
+NIGHTLY_PIPELINE_MODEL = os.getenv('NIGHTLY_PIPELINE_MODEL', 'claude-haiku-4-5-20251001')
+# Webhook for Claude's nightly research notes (falls back to review → morning → main).
+DISCORD_RESEARCH_WEBHOOK_URL = os.getenv('DISCORD_RESEARCH_WEBHOOK_URL', '')

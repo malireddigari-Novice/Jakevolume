@@ -5,9 +5,23 @@ REM trading hours. Checks every 5 minutes until 15:15 local time, then exits.
 cd /d "C:\Users\malir\Projects\Python\Jakevolume"
 set SAMPLE_MODE=false
 
+REM ── Gold-only production mode — ALL layers active ─────────────────────────
+REM Full Gold pipeline: structural + value/contract-low gate, deferred directional-
+REM intent validation (P2 wired), opposite-side veto, event-time capture/eligibility,
+REM and breakout/breakdown continuation. Everything non-Gold is research-only.
+REM Remove any line to disable that layer; remove all to revert to pre-Gold behavior.
+set GOLD_ONLY_PRODUCTION_MODE=true
+set INTENT_VALIDATION_ENABLED=true
+set OPPOSITE_SIDE_VETO_ENABLED=true
+set EVENT_TIME_ELIGIBILITY_ENABLED=true
+set BREAKOUT_BREAKDOWN_ENABLED=true
+
 set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
 set TRADE_END_MIN=15
+
+REM --- Log housekeeping: rotate if over 10 MB, keeping one .old backup ---
+if exist "%LOG%" for %%A in ("%LOG%") do if %%~zA GTR 10485760 move /Y "%LOG%" "%LOG%.old" >nul
 
 echo [%DATE% %TIME%] ===== Jakevolume watchdog started ===== >> %LOG%
 

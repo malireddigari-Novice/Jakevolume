@@ -58,8 +58,11 @@ def compute_sentiment(
         drift_score = 0
 
     # ── Near-ATM Put/Call OI ratio ────────────────────────────────────────────
-    lo = prev_close * (1 - config.ATM_RANGE_PCT)
-    hi = prev_close * (1 + config.ATM_RANGE_PCT)
+    # Band centred on the pre-market SPOT (not prev close) so the P/C ratio reflects
+    # where price actually is at 08:20 — consistent with the spot-anchored S/R levels.
+    anchor = pm_price if pm_price and pm_price > 0 else prev_close
+    lo = anchor * (1 - config.ATM_RANGE_PCT)
+    hi = anchor * (1 + config.ATM_RANGE_PCT)
 
     call_oi = sum(c['open_interest'] for c in chain['calls'] if lo <= c['strike'] <= hi)
     put_oi  = sum(p['open_interest'] for p in chain['puts']  if lo <= p['strike'] <= hi)

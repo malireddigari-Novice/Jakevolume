@@ -14,7 +14,12 @@ venv/
 
 # Logs
 *.log
+*.log.*
+*.err
 startup.log
+
+# Backups (incl. expired token backups — sensitive)
+*.bak
 
 # Single-instance lock (runtime)
 *.lock
@@ -22,3 +27,9 @@ startup.log
 # IDE
 .vscode/
 .idea/
+
+# Generated docs
+*.docx
+
+# Claude Code tooling
+.claude/

@@ -98,6 +98,12 @@ _HDR_PAPER_TRADES = [
     'Capital_Used', 'Order_ID',
 ]
 
+_HDR_SIGNAL_REVIEW = [
+    'Analysis_Date', 'Signal_Time', 'Symbol', 'Signal_Type', 'Strike', 'Type',
+    'Entry', 'MFE_%', 'MAE_%', 'Peak', 'Rule_PnL_%',
+    'Suggested_Action', 'Suggested_PnL_%', 'Recommendation',
+]
+
 _HEADERS = {
     config.SHEET_NAMES['daily_levels']:       _HDR_DAILY_LEVELS,
     config.SHEET_NAMES['signals']:            _HDR_SIGNALS,
@@ -105,6 +111,7 @@ _HEADERS = {
     config.SHEET_NAMES['morning_sentiment']:  _HDR_MORNING_SENTIMENT,
     config.SHEET_NAMES['levels_comparison']:  _HDR_LEVELS_COMPARISON,
     config.SHEET_NAMES['paper_trades']:       _HDR_PAPER_TRADES,
+    config.SHEET_NAMES['review']:             _HDR_SIGNAL_REVIEW,
 }
 
 
@@ -249,6 +256,22 @@ class SheetsLogger:
         logger.info(
             "Sheets: queued sentiment for %s => %s", sentiment['symbol'], sentiment['bias']
         )
+
+    def log_daily_review(self, rows: list) -> None:
+        """Enqueue one Signal_Review row per analyzed signal (daily post-close review)."""
+        for r in rows:
+            st = r.get('signal_time')
+            self._enqueue('review', [
+                str(r.get('analysis_date', '')),
+                st.strftime('%H:%M') if hasattr(st, 'strftime') else str(st or ''),
+                r.get('symbol', ''), r.get('signal_type', ''),
+                r.get('traded_strike', ''), r.get('option_type', ''),
+                r.get('entry_price', ''), r.get('mfe_pct', ''), r.get('mae_pct', ''),
+                r.get('peak_price', ''), r.get('rule_pnl_pct', ''),
+                r.get('suggested_action', ''), r.get('suggested_pnl_pct', ''),
+                r.get('suggestion', ''),
+            ])
+        logger.info("Sheets: queued %d daily-review rows", len(rows))
 
     def log_oi_snapshot(
         self,
@@ -454,18 +477,30 @@ class SheetsLogger:
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _ranked(levels: list[dict], level_type: str) -> list[dict]:
-    return sorted(
-        [lv for lv in levels if lv['level_type'] == level_type],
-        key=lambda x: x['rank'],
-    )
+    """
+    One side's S/R levels ordered by PROXIMITY to spot (nearest first) — matches
+    the morning briefing's rank-1 = nearest display. Resistance strikes sit
+    at/above spot so nearest-first is ascending strike; supports sit at/below so
+    nearest-first is descending. The persisted `rank` field (OI strength, which
+    drives the signal gates) is read elsewhere and is intentionally NOT used here.
+    """
+    side = [lv for lv in levels if lv['level_type'] == level_type]
+    return sorted(side, key=lambda x: x['strike'], reverse=(level_type == 'SUPPORT'))
 
 
 def _level_cols(levels: list[dict], n: int) -> list:
-    """Flatten up to n levels into [strike, oi, strike, oi, …] columns."""
+    """
+    Flatten up to n levels into [strike, oi, strike, oi, …] columns, nearest first.
+    A trailing '*' on the strike marks the highest-OI strike on that side (the
+    dominant wall); non-marked strikes stay native numbers for charting/sorting.
+    """
+    max_oi = max((lv.get('open_interest', 0) or 0 for lv in levels[:n]), default=0)
     out = []
     for i in range(n):
         if i < len(levels):
-            out += [levels[i]['strike'], levels[i]['open_interest']]
+            oi     = levels[i].get('open_interest', 0) or 0
+            strike = f"{levels[i]['strike']}*" if oi and oi == max_oi else levels[i]['strike']
+            out += [strike, oi]
         else:
             out += ['', '']
     return out

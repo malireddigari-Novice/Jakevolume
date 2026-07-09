@@ -11,7 +11,7 @@ Signal semantics
 A CALL/PUT alert fires when ALL hold (§17/§18):
   • spot is NEAR a same-side level                        (§4 proximity, binary)
   • correct side is being watched                         (§5)
-  • a valid volume signal exists                          (§8 = §9 OR §10 OR §11)
+  • a valid volume signal exists  (ValidVolumeSignal = SingleBar OR Cluster OR StairStep)
   • the contract is cheap / not chased                    (§12 contract-low)
   • the contract is not historically rich                 (§13 historical percentile)
   • there is no short-cover risk                          (§14)
@@ -31,11 +31,22 @@ Removed for V1 (§1): dynamic S/R flipping, spread filter, target-room filter,
 confidence tiers, WATCH/upgrade alerts, volume-shape labels in Discord.
 """
 import logging
+import statistics
 from collections import defaultdict, deque
 from datetime import date, datetime
 from typing import Optional
 
 import config
+from analysis.flow_reversal import volume_event
+from analysis.volume_analytics import compute_leadership_scores
+from analysis.trend import IntradayTrend
+from analysis.event_state import EventRegistry
+from analysis.rolling_volume import RollingVolume
+from analysis.opening_scan import scan_opening
+from analysis import breakout as _breakout
+from analysis.route_b import route_b_qualifies
+from analysis.gold_mode import contract_low_region
+from analysis.paper_fill import executable_fill as _executable_fill
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -202,36 +213,53 @@ def compute_exit_targets(
     spot: float,
     levels: list,
     position_only: bool = False,
+    origin_level: Optional[float] = None,
 ) -> tuple[Optional[float], Optional[float]]:
     """
-    Exit-target-shift rule. The nearest opposing level is usually too close to
-    give the trade room, so skip it and use the 2nd/3rd opposing levels:
+    Exit-target ladder — take the NEXT levels the trade moves into, skipping a level
+    only when it is too close to the entry (not always skipping the nearest).
 
-      CALL at support    (BULLISH) → Exit1 = 2nd resistance, Exit2 = 3rd
-      PUT  at resistance (BEARISH) → Exit1 = 2nd support,    Exit2 = 3rd
+    The ladder is ALL level strikes on the move side, not only the opposing side: a
+    CALL climbs up through every level above the entry, a PUT falls through every level
+    below it. So a call entered at S3 targets S2, then S1, then R1, R2, R3 in order;
+    a put entered at R3 targets R2, R1, S1, S2, S3.
 
-    Fallbacks: when only one opposing level exists, use it (R1/S1). When only two
-    exist, Exit2 is None. After the shift, any candidate still within
-    EXIT_MIN_ROOM_PCT of spot is dropped (skip to the next farther level).
+    Exit1 / Exit2 = the first two ladder levels that clear EXIT_MIN_ROOM_PCT of room from
+    the entry. A level within that distance is skipped (it would sell the first half too
+    soon); a level with room is KEPT (we no longer blindly skip the nearest). Examples:
+
+      Call entered ~S3:  S2 too close → Exit1 = S1, Exit2 = R1.
+      Call entered ~S2:  S1 too close → Exit1 = R1, Exit2 = R2.
+      Call entered ~S1:  R1 too close → Exit1 = R2, Exit2 = R3.
+      (mirror for puts entered at R3 / R2 / R1)
+      If the next level has room, it is used as-is (no skip).
+
+    Fallbacks: if every level is too close, keep the raw nearest two; only one level on
+    the move side → Exit2 is None. `position_only` is retained for call-site compatibility
+    (the ladder always spans all levels regardless).
+
+    Target integrity (§10/§20): the originating level can NEVER be a target. A CALL's
+    targets must be strictly above BOTH the entry spot AND the origin level; a PUT's
+    strictly below both. `origin_level` is the entry level price; when given it moves
+    the ladder floor/ceiling out to max(spot, origin) / min(spot, origin) so the origin
+    strike (which often sits just past spot) can no longer be selected as Exit1.
 
     Returns (exit1, exit2) as underlying price levels, either may be None.
     """
-    above, below = _opposing_strikes(levels, spot, position_only)
     if signal_type == 'BULLISH':
-        opp  = sorted(above)                       # nearest resistance first
-        room = lambda lv: (lv - spot) / spot if spot > 0 else 0.0
+        floor_px = max(spot, origin_level) if origin_level is not None else spot
+        ladder = sorted(float(l['strike']) for l in levels if float(l['strike']) > floor_px)
+        room   = lambda lv: (lv - spot) / spot if spot > 0 else 0.0
     else:
-        opp  = sorted(below, reverse=True)         # nearest support first
-        room = lambda lv: (spot - lv) / spot if spot > 0 else 0.0
+        ceil_px = min(spot, origin_level) if origin_level is not None else spot
+        ladder = sorted((float(l['strike']) for l in levels if float(l['strike']) < ceil_px),
+                        reverse=True)
+        room   = lambda lv: (spot - lv) / spot if spot > 0 else 0.0
 
-    if not opp:
+    if not ladder:
         return None, None
-    if len(opp) == 1:
-        return opp[0], None                        # only the nearest → fallback to R1/S1
-
-    candidates = opp[1:]                            # skip the nearest (R1/S1)
-    spaced = [lv for lv in candidates if room(lv) >= config.EXIT_MIN_ROOM_PCT]
-    chosen = spaced if spaced else candidates       # keep the shifted set if all too close
+    spaced = [lv for lv in ladder if room(lv) >= config.EXIT_MIN_ROOM_PCT]
+    chosen = spaced if spaced else ladder            # all too close → keep the raw nearest
     return chosen[0], (chosen[1] if len(chosen) > 1 else None)
 
 
@@ -240,7 +268,10 @@ def compute_exit_targets(
 class SignalDetector:
 
     def __init__(self) -> None:
-        self._hist_maxlen = config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK
+        # Retain (close to) the full session per contract so the VolumeStickoutScore
+        # can compute its 20/60-bar baselines, session percentile and 5-min windows.
+        self._hist_maxlen = max(config.SESSION_BARS,
+                                config.OPT_CLUSTER_WINDOW + config.OPT_PRIOR_LOOKBACK)
         # One alert per direction per ticker per day.
         self._fired_today:  dict[_FiredKey, bool] = {}
         self._prev_opt_vol: dict[_OptKey, int]    = {}
@@ -252,9 +283,27 @@ class SignalDetector:
         # §13 multi-day (low, high) per OCC, fetched once per contract per day.
         self._opt_hist_range: dict[str, Optional[tuple[float, float]]] = {}
         self._hist_range_fn = None
+        # Fallback when no live multi-day history exists (Schwab serves no option
+        # price-history): the contract's previous-session (low, high) from the DB.
+        self._prev_range_fn = None
+        # §7-8 completed 1-min bar volume provider + per-contract/minute cache,
+        # plus the pending-volume-confirmation set (near-miss partial-bar candidates).
+        self._completed_bar_fn = None
+        self._completed_bar_cache: dict = {}
+        self._pending_candidates: dict = {}
+        # §8-14 intraday trend tracker + countertrend watch set (reset daily).
+        self._trend = IntradayTrend()
+        self._countertrend_watch: dict = {}
         # §14 prior major volume events per contract key → [(volume, price), …].
         self._major_events: dict[str, list[tuple[int, float]]] = defaultdict(list)
         self._history_date: Optional[date] = None
+        # §73 per-poll candidate-evaluation log (every level, blocked or passed) — the
+        # caller persists `last_candidates` to signal_candidates after each check().
+        self.last_candidates: list[dict] = []
+        # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
+        self._event_reg = EventRegistry()
+        self._rvol: dict[_OptKey, RollingVolume] = {}
+        self.last_opening_candidates: list[dict] = []   # event-time opening scan (research)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -269,6 +318,8 @@ class SignalDetector:
         opening_range: bool = False,
         hist_range_fn=None,
         fired_today_fn=None,
+        prev_range_fn=None,
+        completed_bar_fn=None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -278,7 +329,12 @@ class SignalDetector:
         hist_range_fn : callable(occ) -> (low, high) | None for the §13 gate.
         fired_today_fn: callable(symbol, day) -> {signal_type: [confidence]} so the
                         one-call/one-put-per-day dedup survives restarts/instances.
+        prev_range_fn : callable(symbol, strike, opt_type, before_date) -> (low, high) | None.
+                        §13 historical range: the contract's FULL stored-history (low, high)
+                        from the DB, used when hist_range_fn yields nothing (no live option
+                        price-history). Backs the "at/near historical low" requirement.
         """
+        self.last_candidates = []          # §73 — reset per poll
         if not bars:
             return []
 
@@ -287,6 +343,8 @@ class SignalDetector:
         today       = current['bar_time'].date()
         bar_time    = current['bar_time']
         self._hist_range_fn = hist_range_fn
+        self._prev_range_fn = prev_range_fn
+        self._completed_bar_fn = completed_bar_fn
 
         # Keep 1DTE expiry handling (target-strike pricing); roles stay frozen.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -302,6 +360,12 @@ class SignalDetector:
             self._opt_last_bar    = {}
             self._opt_hist_range  = {}
             self._major_events    = defaultdict(list)
+            self._completed_bar_cache = {}
+            self._pending_candidates  = {}
+            self._trend.reset()
+            self._countertrend_watch  = {}
+            self._event_reg.reset()
+            self._rvol = {}
 
         # Durable dedup: fold in directions already fired today (DB).
         if fired_today_fn is not None:
@@ -321,6 +385,16 @@ class SignalDetector:
         opt_data_map: dict[tuple[float, str], dict] = {}
         vol_deltas:   dict[tuple[float, str], int]  = {}
 
+        # P-ET: current ATM per side (frozen into each contract's EventState on watch
+        # cross). Entire block is a no-op unless EVENT_TIME_ELIGIBILITY_ENABLED.
+        _et_on = config.EVENT_TIME_ELIGIBILITY_ENABLED
+        _atm_call = _atm_put = None
+        if _et_on:
+            _cs = [s for (s, ot) in option_quotes if ot == 'CALL']
+            _ps = [s for (s, ot) in option_quotes if ot == 'PUT']
+            _atm_call = min(_cs, key=lambda s: abs(s - close_price)) if _cs else None
+            _atm_put  = min(_ps, key=lambda s: abs(s - close_price)) if _ps else None
+
         for (s, ot), data in option_quotes.items():
             opt_key: _OptKey = (symbol, s, ot)
             cur_vol  = int(data.get('volume', 0) or 0)
@@ -338,6 +412,24 @@ class SignalDetector:
             self._opt_last_bar[opt_key] = bar_time
             self._opt_vol_hist[opt_key].append(delta)
 
+            # P-ET: feed rolling volume + event-time registry for every subscribed
+            # contract (freezes ATM/spot/quotes at watch/threshold cross). Gated.
+            if _et_on:
+                rv = self._rvol.get(opt_key)
+                if rv is None:
+                    rv = RollingVolume()
+                    self._rvol[opt_key] = rv
+                rv.observe_delta(delta)
+                _atm = _atm_call if ot == 'CALL' else _atm_put
+                if _atm is not None:
+                    self._event_reg.observe(
+                        symbol, s, ot, now=bar_time, spot=close_price, atm_strike=_atm,
+                        r60=rv.r60(), r180=rv.r180(),
+                        floor_60=config.PEAK_1M_VOLUME_MIN, floor_180=config.VOLUME_3M_MIN,
+                        bid=data.get('bid'), ask=data.get('ask'), last=data.get('mark'),
+                        watch_vol=config.OPENING_EVENT_WATCH_VOLUME,
+                        ttl_min=config.OPENING_EVENT_CONTRACT_TTL_MIN)
+
             mark = data.get('mark')
             if mark is not None and mark > 0:
                 prev_low = self._opt_mark_low.get(opt_key)
@@ -345,6 +437,29 @@ class SignalDetector:
 
             opt_data_map[(s, ot)] = data
             vol_deltas[(s, ot)]   = delta
+
+        # ── §8-14 Per-poll leadership + intraday trend update (computed once) ──
+        leadership = (compute_leadership_scores(symbol, opt_data_map, self._opt_vol_hist,
+                                                self._contract_low_dist)
+                      if opt_data_map else None)
+        self._trend.update(symbol, close_price, bar_time, leadership)
+
+        # P-ET step 5: opening ATM±N event-time scan (research-only, gated). Surfaces
+        # contracts that crossed the floor at event time within ATM±window strikes AT
+        # THAT MOMENT — kept eligible even if spot ran away. Logged/recorded, not fired.
+        self.last_opening_candidates = []
+        if _et_on and opening_range:
+            try:
+                self.last_opening_candidates = scan_opening(
+                    symbol, option_quotes, self._event_reg,
+                    window_strikes=config.OPENING_STRIKE_WINDOW)
+                for c in self.last_opening_candidates:
+                    logger.info("OPENING-SCAN eligible (event-time): %s %s $%.2f  "
+                                "dist=%s strikes  %s",
+                                symbol, c['option_type'], c['strike'],
+                                c['dist_strikes'], c['no_retro'])
+            except Exception:
+                logger.warning("%s: opening scan failed", symbol, exc_info=True)
 
         # ── Opening-range thresholds (§15) — raised, never suppressed ──────────
         single_mult     = config.OPENING_RANGE_VOL_MULT      if opening_range else 1.0
@@ -360,22 +475,43 @@ class SignalDetector:
         near_thr = (config.NEAR_LEVEL_DIST_VOLATILE if symbol in config.VOLATILE_SYMBOLS
                     else config.NEAR_LEVEL_DIST_DEFAULT)
 
+        # Mandatory tightened production volume floors — stricter in the opening 15m.
+        # Applied to BOTH the primary-level path (_eval_volume) and the chain-led path.
+        peak1m_floor = (config.OPENING_PEAK_1M_VOLUME_MIN if opening_range
+                        else config.PEAK_1M_VOLUME_MIN)
+        vol3m_floor  = (config.OPENING_VOLUME_3M_MIN if opening_range
+                        else config.VOLUME_3M_MIN)
+
         candidates: list[dict] = []
 
         for level in levels:
             strike       = float(level['strike'])
             rank         = int(level.get('rank', 1))
             level_type   = level['level_type']                       # frozen (no flip)
-            confirm_type = 'PUT' if level_type == 'RESISTANCE' else 'CALL'
-            signal_type  = 'BEARISH' if level_type == 'RESISTANCE' else 'BULLISH'
             label        = ('R' if level_type == 'RESISTANCE' else 'S') + str(rank)
 
             # ── §4 Proximity (binary) ─────────────────────────────────────────
             dist = abs(close_price - strike) / close_price if close_price > 0 else 1.0
             if dist > near_thr:
-                self._log_eval(symbol, label, strike, close_price, confirm_type,
+                self._log_eval(symbol, label, strike, close_price, 'NA',
                                reason='NOT_NEAR_LEVEL', dist=dist)
                 continue
+
+            # Side selection. Default (P-BD off): support->CALL bounce, resistance->PUT
+            # rejection. P-BD on: choose the side by price acceptance (breakout/breakdown),
+            # skipping a crossed-but-not-accepted level (FALSE_BREAKOUT/BREAKDOWN).
+            if config.BREAKOUT_BREAKDOWN_ENABLED:
+                sel = _breakout.level_side(level_type, close_price, strike, bar_close=close_price)
+                if sel is None:
+                    self._log_eval(symbol, label, strike, close_price, 'NA',
+                                   reason='FALSE_BREAKOUT_OR_BREAKDOWN', dist=dist)
+                    continue
+                confirm_type, signal_type, level_action = sel
+            else:
+                confirm_type = 'PUT' if level_type == 'RESISTANCE' else 'CALL'
+                signal_type  = 'BEARISH' if level_type == 'RESISTANCE' else 'BULLISH'
+                level_action = ('REJECTION_PUT' if level_type == 'RESISTANCE'
+                                else 'BOUNCE_CALL')
 
             # ── Identify ATM + 1-ITM confirm-side contracts ───────────────────
             ct_keys = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
@@ -395,22 +531,32 @@ class SignalDetector:
             atm_delta = vol_deltas.get(atm_key, 0)
             atm_okey: _OptKey = (symbol, atm_key[0], confirm_type)
             atm_low   = self._contract_low_dist(atm_okey, atm_data)
-            atm = self._eval_volume(list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
+            atm_completed = self._completed_bar(symbol, atm_key[0], confirm_type, expiry,
+                                                atm_delta, bar_time)
+            atm = self._eval_volume(symbol, list(self._opt_vol_hist[atm_okey]), atm_delta, atm_low,
                                     min_single_vol, min_cluster_vol, cluster_ratio_min,
-                                    excitation_min)
+                                    excitation_min, mark=atm_data.get('mark'), is_atm=True,
+                                    next_day_mode=next_day_mode, completed_vol=atm_completed,
+                                    peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
 
             if itm_key:
                 itm_data  = opt_data_map[itm_key]
                 itm_delta = vol_deltas.get(itm_key, 0)
                 itm_okey: _OptKey = (symbol, itm_key[0], confirm_type)
                 itm_low   = self._contract_low_dist(itm_okey, itm_data)
-                itm = self._eval_volume(list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
+                itm_completed = self._completed_bar(symbol, itm_key[0], confirm_type, expiry,
+                                                    itm_delta, bar_time)
+                itm = self._eval_volume(symbol, list(self._opt_vol_hist[itm_okey]), itm_delta, itm_low,
                                         min_single_vol, min_cluster_vol, cluster_ratio_min,
-                                        excitation_min)
+                                        excitation_min, mark=itm_data.get('mark'), is_atm=False,
+                                        next_day_mode=next_day_mode, completed_vol=itm_completed,
+                                        peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
             else:
                 itm_data, itm_delta, itm_low = {}, 0, None
-                itm = self._eval_volume([], 0, None, min_single_vol, min_cluster_vol,
-                                        cluster_ratio_min, excitation_min)
+                itm = self._eval_volume(symbol, [], 0, None, min_single_vol, min_cluster_vol,
+                                        cluster_ratio_min, excitation_min,
+                                        next_day_mode=next_day_mode,
+                                        peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
 
             valid_volume = atm['valid'] or itm['valid']
 
@@ -421,8 +567,10 @@ class SignalDetector:
                 continue
 
             if not valid_volume:
+                # Surface the granular blocked reason from the VolumeStickoutScore.
+                br = atm.get('block_reason') or itm.get('block_reason') or 'LOW_SCORE'
                 self._log_eval(symbol, label, strike, close_price, confirm_type,
-                               reason='NO_VALID_VOLUME_SIGNAL', dist=dist, atm=atm, low=atm_low)
+                               reason=f'NO_VALID_VOLUME_SIGNAL:{br}', dist=dist, atm=atm, low=atm_low)
                 continue
 
             # Trade the ATM confirm-side contract (nearest spot ≈ the level). The
@@ -479,7 +627,29 @@ class SignalDetector:
                 next_day_mode=next_day_mode, day_mode=day_mode,
                 trade_data=trade_data, traded_strike=traded_strike, target_level=target_level,
             )
+
+            # ── §8-12 Countertrend reversal-conviction gate ───────────────────
+            # A candidate that passed every normal gate but OPPOSES a strong, still-
+            # working, leadership-confirmed move must clear stricter evidence, else it
+            # is held as a watch (does not fire, does not consume the day's allowance).
+            ct_decision, ct_reason = 'CONTINUATION', None
+            if config.COUNTERTREND_GATE_ENABLED:
+                ct_decision, ct_reason = self._countertrend_gate(
+                    symbol, signal_type, atm, itm, leadership, bar_time)
+            if ct_decision == 'WATCH':
+                self._note_countertrend_watch(symbol, signal_type, label, signal, bar_time)
+                self._log_eval(symbol, label, strike, close_price, confirm_type,
+                               reason=ct_reason, dist=dist, atm=atm, low=atm_low, hv=hv_pctile)
+                continue
+            if ct_decision == 'REVERSAL':
+                signal['signal_context'] = 'PRIMARY_LEVEL_COUNTERTREND_REVERSAL'
+                signal['bias'] = 'Countertrend reversal'
+                signal['signal_shape'] = signal['flow_shape'] = 'COUNTERTREND_REVERSAL'
+
+            signal['level_action'] = level_action          # P-BD: bounce/rejection/breakout/breakdown
             candidates.append(signal)
+            self._record_candidate(symbol, label, strike, close_price, confirm_type,
+                                   reason='PASSED', dist=dist, atm=atm, low=atm_low)
 
         if not candidates:
             return []
@@ -500,12 +670,39 @@ class SignalDetector:
                 continue
             self._fired_today[(symbol, st)] = True
             fired.append(sig)
+        # §73 — mark the candidate evals that actually produced an alert.
+        fired_labels = {s['level_label'] for s in fired}
+        for ev in self.last_candidates:
+            if ev['alert_fired'] is False and ev['level_label'] in fired_labels and ev['blocked_reason'] == 'PASSED':
+                ev['alert_fired'] = True
+
+        # ── §3-7 Chain-led emergent entries — an additional entry path, but still bound
+        # by the one-alert-per-direction-per-day rule: at most one CALL and one PUT
+        # alert per symbol per day ACROSS both this and the level-proximity path above
+        # (and across restarts, via the durable fired-today fold). Reversals are a
+        # separate path (flow_reversal) and are intentionally NOT gated here.
+        if config.CHAIN_LED_ENTRY_ENABLED:
+            for confirm_type in ('CALL', 'PUT'):
+                st = 'BULLISH' if confirm_type == 'CALL' else 'BEARISH'
+                if self._fired_today.get((symbol, st)):
+                    continue                      # this side already alerted today
+                csig, creason = self._chain_led_entry(
+                    symbol, confirm_type, opt_data_map, vol_deltas, levels,
+                    close_price, expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio,
+                    leadership=leadership,
+                    peak1m_floor=peak1m_floor, vol3m_floor=vol3m_floor)
+                if csig is not None:
+                    self._fired_today[(symbol, st)] = True
+                    fired.append(csig)
+                elif creason:
+                    logger.info("CHAIN-LED  %s %s  → %s", symbol, confirm_type, creason)
         return fired
 
-    # ── Per-contract volume evaluation (§9/§10/§11) ──────────────────────────
+    # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
 
     def _eval_volume(
         self,
+        symbol: str,
         history: list[int],
         delta: int,
         low_dist: Optional[float],
@@ -513,31 +710,201 @@ class SignalDetector:
         min_cluster_vol: int,
         cluster_ratio_min: float,
         excitation_min: float,
+        *,
+        mark: Optional[float] = None,
+        is_atm: bool = False,
+        next_day_mode: bool = False,
+        completed_vol: Optional[int] = None,
+        peak1m_floor: Optional[int] = None,
+        vol3m_floor: Optional[int] = None,
     ) -> dict:
-        """Evaluate the three volume signals for one contract; returns metrics + A/B/C."""
-        single_raw, spike_ratio = _single_print(history, delta, min_single)
+        """
+        PRODUCTION VOLUME GATE (two-path) — absolute volume is the binding
+        requirement; a high ratio is NEVER sufficient on its own.
+
+          Path A DOMINANT ABSOLUTE      — a very large event qualifies on size +
+                                          concentration + near-low + notional.
+          Path B CONTEXTUAL CONVICTION  — moderate size qualifies only with extreme
+                                          ratio + concentrated event + near contract
+                                          low + meaningful premium notional (the
+                                          caller has already enforced primary-level
+                                          proximity, correct side, and ATM/1-ITM).
+
+        `history` is per-minute volume deltas oldest→newest, current bar (`delta`) last.
+        `completed_vol` (§7-8) is the closed 1-min bar volume when available; it is
+        preferred over the live poll-delta as the trigger. The legacy single/cluster/
+        stair booleans are kept for shape labels + logging only — they no longer decide
+        `valid` (§14: no alternate ratio-led path).
+        """
+        volatile  = symbol in config.VOLATILE_SYMBOLS
+        vol_floor = 250 if volatile else 100      # single-bar current-volume floor
+        win_floor = 600 if volatile else 300      # 5-bar window floor
+
+        # ── Single-bar inputs (median-robust baseline + visual dominance) ─────
+        prior20  = history[-21:-1] if len(history) > 1 else []
+        prior10  = history[-11:-1] if len(history) > 1 else []
+        median20 = statistics.median(prior20) if prior20 else 0.0
+        max20    = max(prior20) if prior20 else 0.0
+        avg10    = (sum(prior10) / len(prior10)) if prior10 else 0.0
+        baseline = max(avg10, median20, 10.0)
+        vol_ratio   = delta / baseline
+        visual_dom  = delta / max(max20, 1.0)
+
+        # ── 5-bar window / cluster inputs (median of prior rolling windows) ───
+        last5 = history[-5:]
+        win5  = sum(last5)
+        prior_windows = [sum(history[i:i + 5]) for i in range(0, max(0, len(history) - 5))][-20:]
+        med_win = statistics.median(prior_windows) if prior_windows else 0.0
+        max_win = max(prior_windows) if prior_windows else 0.0
+        win_ratio5  = win5 / max(med_win, 50.0)
+        cluster_dom = win5 / max(max_win, 1.0)
+        active5 = sum(1 for v in last5 if v >= max(median20 * 2.0, 50.0))
+
         clu        = _cluster_metrics(history)
         excitation = _excitation(clu['window'], clu['base_unit'])
 
-        near_175 = (low_dist is None or low_dist <= config.NEAR_LOW_MAX_DIST)
-        near_200 = (low_dist is None or low_dist <= config.STAIRSTEP_LOW_DIST_MAX)
+        # ════════════════════════════════════════════════════════════════════
+        # PRODUCTION TWO-PATH GATE (§1-6,10-12,14,19)
+        # ════════════════════════════════════════════════════════════════════
+        # §7-8 partial vs completed bar: prefer the closed 1-min bar volume as the
+        # trigger when it is larger (e.g. 456 observed → 508 completed).
+        observed_vol = int(delta)
+        peak1m = int(delta)
+        if completed_vol is not None:
+            bar_status = 'REVISED' if completed_vol != observed_vol else 'COMPLETED'
+            peak1m = max(peak1m, int(completed_vol))
+        else:
+            bar_status = 'PARTIAL'
 
-        a_extreme = single_raw and near_175
-        b_cluster = (clu['vol'] >= min_cluster_vol and clu['ratio'] >= cluster_ratio_min
-                     and clu['active'] >= config.OPT_CLUSTER_ACTIVE_MIN and near_175)
-        # Stair-step also requires the absolute WindowVol5 floor — otherwise a
-        # quiet contract (tiny baseline) fires on ratios alone (e.g. 180 contracts
-        # over 5 bars). "Need absolute volume and ratio", per the §9 principle.
-        c_stair   = (excitation >= excitation_min
-                     and clu['vol'] >= min_cluster_vol
-                     and clu['ratio'] >= config.STAIRSTEP_WINDOW_RATIO_MIN
-                     and clu['active'] >= config.STAIRSTEP_ACTIVE_MIN and near_200)
+        vol3m = sum(history[-3:-1]) + peak1m          # last 3 min, current bar = peak1m
+        vol5m = sum(history[-5:-1]) + peak1m
+
+        # Concentration + background quality (reuse the reversal event metrics).
+        ev = volume_event(history)
+        event_share   = ev['share'] if ev else round(peak1m / max(vol5m, 1), 3)
+        persistent_bg = bool(ev['persistent_bg']) if ev else False
+
+        single_ratio = round(peak1m / baseline, 2)
+        window_ratio = round(clu['ratio'], 2)         # WindowRatio5
+
+        def _grp(d):
+            return d.get(symbol, d['default'])
+        notional_min = (config.MINIMUM_PREMIUM_NOTIONAL_NEXT_EXPIRY if next_day_mode
+                        else config.MINIMUM_PREMIUM_NOTIONAL_0DTE)
+
+        # Qualifying shape for the Path-B base floors + its event-share requirement.
+        if peak1m >= config.SINGLE_PRINT_BASE_FLOOR:
+            shape, trig_vol, share_min = 'SINGLE_BAR', peak1m, config.SINGLE_PRINT_EVENT_SHARE_MIN
+        elif vol3m >= config.THREE_MINUTE_BASE_FLOOR:
+            shape, trig_vol, share_min = 'THREE_MIN', vol3m, config.THREE_MINUTE_EVENT_SHARE_MIN
+        elif vol5m >= config.FIVE_MINUTE_BASE_FLOOR:
+            shape, trig_vol, share_min = 'FIVE_MIN', vol5m, config.FIVE_MINUTE_EVENT_SHARE_MIN
+        else:
+            shape, trig_vol, share_min = 'SINGLE_BAR', peak1m, config.SINGLE_PRINT_EVENT_SHARE_MIN
+        base_vol_ok = (peak1m >= config.SINGLE_PRINT_BASE_FLOOR
+                       or vol3m >= config.THREE_MINUTE_BASE_FLOOR
+                       or vol5m >= config.FIVE_MINUTE_BASE_FLOOR)
+
+        premium_notional = round(trig_vol * (mark or 0.0) * 100.0)
+        notional_ok  = premium_notional >= notional_min
+        near_low_ctx = (low_dist is None or low_dist <= config.CONTEXTUAL_LOW_DIST_MAX)   # ≤1.50
+        near_low_dom = (low_dist is None or low_dist <= config.NEAR_LOW_MAX_DIST)         # ≤1.75
+
+        # ── Path A — Dominant absolute volume (§3) ────────────────────────────
+        dom_vol_ok = (peak1m >= _grp(config.DOMINANT_SINGLE_PRINT)
+                      or vol3m >= _grp(config.DOMINANT_3M)
+                      or vol5m >= _grp(config.DOMINANT_5M))
+        path_a = (config.TRUE_CONVICTION_GATE_ENABLED and dom_vol_ok
+                  and event_share >= config.DOMINANT_EVENT_SHARE_MIN
+                  and not persistent_bg and near_low_dom and notional_ok)
+
+        # ── Path B — Contextual level conviction (§4) ─────────────────────────
+        # NearPrimaryLevel + correct side + ATM/1-ITM are enforced by the caller.
+        ratio_ok = (single_ratio >= config.CONTEXTUAL_SINGLE_PRINT_RATIO
+                    or window_ratio >= config.CONTEXTUAL_MULTI_BAR_RATIO)
+        path_b = (config.CONTEXTUAL_LEVEL_CONVICTION_ENABLED and base_vol_ok and ratio_ok
+                  and near_low_ctx and event_share >= share_min
+                  and not persistent_bg and notional_ok)
+
+        # ── Mandatory tightened floor (§ tighten patch) — binds BOTH paths ────
+        # An event must clear at least one absolute floor regardless of ratio or the
+        # dominant path. Opening-window floors (stricter) are passed by the caller.
+        pk_floor = peak1m_floor if peak1m_floor is not None else config.PEAK_1M_VOLUME_MIN
+        v3_floor = vol3m_floor  if vol3m_floor  is not None else config.VOLUME_3M_MIN
+        mandatory_floor_ok = (peak1m >= pk_floor) or (vol3m >= v3_floor)
+
+        valid = bool(mandatory_floor_ok and (path_a or path_b))
+        path  = 'A' if path_a else ('B' if path_b else None)
+
+        # ── Gold-standard quality label (§5) ──────────────────────────────────
+        gold_standard = bool(
+            path_b and low_dist is not None and low_dist <= config.GOLD_STANDARD_LOW_DIST
+            and is_atm and single_ratio >= config.CONTEXTUAL_SINGLE_PRINT_RATIO)
+        classification = (['GOLD_STANDARD_ALERT', 'PRIMARY_LEVEL_CONVICTION',
+                           'ATM_LEVEL_MATCH', 'ENTRY_NEAR_CONTRACT_LOW']
+                          if gold_standard else [])
+
+        # ── §8 PENDING_VOLUME_CONFIRMATION — near-miss on a still-partial bar ──
+        # Within tolerance of the single-print floor AND the bar has not closed AND
+        # every other contextual condition already passes → hold, do not reject;
+        # the next poll (or the completed bar) re-evaluates.
+        ctx_ok = (ratio_ok and near_low_ctx and not persistent_bg
+                  and event_share >= config.SINGLE_PRINT_EVENT_SHARE_MIN
+                  and round(peak1m * (mark or 0.0) * 100.0) >= notional_min)
+        pending = bool(
+            not valid and not mandatory_floor_ok and bar_status == 'PARTIAL'
+            and config.CONTEXTUAL_LEVEL_CONVICTION_ENABLED and ctx_ok
+            and peak1m >= (1.0 - config.PENDING_VOLUME_TOLERANCE_PCT) * pk_floor)
+
+        # ── Block reason (§6 spam first, then the specific failing condition) ──
+        if valid:
+            block_reason = 'OK'
+        elif pending:
+            block_reason = 'PENDING_VOLUME_CONFIRMATION'
+        elif not mandatory_floor_ok:
+            block_reason = 'RESEARCH_ONLY_SUBTHRESHOLD_EVENT'     # below tightened floor
+        elif not base_vol_ok:
+            block_reason = 'INSUFFICIENT_CONVICTION_VOLUME'       # small vol + (any) ratio
+        elif persistent_bg:
+            block_reason = 'PERSISTENT_BACKGROUND_FLOW'
+        elif not notional_ok:
+            block_reason = 'LOW_PREMIUM_NOTIONAL'
+        elif not near_low_ctx:
+            block_reason = 'CONTRACT_NOT_NEAR_LOW'
+        elif event_share < share_min:
+            block_reason = 'LOW_EVENT_SHARE'
+        elif not ratio_ok:
+            block_reason = 'LOW_RELATIVE_VOLUME'
+        else:
+            block_reason = 'NO_CONVICTION_PATH'
+
+        trig_type  = 'SINGLE_BAR' if shape == 'SINGLE_BAR' else 'MULTI_MIN_WINDOW'
+        trig_ratio = single_ratio if shape == 'SINGLE_BAR' else window_ratio
+
+        # Legacy shape booleans (labels/logging only — not an alert path).
+        single_valid  = peak1m >= config.SINGLE_PRINT_BASE_FLOOR and single_ratio >= 8.0
+        cluster_valid = vol5m >= config.FIVE_MINUTE_BASE_FLOOR and window_ratio >= 3.0
+        stair_valid   = vol5m >= config.FIVE_MINUTE_BASE_FLOOR and excitation >= excitation_min
+
         return {
-            'delta': delta, 'spike_ratio': spike_ratio,
-            'vol': clu['vol'], 'ratio': clu['ratio'],
-            'active': clu['active'], 'burst': clu['burst'], 'excitation': excitation,
-            'A': a_extreme, 'B': b_cluster, 'C': c_stair,
-            'valid': a_extreme or b_cluster or c_stair,
+            'delta': delta, 'spike_ratio': single_ratio,
+            'vol': vol5m, 'ratio': window_ratio,
+            'peak_1m': peak1m, 'vol_3m': vol3m, 'vol_5m': vol5m,
+            'peak1m_floor': pk_floor, 'vol3m_floor': v3_floor,
+            'mandatory_floor_ok': mandatory_floor_ok,
+            'event_share': event_share, 'persistent_bg': persistent_bg,
+            'premium_notional': premium_notional,
+            'observed_vol': observed_vol, 'completed_vol': completed_vol,
+            'bar_status': bar_status, 'shape': shape, 'pending': pending,
+            'path': path, 'gold_standard': gold_standard, 'classification': classification,
+            'active': active5, 'burst': clu['burst'], 'excitation': excitation,
+            'visual_dom': round(visual_dom, 2), 'cluster_dom': round(cluster_dom, 2),
+            'A': bool(single_valid), 'B': bool(cluster_valid), 'C': bool(stair_valid),
+            'strong': bool(gold_standard or path_a),
+            'block_reason': block_reason,
+            'trigger_type': trig_type, 'trigger_volume': trig_vol,
+            'trigger_ratio': trig_ratio,
+            'valid': valid,
         }
 
     # ── §13 historical value percentile ───────────────────────────────────────
@@ -550,18 +917,28 @@ class SignalDetector:
         (mark - HistLow) / (HistHigh - HistLow) over the multi-day window, or None
         when not evaluable (no fn, no expiry, no mark, or no prior history → 0DTE).
         """
-        if self._hist_range_fn is None or expiry is None:
+        if expiry is None:
             return None
         mark = data.get('mark')
         if not mark or mark <= 0:
             return None
         occ = occ_symbol(symbol, expiry, strike, opt_type)
         if occ not in self._opt_hist_range:
-            try:
-                self._opt_hist_range[occ] = self._hist_range_fn(occ)
-            except Exception as exc:
-                logger.warning("hist_range_fn failed for %s: %s", occ, exc)
-                self._opt_hist_range[occ] = None
+            rng = None
+            if self._hist_range_fn is not None:
+                try:
+                    rng = self._hist_range_fn(occ)
+                except Exception as exc:
+                    logger.warning("hist_range_fn failed for %s: %s", occ, exc)
+            # Fallback: no live multi-day history → previous session's (low, high).
+            if not rng and self._prev_range_fn is not None:
+                try:
+                    rng = self._prev_range_fn(symbol, strike, opt_type, self._history_date)
+                    if rng:
+                        logger.debug("§13 hist-range fallback for %s → prev-session %s", occ, rng)
+                except Exception as exc:
+                    logger.warning("prev_range_fn failed for %s: %s", occ, exc)
+            self._opt_hist_range[occ] = rng
         rng = self._opt_hist_range.get(occ)
         if not rng:
             return None
@@ -646,6 +1023,30 @@ class SignalDetector:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _completed_bar(self, symbol, strike, ot, expiry, observed, bar_time) -> Optional[int]:
+        """
+        §7-8 — the closed 1-min OPRA bar volume for a contract, or None.
+
+        Only queried when the live poll-delta (`observed`) is already promising
+        (≥ half the single-print floor) so we don't spend an API call per contract
+        per poll on obvious non-events. Cached per contract per minute.
+        """
+        if self._completed_bar_fn is None or expiry is None:
+            return None
+        if observed < 0.5 * config.SINGLE_PRINT_BASE_FLOOR:
+            return None
+        occ  = occ_symbol(symbol, expiry, strike, ot)
+        ckey = (occ, bar_time.replace(second=0, microsecond=0))
+        if ckey in self._completed_bar_cache:
+            return self._completed_bar_cache[ckey]
+        vol = None
+        try:
+            vol = self._completed_bar_fn(occ, bar_time)
+        except Exception as exc:
+            logger.warning("completed_bar_fn failed for %s: %s", occ, exc)
+        self._completed_bar_cache[ckey] = vol
+        return vol
+
     def _contract_low_dist(self, okey: _OptKey, data: dict) -> Optional[float]:
         """
         §12 ContractLowDistance = mark / max(IntradayLow, 0.01); None if unknown.
@@ -659,10 +1060,279 @@ class SignalDetector:
             return round(mark / low, 4)
         return None
 
+    def _strike_metrics(self, symbol, key, quote, delta, bar_time, expiry) -> dict:
+        """Per-strike chain metrics (peak1m incl. completed bar, 3m/5m, share, bg, notional)."""
+        strike, ot = key
+        hist = list(self._opt_vol_hist.get((symbol, strike, ot), []))
+        completed = self._completed_bar(symbol, strike, ot, expiry, int(delta or 0), bar_time)
+        peak1m = max(int(delta or 0), int(completed)) if completed is not None else int(delta or 0)
+        vol3m = sum(hist[-3:-1]) + peak1m
+        vol5m = sum(hist[-5:-1]) + peak1m
+        ev = volume_event(hist)
+        share         = ev['share'] if ev else round(peak1m / max(vol5m, 1), 3)
+        event_vol     = ev['event_vol'] if ev else peak1m
+        persistent_bg = bool(ev['persistent_bg']) if ev else False
+        low_dist = self._contract_low_dist((symbol, strike, ot), quote)
+        mark     = quote.get('mark') or 0.0
+        notional = round(max(peak1m, vol3m) * mark * 100.0)
+        return dict(key=key, strike=strike, ot=ot, peak1m=peak1m, vol3m=vol3m, vol5m=vol5m,
+                    share=share, event_vol=event_vol, persistent_bg=persistent_bg,
+                    low_dist=low_dist, mark=mark, notional=notional, delta=int(delta or 0))
+
+    @staticmethod
+    def _target_oi_name(price, levels) -> Optional[str]:
+        """Map a target price back to its morning OI rank label (R1..S3), §17."""
+        if price is None:
+            return None
+        best, bestd = None, 1e9
+        for lv in levels:
+            d = abs(float(lv['strike']) - float(price))
+            if d < bestd:
+                bestd, best = d, lv
+        if best is None:
+            return None
+        side = 'R' if best['level_type'] == 'RESISTANCE' else 'S'
+        return f"{side}{best.get('rank', '')}".rstrip()
+
+    def _chain_led_entry(self, symbol, confirm_type, opt_data_map, vol_deltas, levels,
+                         close_price, expiry, bars, bar_time, now, next_day_mode,
+                         hv_pctile, pc_ratio, leadership=None,
+                         peak1m_floor=None, vol3m_floor=None):
+        """
+        §3-7 — chain-led emergent entry. Coordinated ATM + adjacent-strike volume builds a
+        new emergent support/resistance before spot reaches a primary level. Returns
+        (signal_dict | None, block_reason | None). Additive to the primary-level path.
+        """
+        if not config.CHAIN_LED_ENTRY_ENABLED:
+            return None, None
+        signal_type = 'BULLISH' if confirm_type == 'CALL' else 'BEARISH'
+        # Same one-per-direction-per-day key as the level-proximity path, so a
+        # chain-led alert never duplicates a side that already fired today.
+        if self._fired_today.get((symbol, signal_type)):
+            return None, None
+
+        ct = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
+        if len(ct) < 2:
+            return None, 'CHAIN_CONFIRMATION_MISSING'
+        atm_key = min(ct, key=lambda k: abs(k[0] - close_price))
+        a_strike = atm_key[0]
+        if confirm_type == 'CALL':           # ITM below spot, OTM above
+            itm = [k for k in ct if k[0] < a_strike]; otm = [k for k in ct if k[0] > a_strike]
+            itm_key = max(itm, key=lambda k: k[0]) if itm else None
+            otm_key = min(otm, key=lambda k: k[0]) if otm else None
+        else:                                # PUT: ITM above spot, OTM below
+            itm = [k for k in ct if k[0] > a_strike]; otm = [k for k in ct if k[0] < a_strike]
+            itm_key = min(itm, key=lambda k: k[0]) if itm else None
+            otm_key = max(otm, key=lambda k: k[0]) if otm else None
+
+        def m(key):
+            return (self._strike_metrics(symbol, key, opt_data_map[key],
+                                         vol_deltas.get(key, 0), bar_time, expiry)
+                    if key is not None else None)
+        atm_m, itm_m, otm_m = m(atm_key), m(itm_key), m(otm_key)
+        chain = [x for x in (itm_m, atm_m, otm_m) if x]
+
+        # §4D individual strike quality
+        atm_ok = atm_m['peak1m'] >= config.CHAIN_ATM_1M_MIN or atm_m['vol3m'] >= config.CHAIN_ATM_3M_MIN
+        adj = [x for x in (itm_m, otm_m)
+               if x and (x['peak1m'] >= config.CHAIN_ADJACENT_1M_MIN
+                         or x['vol3m'] >= config.CHAIN_ADJACENT_3M_MIN)]
+        if not atm_ok:
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+        if not adj:                                   # §4A multi-strike confirmation
+            # Route B (§ P3): an exceptional single ATM strike can stand in for adjacent
+            # confirmation. Only in Gold mode (else chain-led behavior is unchanged);
+            # opposite-side dominance is still enforced by the leadership gate below.
+            route_b = (config.GOLD_ONLY_PRODUCTION_MODE and route_b_qualifies(
+                peak_1m=atm_m['peak1m'], strikes_from_atm=0,
+                premium_notional=atm_m['notional'],
+                clow_region=contract_low_region(atm_m['low_dist']),
+                concentrated=(atm_m['share'] >= config.CHAIN_EVENT_SHARE_MIN),
+                opposite_dominates=False))
+            if not route_b:
+                return None, 'CHAIN_CONFIRMATION_MISSING'
+
+        # §4C combined absolute volume (ITM+ATM+OTM)
+        c1, c3, c5 = (sum(x['peak1m'] for x in chain), sum(x['vol3m'] for x in chain),
+                      sum(x['vol5m'] for x in chain))
+
+        # Mandatory tightened floor (§ tighten patch) — the combined chain event must
+        # clear the same absolute floor as the primary path (opening-aware, binding).
+        pk_floor = peak1m_floor if peak1m_floor is not None else config.PEAK_1M_VOLUME_MIN
+        v3_floor = vol3m_floor  if vol3m_floor  is not None else config.VOLUME_3M_MIN
+        if not (c1 >= pk_floor or c3 >= v3_floor):
+            return None, 'RESEARCH_ONLY_SUBTHRESHOLD_EVENT'
+        if confirm_type == 'CALL':
+            f1, f3, f5 = (config.CHAIN_CALL_COMBINED_1M_FLOOR, config.CHAIN_CALL_COMBINED_3M_FLOOR,
+                          config.CHAIN_CALL_COMBINED_5M_FLOOR)
+        else:
+            f1, f3, f5 = (config.CHAIN_PUT_COMBINED_1M_FLOOR, config.CHAIN_PUT_COMBINED_3M_FLOOR,
+                          config.CHAIN_PUT_COMBINED_5M_FLOOR)
+        if not (c1 >= f1 or c3 >= f3 or c5 >= f5):
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4F economic size
+        comb_notional = sum(x['notional'] for x in chain)
+        if not (comb_notional >= config.CHAIN_COMBINED_NOTIONAL_MIN
+                and atm_m['notional'] >= config.CHAIN_ATM_NOTIONAL_MIN):
+            return None, 'CHAIN_NOTIONAL_INSUFFICIENT'
+
+        # §4E contract value location
+        if atm_m['low_dist'] is not None and atm_m['low_dist'] > config.CHAIN_ATM_LOW_DISTANCE_MAX:
+            return None, 'EMERGENT_ENTRY_CHASED'
+        if not any(x['low_dist'] is None or x['low_dist'] <= config.CHAIN_ADJACENT_LOW_DISTANCE_MAX
+                   for x in adj):
+            return None, 'EMERGENT_ENTRY_CHASED'
+
+        # §4G flow concentration
+        concentrated = sum(1 for x in chain if x['share'] >= config.CHAIN_EVENT_SHARE_MIN)
+        tot20 = sum(x['event_vol'] / max(x['share'], 0.01) for x in chain)
+        comb_share = sum(x['event_vol'] for x in chain) / max(tot20, 1.0)
+        if not (concentrated >= 2 or comb_share >= config.CHAIN_COMBINED_EVENT_SHARE_MIN):
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4H background quality
+        if atm_m['persistent_bg']:
+            return None, 'CHAIN_VOLUME_INSUFFICIENT'
+
+        # §4I directional leadership (computed once per poll, passed in)
+        ld = leadership if leadership is not None else compute_leadership_scores(
+            symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist)
+        call_ld = (ld or {}).get('call_leadership', 0.0)
+        put_ld  = (ld or {}).get('put_leadership', 0.0)
+        lead, opp = (call_ld, put_ld) if confirm_type == 'CALL' else (put_ld, call_ld)
+        if not (lead >= config.CHAIN_LEADERSHIP_MIN and (lead - opp) >= config.CHAIN_LEADERSHIP_MARGIN):
+            return None, 'CHAIN_LEADERSHIP_INSUFFICIENT'
+
+        # §7 contract selection — ATM default; 1-OTM only if independently strong + near low.
+        selected = atm_m
+        if (otm_m and otm_m in adj and otm_m['low_dist'] is not None
+                and otm_m['low_dist'] <= config.CHAIN_ATM_LOW_DISTANCE_MAX
+                and (otm_m['peak1m'] >= config.CHAIN_ATM_1M_MIN or otm_m['vol3m'] >= config.CHAIN_ATM_3M_MIN)):
+            selected = otm_m
+        # §4J selected not already chased
+        if selected['low_dist'] is not None and selected['low_dist'] > config.CHAIN_SELECTED_LOW_DISTANCE_MAX:
+            return None, 'EMERGENT_ENTRY_CHASED'
+
+        # ── Build the emergent signal (reuse _build_signal + price-order targets §16) ──
+        sel_key = selected['key']
+        sel_quote = opt_data_map[sel_key]
+        other_m = next((x for x in (atm_m, itm_m, otm_m) if x and x is not selected), atm_m)
+        sel_ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, sel_key[0], confirm_type), [])),
+                                   selected['delta'], selected['low_dist'], 300, 300, 3.0,
+                                   config.STAIRSTEP_EXCITATION_MIN, mark=selected['mark'],
+                                   is_atm=(selected is atm_m), next_day_mode=next_day_mode)
+        oth_ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, other_m['key'][0], confirm_type), [])),
+                                   other_m['delta'], other_m['low_dist'], 300, 300, 3.0,
+                                   config.STAIRSTEP_EXCITATION_MIN, mark=other_m['mark'], is_atm=False,
+                                   next_day_mode=next_day_mode)
+
+        # Emergent location spot = underlying close ~window bars back (§6).
+        n = config.CHAIN_CONFIRMATION_WINDOW_MINUTES + 1
+        emergent_spot = float(bars[-n]['close']) if len(bars) >= n else float(close_price)
+        loc_type = 'SUPPORT' if confirm_type == 'CALL' else 'RESISTANCE'
+        day_mode = 'NEXT_DAY' if next_day_mode else '0DTE'
+
+        sig = self._build_signal(
+            symbol, {'strike': float(sel_key[0])}, levels, 0, 'EMERGENT', loc_type,
+            confirm_type, signal_type, {'close': close_price}, expiry, sel_quote, sel_ev,
+            selected['delta'], selected['low_dist'], oth_ev, other_m['delta'], True,
+            round(lead, 3), 'CHAIN_LED', hv_pctile, pc_ratio,
+            _pc_conviction(signal_type, pc_ratio), next_day_mode, day_mode, sel_quote,
+            float(sel_key[0]), None)
+
+        # Chain-led overrides + emergent metadata (persisted by the caller).
+        sig['signal_context'] = 'CHAIN_LED_EMERGENT_ENTRY'
+        sig['signal_shape'] = sig['flow_shape'] = 'CHAIN_LED'
+        sig['level_label'] = 'EMERGENT'
+        sig['level_price'] = emergent_spot
+        sig['bias'] = 'Chain-led call' if confirm_type == 'CALL' else 'Chain-led put'
+        sig['target1_oi_name'] = self._target_oi_name(sig.get('exit1_price'), levels)
+        sig['target2_oi_name'] = self._target_oi_name(sig.get('exit2_price'), levels)
+        sig['emergent_location_id'] = None
+        sig['emergent'] = {
+            'session_date': now.date(), 'symbol': symbol, 'location_type': loc_type,
+            'location_spot': emergent_spot, 'direction': signal_type,
+            'event_start': bar_time, 'event_end': bar_time,
+            'atm_strike': atm_m['strike'], 'itm_strike': itm_m['strike'] if itm_m else None,
+            'otm_strike': otm_m['strike'] if otm_m else None,
+            'atm_vol_3m': atm_m['vol3m'], 'itm_vol_3m': itm_m['vol3m'] if itm_m else None,
+            'otm_vol_3m': otm_m['vol3m'] if otm_m else None, 'combined_vol_3m': c3,
+            'atm_notional': atm_m['notional'], 'combined_notional': comb_notional,
+            'atm_low_dist': atm_m['low_dist'], 'itm_low_dist': itm_m['low_dist'] if itm_m else None,
+            'otm_low_dist': otm_m['low_dist'] if otm_m else None,
+            'call_leadership': round(call_ld, 3), 'put_leadership': round(put_ld, 3),
+            'selected_strike': float(sel_key[0]),
+        }
+        # Chain-led trigger display fields (§18).
+        sig['chain_strikes'] = [x['strike'] for x in chain]
+        sig['chain_combined_3m'] = c3
+        sig['emergent_spot'] = emergent_spot
+        return sig, None
+
+    def _countertrend_gate(self, symbol, signal_type, atm, itm, leadership, bar_time):
+        """
+        §8-12 — verdict for a candidate vs the active intraday trend:
+          'CONTINUATION' — no active trend or aligned → ordinary signal,
+          'REVERSAL'     — opposes a still-working, leadership-confirmed move AND clears
+                           the stricter floors / chain / leadership / thesis gate → fire,
+          'WATCH'        — opposes but fails the stricter gate → hold, do not fire.
+        """
+        trend_dir = self._trend.active_direction(symbol)
+        if trend_dir is None or signal_type == trend_dir:
+            return 'CONTINUATION', None
+
+        def grp(d):
+            return d.get(symbol, d['default'])
+        ct_s, ct_3, ct_5 = (grp(config.COUNTERTREND_SINGLE_PRINT_FLOOR),
+                            grp(config.COUNTERTREND_3M_FLOOR), grp(config.COUNTERTREND_5M_FLOOR))
+        peak1m = atm.get('peak_1m') or 0
+        vol3m  = atm.get('vol_3m') or 0
+        vol5m  = atm.get('vol_5m') or 0
+        vol_ok   = peak1m >= ct_s or vol3m >= ct_3 or vol5m >= ct_5                    # §9
+        chain_ok = (bool(atm.get('valid')) and bool(itm.get('valid'))) or peak1m >= 1.5 * ct_s  # §10
+        call_ld = (leadership or {}).get('call_leadership', 0.0) or 0.0
+        put_ld  = (leadership or {}).get('put_leadership', 0.0) or 0.0
+        opp, same = (put_ld, call_ld) if signal_type == 'BEARISH' else (call_ld, put_ld)
+        lead_ok = (opp >= config.COUNTERTREND_LEADERSHIP_MIN
+                   and (opp - same) >= config.COUNTERTREND_LEADERSHIP_MARGIN)          # §11
+        thesis_ok = (self._trend.same_side_fading(symbol, trend_dir, bar_time)
+                     or not self._trend.still_working(symbol))                         # §12
+        if vol_ok and chain_ok and lead_ok and thesis_ok:
+            return 'REVERSAL', None
+        if not vol_ok:
+            reason = 'COUNTERTREND_VOLUME_INSUFFICIENT'
+        elif not chain_ok:
+            reason = 'COUNTERTREND_CHAIN_CONFIRMATION_MISSING'
+        elif not lead_ok:
+            reason = 'COUNTERTREND_LEADERSHIP_INSUFFICIENT'
+        else:
+            reason = 'ACTIVE_TREND_NOT_FADING'
+        return 'WATCH', reason
+
+    def _note_countertrend_watch(self, symbol, signal_type, label, signal, bar_time):
+        """§14 — record a countertrend watch once (in-memory, 30-min window). The per-poll
+        re-evaluation promotes it to a REVERSAL automatically when conviction appears; the
+        watch itself never fires a Discord alert nor consumes the day's direction allowance."""
+        key = (symbol, signal_type)
+        w = self._countertrend_watch.get(key)
+        if w and (bar_time - w['start']).total_seconds() / 60.0 > config.COUNTERTREND_WATCH_MINUTES:
+            w = None
+        if w is None:
+            self._countertrend_watch[key] = {
+                'start': bar_time, 'direction': signal_type, 'level': label,
+                'initial_volume': signal.get('atm_vol_1m'),
+                'initial_ratio': signal.get('atm_spike_ratio'),
+                'initial_notional': signal.get('premium_notional'),
+            }
+            logger.info("COUNTERTREND_WATCH_CREATED  %s %s @ %s  vol=%s ratio=%s",
+                        symbol, signal_type, label, signal.get('atm_vol_1m'),
+                        signal.get('atm_spike_ratio'))
+
     def _log_eval(self, symbol, label, strike, spot, confirm_type, *,
                   reason: str, dist: float, atm: dict = None,
                   low: Optional[float] = None, hv: Optional[float] = None) -> None:
-        """§21 per-level evaluation log with the blocked reason."""
+        """§21 per-level evaluation log with the blocked reason (+ §73 candidate record)."""
         a = atm or {}
         logger.info(
             "MONITOR  %s %s@%.2f  spot=%.2f  dist=%.3f%%  %s  "
@@ -674,6 +1344,47 @@ class SignalDetector:
             f"{hv:.2f}" if hv is not None else "n/a",
             reason,
         )
+        self._record_candidate(symbol, label, strike, spot, confirm_type,
+                               reason=reason, dist=dist, atm=atm, low=low, hv=hv)
+
+    def _record_candidate(self, symbol, label, strike, spot, confirm_type, *,
+                          reason, dist, atm=None, low=None, hv=None) -> None:
+        """§73 — append one candidate-evaluation record (blocked OR passed) for the caller
+        to persist to signal_candidates. Booleans are derived from the blocked reason."""
+        a = atm or {}
+        base = reason.split(':', 1)[0]                       # strip the granular suffix
+        near = base != 'NOT_NEAR_LEVEL'
+        self.last_candidates.append({
+            'symbol': symbol, 'candidate_side': confirm_type, 'level_label': label,
+            'strike': float(strike), 'spot': round(float(spot), 4),
+            'dist_pct': round(dist * 100, 4), 'near_level': near,
+            'contract_low_distance': (round(low, 4) if low is not None else None),
+            'contract_near_low': (low is None or low <= config.NEAR_LOW_MAX_DIST),
+            'valid_volume_event': not base.startswith('NO_VALID_VOLUME') and near,
+            'already_alerted': base == 'ALREADY_ALERTED_TODAY',
+            'alert_fired': False,
+            'signal_type': 'BULLISH' if confirm_type == 'CALL' else 'BEARISH',
+            'blocked_reason': reason[:48],
+            'hv_pctile': hv,
+            'atm_vol_1m': a.get('delta'), 'win_vol': a.get('vol'),
+            'active_bars': a.get('active'),
+            # ── Production two-path gate fields (§12/§15 research logging) ──
+            'gate_path':        a.get('path'),
+            'gold_standard':    bool(a.get('gold_standard')),
+            'pending':          bool(a.get('pending')),
+            'trigger_volume':   a.get('trigger_volume'),
+            'trigger_ratio':    a.get('trigger_ratio'),
+            'premium_notional': a.get('premium_notional'),
+            'peak_1m':          a.get('peak_1m'),
+            'vol_3m':           a.get('vol_3m'),
+            'vol_5m':           a.get('vol_5m'),
+            'event_share':      a.get('event_share'),
+            'persistent_bg':    bool(a.get('persistent_bg')) if a else None,
+            'bar_status':       a.get('bar_status'),
+            'observed_vol':     a.get('observed_vol'),
+            'completed_vol':    a.get('completed_vol'),
+            'classification':   ','.join(a.get('classification') or []) or None,
+        })
 
     def _build_signal(
         self,
@@ -713,15 +1424,16 @@ class SignalDetector:
         # Exit targets — shifted one level out (skip the too-close nearest level).
         # Roles are frozen (no flipping), so use the frozen SUPPORT/RESISTANCE types.
         exit1_price, exit2_price = compute_exit_targets(
-            signal_type, spot, levels, position_only=False)
+            signal_type, spot, levels, position_only=False, origin_level=strike)
 
         bias = 'Call-side bias' if level_type == 'SUPPORT' else 'Put-side bias'
 
         opt_mark = trade_data.get('mark')
         opt_bid  = trade_data.get('bid')
         opt_ask  = trade_data.get('ask')
-        price_to_enter = round(opt_ask, 2) if opt_ask else None
-        price_to_exit  = round(opt_ask * 2, 2) if opt_ask else None
+        # §1/§13 realistic executable fill at commit (near the ask) + method label.
+        price_to_enter, paper_fill_method = _executable_fill(opt_bid, opt_ask, opt_mark)
+        price_to_exit  = round(price_to_enter * 2, 2) if price_to_enter else None
 
         option_hl_flag: Optional[str] = None
         day_high = trade_data.get('day_high')
@@ -748,6 +1460,11 @@ class SignalDetector:
             'level_price':      strike,
             'level_label':      level_label,      # 'R1'…'S3' (used in Discord/selection)
             'level_rank':       rank,
+            # §1 production signal context (chain-led / countertrend override this)
+            'signal_context':       'PRIMARY_LEVEL_CONTINUATION',
+            'emergent_location_id': None,
+            'target1_oi_name':      None,
+            'target2_oi_name':      None,
             'expiry':           expiry,
             'trigger_price':    spot,
             'option_type':      confirm_type,
@@ -759,6 +1476,7 @@ class SignalDetector:
             'opt_ask':          opt_ask,
             'price_to_enter':   price_to_enter,
             'price_to_exit':    price_to_exit,
+            'paper_fill_method': paper_fill_method,
             'prox_score':       1.0,              # binary near-level → always 1.0
             'cluster_strength': cluster_strength,
             'strong_cluster':   atm_itm_confirm,
@@ -771,6 +1489,20 @@ class SignalDetector:
             'atm_vol_1m':       atm_delta,
             'atm_spike_ratio':  atm.get('spike_ratio', 0.0),
             'atm_vol_3m':       atm.get('vol', 0),
+            # Volume trigger (what Discord shows: single-bar vs multi-min window)
+            'trigger_volume_type': atm.get('trigger_type'),
+            'trigger_volume':      atm.get('trigger_volume'),
+            'trigger_ratio':       atm.get('trigger_ratio'),
+            # §13 production-gate display fields
+            'gate_path':        atm.get('path'),
+            'gold_standard':    bool(atm.get('gold_standard')),
+            'observed_vol':     atm.get('observed_vol'),
+            'completed_vol':    atm.get('completed_vol'),
+            'bar_status':       atm.get('bar_status'),
+            'peak_1m':          atm.get('peak_1m'),
+            'vol_3m_window':    atm.get('vol_3m'),
+            'event_share':      atm.get('event_share'),
+            'premium_notional': atm.get('premium_notional'),
             'itm_vol_1m':       itm_delta,
             'itm_spike_ratio':  itm.get('spike_ratio', 0.0),
             'itm_vol_3m':       itm.get('vol', 0),
@@ -791,6 +1523,11 @@ class SignalDetector:
             'spike_volume':       None,
             'consecutive_spikes': None,
         }
+
+        # P-ET: attach the contract's frozen event-time state (for persistence + later
+        # event-time eligibility). None when disabled or no event was registered.
+        if config.EVENT_TIME_ELIGIBILITY_ENABLED:
+            signal['event_state'] = self._event_reg.get(symbol, traded_strike, confirm_type)
 
         strike_note = (f"  [{day_mode} strike={traded_strike:.2f}→tgt {target_level:.2f}]"
                        if next_day_mode and target_level is not None else "")

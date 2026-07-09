@@ -48,6 +48,16 @@ def is_market_open(dt: datetime = None) -> bool:
     return _MARKET_OPEN <= t < _MARKET_CLOSE
 
 
+def is_post_close(dt: datetime = None) -> bool:
+    """True on a weekday at/after market close (15:00 CST). Daily-review trigger;
+    the once-per-day guard in the loop ensures it runs a single time."""
+    if dt is None:
+        dt = now_cst()
+    if not is_weekday(dt):
+        return False
+    return dt.time().replace(second=0, microsecond=0) >= _MARKET_CLOSE
+
+
 def is_warmup(dt: datetime = None) -> bool:
     """
     True during the first SIGNAL_WARMUP_MINUTES after open (08:30 CST).
@@ -68,12 +78,15 @@ def is_warmup(dt: datetime = None) -> bool:
 
 def is_past_snapshot(dt: datetime = None) -> bool:
     """
-    True on a weekday once the 08:20 snapshot time has passed, up to market close.
+    True on a weekday once the snapshot time (config.SNAPSHOT_HOUR:MINUTE) has
+    passed, up to market close.
 
     Used to trigger a *catch-up* morning snapshot when the process starts (or is
-    restarted by the watchdog) after the narrow 08:20 snapshot window has already
+    restarted by the watchdog) after the narrow snapshot window has already
     elapsed — otherwise a late start would leave the day with no S/R levels and no
-    morning briefing.
+    morning briefing. This is also what lets the snapshot fire reliably when the
+    watchdog launches main.py right at the snapshot minute: the first loop tick
+    sees this True and runs it, even if boot pushed it a few seconds past window.
     """
     if dt is None:
         dt = now_cst()
@@ -116,8 +129,9 @@ def is_eod_window(dt: datetime = None, window_sec: int = 59) -> bool:
 
 def is_snapshot_window(dt: datetime = None, window_sec: int = 59) -> bool:
     """
-    True if `dt` is within `window_sec` seconds of today's 08:20 CST snapshot.
-    Designed to fire exactly once per day when called from a 60-second loop.
+    True if `dt` is within `window_sec` seconds of today's snapshot time
+    (config.SNAPSHOT_HOUR:MINUTE, CST). Designed to fire exactly once per day
+    when called from a 60-second loop.
     """
     if dt is None:
         dt = now_cst()

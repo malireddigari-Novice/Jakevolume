@@ -115,7 +115,130 @@ def get_top_oi_snapshot(
     }
 
 
+def compute_secondary_watchlist(
+    chain: dict,
+    underlying_price: float,
+    oi_changes: dict | None = None,
+) -> list[dict]:
+    """
+    §11-§16 Secondary OI Watchlist — three tiers beyond the primary S1-R3 levels.
+
+    Tier 1  EXTENDED_RANK  : ranks 4+ within the primary ±OI_LEVEL_BAND_PCT, by OI.
+    Tier 2  OUTER_WALL     : top-N by OI in the outer band (primary → SECONDARY_OUTER_BAND_PCT).
+    Tier 3  OI_BUILDUP     : top-N by overnight oi_change across ALL strikes with positive
+                             OI change (new institutional positioning anywhere in the chain).
+
+    Parameters
+    ----------
+    chain            : normalised option chain (same shape as compute_oi_levels input)
+    underlying_price : 8:20 AM spot (Spot0)
+    oi_changes       : {(strike_float, option_type): {'oi_change': int, 'oi_change_pct': float}}
+                       queried from option_chain_snapshots after reconcile_oi_changes;
+                       None → OI_BUILDUP tier is skipped (first session, no prior data).
+    """
+    all_contracts = chain.get('all', [])
+    if not all_contracts:
+        return []
+
+    spot         = underlying_price
+    chain_expiry = chain.get('expiry')
+    primary_band = config.OI_LEVEL_BAND_PCT
+    outer_band   = config.SECONDARY_OUTER_BAND_PCT
+
+    primary_call_hi = spot * (1 + primary_band)
+    primary_put_lo  = spot * (1 - primary_band)
+    outer_call_hi   = spot * (1 + outer_band)
+    outer_put_lo    = spot * (1 - outer_band)
+
+    result: list[dict] = []
+
+    # ── Tier 1: Extended ranks within the primary band ────────────────────
+    call_in_primary = [c for c in all_contracts
+                       if c['option_type'] == 'CALL'
+                       and spot <= float(c['strike']) <= primary_call_hi]
+    put_in_primary  = [c for c in all_contracts
+                       if c['option_type'] == 'PUT'
+                       and primary_put_lo <= float(c['strike']) <= spot]
+
+    total_n = config.TOP_N_LEVELS + config.SECONDARY_WATCHLIST_TOP_N
+    for rank, c in enumerate(_top_by_oi(call_in_primary, total_n), start=1):
+        if rank <= config.TOP_N_LEVELS:
+            continue
+        result.append(_make_secondary(c, 'EXTENDED_RANK', 'CALL',
+                                      rank - config.TOP_N_LEVELS, spot, chain_expiry, oi_changes))
+
+    for rank, c in enumerate(_top_by_oi(put_in_primary, total_n), start=1):
+        if rank <= config.TOP_N_LEVELS:
+            continue
+        result.append(_make_secondary(c, 'EXTENDED_RANK', 'PUT',
+                                      rank - config.TOP_N_LEVELS, spot, chain_expiry, oi_changes))
+
+    # ── Tier 2: Outer-wall strikes (beyond primary band, within outer band) ─
+    call_outer = [c for c in all_contracts
+                  if c['option_type'] == 'CALL'
+                  and primary_call_hi < float(c['strike']) <= outer_call_hi]
+    put_outer  = [c for c in all_contracts
+                  if c['option_type'] == 'PUT'
+                  and outer_put_lo <= float(c['strike']) < primary_put_lo]
+
+    for rank, c in enumerate(_top_by_oi(call_outer, config.SECONDARY_OUTER_TOP_N), start=1):
+        result.append(_make_secondary(c, 'OUTER_WALL', 'CALL', rank, spot, chain_expiry, oi_changes))
+
+    for rank, c in enumerate(_top_by_oi(put_outer, config.SECONDARY_OUTER_TOP_N), start=1):
+        result.append(_make_secondary(c, 'OUTER_WALL', 'PUT', rank, spot, chain_expiry, oi_changes))
+
+    # ── Tier 3: OI buildup standouts (biggest positive oi_change) ────────
+    if oi_changes:
+        buildup: list[tuple] = []
+        seen: set = set()
+        for c in all_contracts:
+            key = (float(c['strike']), c['option_type'])
+            if key in seen:
+                continue
+            ch = oi_changes.get(key)
+            if ch and (ch.get('oi_change') or 0) > 0:
+                buildup.append((ch['oi_change'], c, ch))
+                seen.add(key)
+        buildup.sort(key=lambda x: x[0], reverse=True)
+        for rank, (_, c, _ch) in enumerate(buildup[:config.SECONDARY_OI_BUILDUP_TOP_N], start=1):
+            result.append(_make_secondary(c, 'OI_BUILDUP', c['option_type'],
+                                          rank, spot, chain_expiry, oi_changes))
+
+    t1 = sum(1 for r in result if r['watchlist_tier'] == 'EXTENDED_RANK')
+    t2 = sum(1 for r in result if r['watchlist_tier'] == 'OUTER_WALL')
+    t3 = sum(1 for r in result if r['watchlist_tier'] == 'OI_BUILDUP')
+    logger.info(
+        "Secondary watchlist  extended=%d  outer_wall=%d  oi_buildup=%d",
+        t1, t2, t3,
+    )
+    return result
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _make_secondary(
+    contract: dict,
+    tier: str,
+    option_type: str,
+    band_rank: int,
+    spot: float,
+    chain_expiry,
+    oi_changes: dict | None,
+) -> dict:
+    strike = float(contract['strike'])
+    ch = (oi_changes or {}).get((strike, option_type), {})
+    return {
+        'watchlist_tier': tier,
+        'strike':         strike,
+        'option_type':    option_type,
+        'open_interest':  int(contract.get('open_interest', 0)),
+        'oi_change':      ch.get('oi_change'),
+        'oi_change_pct':  ch.get('oi_change_pct'),
+        'distance_pct':   round((strike - spot) / spot, 6) if spot > 0 else None,
+        'band_rank':      band_rank,
+        'expiry':         contract.get('expiry', chain_expiry),
+    }
+
 
 def _top_by_oi(contracts: list[dict], n: int) -> list[dict]:
     """Deduplicate by strike (keep highest OI), return top-n sorted by OI descending."""

@@ -104,6 +104,87 @@ class AlpacaClient:
             logger.warning("Alpaca: could not fetch position for %s: %s", occ, exc)
             return 0
 
+    def position_unrealized_pl(self, occ: str) -> Optional[float]:
+        """
+        Unrealized P&L (dollars) for an open option position, None if no position.
+
+        Used by EOD logic to decide profit-vs-loss: a position in profit is banked,
+        a strong loser with expiry life left may be held overnight. Returns None on
+        404 (no position) or any error so callers can fall back to closing.
+        """
+        try:
+            r = requests.get(
+                f"{self._base}/v2/positions/{occ}", headers=self._headers, timeout=10
+            )
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return float(r.json().get('unrealized_pl', 0))
+        except Exception as exc:
+            logger.warning("Alpaca: could not fetch P&L for %s: %s", occ, exc)
+            return None
+
+    def list_positions(self) -> list[dict]:
+        """
+        Return every currently open position with detail ([] on error).
+
+        Each: {occ, qty, side, avg_entry_price, current_price, market_value,
+               unrealized_pl, unrealized_plpc}. This is the broker's ground truth
+        for what is actually held right now — reconcile it against the trades table
+        (db.get_open_trades) to catch drift between system state and reality.
+        """
+        try:
+            r = requests.get(f"{self._base}/v2/positions", headers=self._headers, timeout=10)
+            r.raise_for_status()
+            out = []
+            for p in r.json():
+                out.append({
+                    'occ':             p.get('symbol'),
+                    'qty':             int(float(p.get('qty', 0) or 0)),
+                    'side':            p.get('side'),
+                    'avg_entry_price': float(p.get('avg_entry_price', 0) or 0),
+                    'current_price':   float(p.get('current_price', 0) or 0),
+                    'market_value':    float(p.get('market_value', 0) or 0),
+                    'unrealized_pl':   float(p.get('unrealized_pl', 0) or 0),
+                    'unrealized_plpc': float(p.get('unrealized_plpc', 0) or 0),
+                })
+            return out
+        except Exception as exc:
+            logger.warning("Alpaca: could not list positions: %s", exc)
+            return []
+
+    def list_open_orders(self) -> list[dict]:
+        """
+        Return open (unfilled / partially-filled) orders ([] on error).
+
+        Each: {id, occ, side, qty, filled_qty, type, limit_price, status,
+               submitted_at}. A buy-to-open here that has not filled explains a DB
+        trade that shows no Alpaca position yet.
+        """
+        try:
+            r = requests.get(
+                f"{self._base}/v2/orders", headers=self._headers,
+                params={'status': 'open', 'nested': 'true'}, timeout=10,
+            )
+            r.raise_for_status()
+            out = []
+            for o in r.json():
+                out.append({
+                    'id':           o.get('id'),
+                    'occ':          o.get('symbol'),
+                    'side':         o.get('side'),
+                    'qty':          int(float(o.get('qty', 0) or 0)),
+                    'filled_qty':   int(float(o.get('filled_qty', 0) or 0)),
+                    'type':         o.get('type'),
+                    'limit_price':  float(o['limit_price']) if o.get('limit_price') else None,
+                    'status':       o.get('status'),
+                    'submitted_at': o.get('submitted_at'),
+                })
+            return out
+        except Exception as exc:
+            logger.warning("Alpaca: could not list open orders: %s", exc)
+            return []
+
     # ── Position sizing ───────────────────────────────────────────────────────
 
     def calculate_qty(self, limit_price: float) -> tuple[int, float]:
@@ -244,3 +325,15 @@ def occ_symbol(symbol: str, expiry: date, strike: float, option_type: str) -> st
     cp       = 'C' if option_type == 'CALL' else 'P'
     strike_i = int(round(strike * 1000))
     return f"{symbol}{date_s}{cp}{strike_i:08d}"
+
+
+def parse_occ_symbol(occ: str) -> tuple:
+    """
+    Inverse of occ_symbol: OCC ticker → (underlying, expiry_date, option_type, strike).
+    Symbol-length agnostic — the fixed 15-char tail (YYMMDD + C/P + 8-digit strike) is
+    sliced from the right.  Example: NVDA260626P00195000 → ('NVDA', date(2026,6,26), 'PUT', 195.0)
+    """
+    strike = int(occ[-8:]) / 1000.0
+    cp     = occ[-9]
+    yy, mm, dd = int(occ[-15:-13]), int(occ[-13:-11]), int(occ[-11:-9])
+    return occ[:-15], date(2000 + yy, mm, dd), ('CALL' if cp == 'C' else 'PUT'), strike
