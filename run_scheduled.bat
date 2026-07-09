@@ -5,15 +5,16 @@ REM trading hours. Checks every 5 minutes until 15:15 local time, then exits.
 cd /d "C:\Users\malir\Projects\Python\Jakevolume"
 set SAMPLE_MODE=false
 
-REM ── Gold-only production mode ──────────────────────────────────────────────
-REM Only Gold-graded events (structural + value/contract-low region) create alerts
-REM + paper trades; everything else is stored research-only. Intent validation and
-REM the opposite-side veto are DISABLED here because their live poll-loop wiring
-REM (P2 integration) is not done yet — leaving intent on would block every signal
-REM (NO_TRADE blackout). Re-enable them once P2 is wired. Remove these lines to revert.
+REM ── Gold-only production mode — ALL layers active ─────────────────────────
+REM Full Gold pipeline: structural + value/contract-low gate, deferred directional-
+REM intent validation (P2 wired), opposite-side veto, event-time capture/eligibility,
+REM and breakout/breakdown continuation. Everything non-Gold is research-only.
+REM Remove any line to disable that layer; remove all to revert to pre-Gold behavior.
 set GOLD_ONLY_PRODUCTION_MODE=true
-set INTENT_VALIDATION_ENABLED=false
-set OPPOSITE_SIDE_VETO_ENABLED=false
+set INTENT_VALIDATION_ENABLED=true
+set OPPOSITE_SIDE_VETO_ENABLED=true
+set EVENT_TIME_ELIGIBILITY_ENABLED=true
+set BREAKOUT_BREAKDOWN_ENABLED=true
 
 set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
