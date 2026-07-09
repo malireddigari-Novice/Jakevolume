@@ -15,6 +15,10 @@ set INTENT_VALIDATION_ENABLED=true
 set OPPOSITE_SIDE_VETO_ENABLED=true
 set EVENT_TIME_ELIGIBILITY_ENABLED=true
 set BREAKOUT_BREAKDOWN_ENABLED=true
+REM Fix (2) — opening-window event-time flow can fire in production. Conservative:
+REM inherits the chain-led live-leadership gate + Gold gate + demand-story filter, so it
+REM will not fire directional entries into two-sided opening flow.
+set OPENING_SCAN_PRODUCTION_ENABLED=true
 
 set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
