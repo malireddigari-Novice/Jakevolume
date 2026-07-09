@@ -59,6 +59,32 @@ def classify_interaction(side: str, level_type: str, spot: float, level_price: f
         return 'FALSE_BREAKDOWN' if close < level_price else 'MIXED'
 
 
+def level_side(level_type: str, spot: float, level_price: float, *, bar_close: float = None):
+    """
+    Decide which side to evaluate at a primary level based on price acceptance:
+      RESISTANCE accepted above  -> ('CALL','BULLISH','BREAKOUT_CALL')
+      RESISTANCE not crossed     -> ('PUT','BEARISH','REJECTION_PUT')
+      SUPPORT accepted below     -> ('PUT','BEARISH','BREAKDOWN_PUT')
+      SUPPORT not crossed        -> ('CALL','BULLISH','BOUNCE_CALL')
+      crossed-but-not-accepted   -> None  (FALSE_BREAKOUT / FALSE_BREAKDOWN: skip)
+    Returns (confirm_type, signal_type, level_action) or None.
+    """
+    close = bar_close if bar_close is not None else spot
+    buf = level_buffer(level_price)
+    if level_type == 'RESISTANCE':
+        if close >= level_price + buf:
+            return 'CALL', 'BULLISH', 'BREAKOUT_CALL'
+        if close > level_price:                      # crossed but not accepted
+            return None
+        return 'PUT', 'BEARISH', 'REJECTION_PUT'
+    else:  # SUPPORT
+        if close <= level_price - buf:
+            return 'PUT', 'BEARISH', 'BREAKDOWN_PUT'
+        if close < level_price:
+            return None
+        return 'CALL', 'BULLISH', 'BOUNCE_CALL'
+
+
 # Which interactions are actionable (map to a Gold subtype) vs blocked.
 ACTIONABLE = {'BOUNCE_CALL', 'REJECTION_PUT', 'BREAKOUT_CALL', 'BREAKDOWN_PUT'}
 BLOCKED    = {'FALSE_BREAKOUT', 'FALSE_BREAKDOWN', 'MIXED'}

@@ -59,5 +59,19 @@ ck("bounce -> GOLD_PRIMARY_BOUNCE_CALL subtype",
 ck("breakout subtype is a recognized Gold subtype",
    gm.GOLD_PRIMARY_BREAKOUT_CALL in gm._GOLD_SUBTYPES)
 
+# ── level_side (detector side-selection by acceptance) ──
+ck("resistance accepted above -> CALL breakout",
+   bo.level_side('RESISTANCE', 310.4, 310.0, bar_close=310.4) == ('CALL', 'BULLISH', 'BREAKOUT_CALL'))
+ck("resistance not crossed -> PUT rejection",
+   bo.level_side('RESISTANCE', 309.7, 310.0, bar_close=309.7) == ('PUT', 'BEARISH', 'REJECTION_PUT'))
+ck("resistance crossed-not-accepted -> None (skip)",
+   bo.level_side('RESISTANCE', 310.1, 310.0, bar_close=310.1) is None)
+ck("support accepted below -> PUT breakdown",
+   bo.level_side('SUPPORT', 304.5, 305.0, bar_close=304.5) == ('PUT', 'BEARISH', 'BREAKDOWN_PUT'))
+ck("support not crossed -> CALL bounce",
+   bo.level_side('SUPPORT', 305.4, 305.0, bar_close=305.4) == ('CALL', 'BULLISH', 'BOUNCE_CALL'))
+ck("support crossed-not-accepted -> None (skip)",
+   bo.level_side('SUPPORT', 304.9, 305.0, bar_close=304.9) is None)
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")
 sys.exit(1 if fails else 0)

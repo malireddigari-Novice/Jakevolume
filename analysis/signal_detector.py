@@ -43,6 +43,9 @@ from analysis.trend import IntradayTrend
 from analysis.event_state import EventRegistry
 from analysis.rolling_volume import RollingVolume
 from analysis.opening_scan import scan_opening
+from analysis import breakout as _breakout
+from analysis.route_b import route_b_qualifies
+from analysis.gold_mode import contract_low_region
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
 
@@ -484,16 +487,30 @@ class SignalDetector:
             strike       = float(level['strike'])
             rank         = int(level.get('rank', 1))
             level_type   = level['level_type']                       # frozen (no flip)
-            confirm_type = 'PUT' if level_type == 'RESISTANCE' else 'CALL'
-            signal_type  = 'BEARISH' if level_type == 'RESISTANCE' else 'BULLISH'
             label        = ('R' if level_type == 'RESISTANCE' else 'S') + str(rank)
 
             # ── §4 Proximity (binary) ─────────────────────────────────────────
             dist = abs(close_price - strike) / close_price if close_price > 0 else 1.0
             if dist > near_thr:
-                self._log_eval(symbol, label, strike, close_price, confirm_type,
+                self._log_eval(symbol, label, strike, close_price, 'NA',
                                reason='NOT_NEAR_LEVEL', dist=dist)
                 continue
+
+            # Side selection. Default (P-BD off): support->CALL bounce, resistance->PUT
+            # rejection. P-BD on: choose the side by price acceptance (breakout/breakdown),
+            # skipping a crossed-but-not-accepted level (FALSE_BREAKOUT/BREAKDOWN).
+            if config.BREAKOUT_BREAKDOWN_ENABLED:
+                sel = _breakout.level_side(level_type, close_price, strike, bar_close=close_price)
+                if sel is None:
+                    self._log_eval(symbol, label, strike, close_price, 'NA',
+                                   reason='FALSE_BREAKOUT_OR_BREAKDOWN', dist=dist)
+                    continue
+                confirm_type, signal_type, level_action = sel
+            else:
+                confirm_type = 'PUT' if level_type == 'RESISTANCE' else 'CALL'
+                signal_type  = 'BEARISH' if level_type == 'RESISTANCE' else 'BULLISH'
+                level_action = ('REJECTION_PUT' if level_type == 'RESISTANCE'
+                                else 'BOUNCE_CALL')
 
             # ── Identify ATM + 1-ITM confirm-side contracts ───────────────────
             ct_keys = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
@@ -628,6 +645,7 @@ class SignalDetector:
                 signal['bias'] = 'Countertrend reversal'
                 signal['signal_shape'] = signal['flow_shape'] = 'COUNTERTREND_REVERSAL'
 
+            signal['level_action'] = level_action          # P-BD: bounce/rejection/breakout/breakdown
             candidates.append(signal)
             self._record_candidate(symbol, label, strike, close_price, confirm_type,
                                    reason='PASSED', dist=dist, atm=atm, low=atm_low)
@@ -1121,7 +1139,17 @@ class SignalDetector:
         if not atm_ok:
             return None, 'CHAIN_VOLUME_INSUFFICIENT'
         if not adj:                                   # §4A multi-strike confirmation
-            return None, 'CHAIN_CONFIRMATION_MISSING'
+            # Route B (§ P3): an exceptional single ATM strike can stand in for adjacent
+            # confirmation. Only in Gold mode (else chain-led behavior is unchanged);
+            # opposite-side dominance is still enforced by the leadership gate below.
+            route_b = (config.GOLD_ONLY_PRODUCTION_MODE and route_b_qualifies(
+                peak_1m=atm_m['peak1m'], strikes_from_atm=0,
+                premium_notional=atm_m['notional'],
+                clow_region=contract_low_region(atm_m['low_dist']),
+                concentrated=(atm_m['share'] >= config.CHAIN_EVENT_SHARE_MIN),
+                opposite_dominates=False))
+            if not route_b:
+                return None, 'CHAIN_CONFIRMATION_MISSING'
 
         # §4C combined absolute volume (ITM+ATM+OTM)
         c1, c3, c5 = (sum(x['peak1m'] for x in chain), sum(x['vol3m'] for x in chain),
