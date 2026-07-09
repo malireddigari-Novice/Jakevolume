@@ -181,11 +181,73 @@ def production_allowed(sig) -> bool:
     return _intent_ok(sig) and _veto_ok(sig)
 
 
+def gate_audit(sig) -> dict:
+    """
+    §13 gate-by-gate audit. Re-derive each production gate's verdict from the fields
+    classify()/production_allowed() already stamped, so a reviewer can see exactly
+    which gate admitted or blocked a signal (no side effects).
+
+    Returns {'gates': [{gate, verdict, detail}], 'blocking_gate': str|None,
+             'decision': 'PRODUCTION'|'RESEARCH'}. verdict ∈ PASS / FAIL / SKIP.
+    """
+    gates = []
+    reversal = sig.get('gold_subtype') in _REVERSAL_EXEMPT
+
+    if not config.GOLD_ONLY_PRODUCTION_MODE:
+        gates.append({'gate': 'GOLD_MODE', 'verdict': 'SKIP', 'detail': 'mode off — pass-through'})
+        return {'gates': gates, 'blocking_gate': None, 'decision': 'PRODUCTION'}
+    gates.append({'gate': 'GOLD_MODE', 'verdict': 'PASS', 'detail': 'mode on'})
+
+    grade_ok = sig.get('gold_grade') == 'GOLD'
+    gates.append({'gate': 'GRADE', 'verdict': 'PASS' if grade_ok else 'FAIL',
+                  'detail': f"grade={sig.get('gold_grade')} "
+                            f"value={sig.get('value_region')} clow={sig.get('clow_region')}"})
+
+    subtype_ok = sig.get('gold_subtype') in _GOLD_SUBTYPES
+    gates.append({'gate': 'SUBTYPE', 'verdict': 'PASS' if subtype_ok else 'FAIL',
+                  'detail': f"subtype={sig.get('gold_subtype')}"})
+
+    if not config.INTENT_VALIDATION_ENABLED:
+        gates.append({'gate': 'INTENT', 'verdict': 'SKIP', 'detail': 'intent gate off'})
+        intent_ok = True
+    elif reversal:
+        gates.append({'gate': 'INTENT', 'verdict': 'SKIP', 'detail': 'reversal exempt'})
+        intent_ok = True
+    else:
+        intent_ok = is_directional_demand(sig.get('intent_class'))
+        gates.append({'gate': 'INTENT', 'verdict': 'PASS' if intent_ok else 'FAIL',
+                      'detail': f"intent_class={sig.get('intent_class')}"})
+
+    if not config.OPPOSITE_SIDE_VETO_ENABLED:
+        gates.append({'gate': 'OPP_VETO', 'verdict': 'SKIP', 'detail': 'veto gate off'})
+        veto_ok = True
+    else:
+        veto_ok = not sig.get('opp_veto')
+        gates.append({'gate': 'OPP_VETO', 'verdict': 'PASS' if veto_ok else 'FAIL',
+                      'detail': f"opp_veto={bool(sig.get('opp_veto'))}"})
+
+    blocking = next((g['gate'] for g in gates if g['verdict'] == 'FAIL'), None)
+    decision = 'PRODUCTION' if blocking is None else 'RESEARCH'
+    return {'gates': gates, 'blocking_gate': blocking, 'decision': decision}
+
+
+def audit_summary(audit: dict) -> str:
+    """One-line render of a gate_audit() result, e.g.
+    'GOLD_MODE:PASS GRADE:PASS SUBTYPE:PASS INTENT:FAIL → RESEARCH (blocked at INTENT)'."""
+    parts = " ".join(f"{g['gate']}:{g['verdict']}" for g in audit['gates'])
+    tail = f" → {audit['decision']}"
+    if audit['blocking_gate']:
+        tail += f" (blocked at {audit['blocking_gate']})"
+    return parts + tail
+
+
 def annotate_and_gate(sig) -> bool:
-    """Classify (always) then return production_allowed; stamps sig['production_allowed']."""
+    """Classify (always) then return production_allowed; stamps sig['production_allowed']
+    and sig['gate_audit'] (§13 gate-by-gate trail)."""
     classify(sig)
     allowed = production_allowed(sig)
     sig['production_allowed'] = allowed
+    sig['gate_audit'] = gate_audit(sig)
     return allowed
 
 

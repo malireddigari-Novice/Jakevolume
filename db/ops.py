@@ -611,6 +611,28 @@ def save_signal_latency(signal_id: int, es) -> None:
         _put(conn)
 
 
+def save_signal_gate_audit(signal_id: int, symbol: str, audit: dict, summary: str) -> None:
+    """Persist a signal's §13 gate-by-gate audit. No-op when audit is None/empty."""
+    if not audit:
+        return
+    from psycopg2.extras import Json
+    sql = """
+        INSERT INTO signal_gate_audit
+            (signal_id, symbol, decision, blocking_gate, summary, gates)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (signal_id) DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (signal_id, symbol, audit.get('decision'),
+                              audit.get('blocking_gate'), summary,
+                              Json(audit.get('gates', []))))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_morning_sentiment(
     symbol: str,
     snap_date: date,

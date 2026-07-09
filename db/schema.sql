@@ -286,6 +286,17 @@ CREATE TABLE IF NOT EXISTS signal_latency (
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- ── §13 Gate-by-gate audit (which production gate admitted/blocked a signal) ──
+CREATE TABLE IF NOT EXISTS signal_gate_audit (
+    signal_id      BIGINT PRIMARY KEY REFERENCES signals(id),
+    symbol         VARCHAR(10),
+    decision       VARCHAR(12),    -- PRODUCTION | RESEARCH
+    blocking_gate  VARCHAR(20),    -- first FAIL gate, NULL when admitted
+    summary        TEXT,           -- one-line 'GATE:VERDICT ... → DECISION' render
+    gates          JSONB,          -- ordered [{gate, verdict, detail}]
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ── Morning sentiment (daily P/C ratio + bias per symbol) ────────────────────
 CREATE TABLE IF NOT EXISTS morning_sentiment (
     id          BIGSERIAL    PRIMARY KEY,

@@ -710,7 +710,17 @@ def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
     if emergent is not None:
         sig['emergent_location_id'] = db.save_emergent_location(emergent)
     event_state = sig.pop('event_state', None)   # P-ET: not a signals column
+    gate_audit = sig.pop('gate_audit', None)     # §13: not a signals column
     sig_id = db.save_signal(sig)
+    if gate_audit is not None:
+        summary = gold_mode.audit_summary(gate_audit)
+        if gate_audit.get('decision') == 'RESEARCH':
+            logger.info("GATE-AUDIT %s %s: %s", sig.get('symbol'),
+                        sig.get('signal_type'), summary)
+        try:
+            db.save_signal_gate_audit(sig_id, sig.get('symbol'), gate_audit, summary)
+        except Exception:
+            logger.warning("save_signal_gate_audit failed for %s", sig.get('symbol'), exc_info=True)
     if event_state is not None:
         # §1/§13 stamp commit-time quotes + realistic paper fill + price-moved flag.
         b, a = sig.get('opt_bid'), sig.get('opt_ask')
