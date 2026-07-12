@@ -393,6 +393,17 @@ OPENING_RANGE_EXCITATION_MIN = float(os.getenv('OPENING_RANGE_EXCITATION_MIN', '
 # shift, drop any target still within EXIT_MIN_ROOM_PCT of the entry spot.
 EXIT_MIN_ROOM_PCT = float(os.getenv('EXIT_MIN_ROOM_PCT', '0.0025'))   # 0.25%
 
+# ── Chandelier trailing exit (trail the runner) ───────────────────────────────
+# After Exit1 banks the first half at level 1, the remaining half is trailed with a
+# chandelier stop on the UNDERLYING instead of the fixed Exit2 level: the trail sits
+# ATR*mult below the highest high since entry (mirror for puts) and ratchets up (never
+# loosens); the runner stops out when the underlying reverses through it. Lets winners
+# run into the fat tail while protecting the open gain. Default OFF — validate on the
+# counterfactual replay before enabling.
+CHANDELIER_EXIT_ENABLED = os.getenv('CHANDELIER_EXIT_ENABLED', 'false').lower() == 'true'
+CHANDELIER_ATR_PERIOD   = int(os.getenv('CHANDELIER_ATR_PERIOD', '14'))   # 1-min bars
+CHANDELIER_ATR_MULT     = float(os.getenv('CHANDELIER_ATR_MULT', '3.0'))  # classic 3x ATR
+
 # ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
 CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
 CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2

@@ -1421,7 +1421,7 @@ def get_open_trades(symbol: str = None) -> list:
                exit1_underlying, exit2_underlying,
                exit1_qty, exit2_qty,
                exit1_filled, exit2_filled,
-               stoploss_price, strike, option_type, expiry
+               stoploss_price, strike, option_type, expiry, created_at
         FROM   trades
         WHERE  status = 'placed'
           AND  (exit1_filled = FALSE OR exit2_filled = FALSE)
