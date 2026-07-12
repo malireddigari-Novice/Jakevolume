@@ -1111,6 +1111,30 @@ def save_volume_leadership(
         _put(conn)
 
 
+def save_relative_strength(rows: list, *, scope: str, bench_symbol: str,
+                           bench_pct, bench_spot, session_date: date, ts) -> None:
+    """Bulk-insert relative-strength rows (MORNING or INTRADAY). `rows` are
+    compute_row() dicts: {symbol, pct, rs, rs_class}. No-op when empty."""
+    if not rows:
+        return
+    sql = """
+        INSERT INTO relative_strength
+            (symbol, session_date, ts, scope, bench_symbol,
+             stock_pct, bench_pct, rs, rs_class, spot, bench_spot)
+        VALUES %s
+    """
+    vals = [(r['symbol'], session_date, ts, scope, bench_symbol,
+             r.get('pct'), bench_pct, r.get('rs'), r.get('rs_class'),
+             r.get('spot'), bench_spot) for r in rows]
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, vals)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_signal_volume_analytics(rows: list) -> None:
     """Bulk upsert §26-§29/§31 volume analytics per signal (one row per signal_id)."""
     if not rows:

@@ -37,6 +37,7 @@ from analysis.flow_reversal import FlowReversalEngine, volume_event
 from analysis.volume_analytics import compute_leadership_scores
 from analysis.open_positions import collect_open_positions
 from analysis import gold_mode
+from analysis import relative_strength as rs
 from analysis.intent_gate import IntentGate
 from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
@@ -99,6 +100,73 @@ _intent_gate = IntentGate()
 
 
 # ── Morning snapshot (08:00 CST, once per trading day) ───────────────────────
+
+def _spot_anchor(symbol: str, schwab: SchwabClient, adata=None):
+    """(prev_close, spot) for a symbol — Alpaca SIP mid preferred, then Schwab, then
+    prev_close. Same anchor logic the MAG7 loop uses; reused for SPY/QQQ benchmarks."""
+    prev_close = schwab.get_prev_close(symbol)
+    spot = None
+    if adata is not None:
+        try:
+            spot = adata.get_quote_mid(symbol)
+        except Exception:
+            spot = None
+    if not spot:
+        try:
+            spot = schwab.get_quote(symbol).get('price')
+        except Exception:
+            spot = None
+    if not spot:
+        spot = prev_close
+    return prev_close, spot
+
+
+def _compute_morning_relative_strength(sentiments: list, schwab, adata, today, now):
+    """
+    Pull SPY/QQQ (context only) and compute each MAG7 name's raw relative return vs
+    RS_BENCHMARK (QQQ). Annotates each MAG7 sentiment in place with rs/rs_class/rs_tag.
+    Returns (benchmarks, divergences) for the briefing; ([], []) when disabled/unavailable.
+    """
+    if not config.RELATIVE_STRENGTH_ENABLED:
+        return [], []
+    benchmarks, bench_map = [], {}
+    for b in config.BENCHMARKS:
+        try:
+            bprev, bspot = _spot_anchor(b, schwab, adata)
+            bp = rs.pct_change(bspot, bprev)
+            bench_map[b] = {'pct': bp, 'spot': bspot}
+            benchmarks.append({'symbol': b, 'prev_close': bprev, 'pm_price': bspot, 'pct': bp})
+            logger.info("BENCHMARK %s: prev=%.2f spot=%.2f chg=%s%%", b,
+                        bprev or 0.0, bspot or 0.0, bp)
+        except Exception:
+            logger.warning("Benchmark %s pull failed", b, exc_info=True)
+    bench = bench_map.get(config.RS_BENCHMARK)
+    bench_pct = bench['pct'] if bench else None
+    bench_spot = bench['spot'] if bench else None
+    if bench_pct is None:
+        logger.warning("Relative strength: no %s benchmark %% — skipping RS", config.RS_BENCHMARK)
+        return benchmarks, []
+    thr = config.RS_DIVERGENCE_PCT
+    rows = []
+    for s in sentiments:
+        if s['symbol'] not in config.MAG7:
+            continue
+        row = rs.compute_row(s['symbol'], s.get('pm_price'), s.get('prev_close'), bench_pct, thr)
+        row['spot'] = s.get('pm_price')
+        rows.append(row)
+        s['rs'], s['rs_class'], s['rs_tag'] = row['rs'], row['rs_class'], row['rs_tag']
+    divs = rs.divergences(rows, thr)
+    if divs:
+        logger.info("RS divergences vs %s: %s", config.RS_BENCHMARK,
+                    ", ".join(f"{d['symbol']} {d['rs']:+.2f}({d['rs_tag']})" for d in divs))
+    try:
+        db.save_relative_strength(rows, scope='MORNING', bench_symbol=config.RS_BENCHMARK,
+                                  bench_pct=bench_pct, bench_spot=bench_spot,
+                                  session_date=today, ts=now)
+    except Exception:
+        logger.warning("Morning RS save failed", exc_info=True)
+    return benchmarks, divs
+
 
 def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> None:
     """
@@ -246,6 +314,10 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
         except Exception:
             logger.exception("Morning snapshot failed for %s", symbol)
 
+    # Relative strength vs QQQ (adds rs/rs_class/rs_tag to each MAG7 sentiment).
+    benchmarks, rs_divergences = _compute_morning_relative_strength(
+        sentiments, schwab, adata, today, now)
+
     _print_mag7_briefing(sentiments, now)
 
     # Send morning briefing to Discord
@@ -281,7 +353,8 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
             logger.warning("Morning briefing: open-position check failed", exc_info=True)
 
     discord_briefing(discord_results, now, oi_buildup=top_buildup,
-                     weekend_gaps=weekend_gaps, open_positions=open_pos)
+                     weekend_gaps=weekend_gaps, open_positions=open_pos,
+                     benchmarks=benchmarks, rs_divergences=rs_divergences)
 
     # Retention: keep only the most recent N trading days of 1-min bar data.
     # Runs once per trading day here; alerts/signals are never pruned.
@@ -369,6 +442,70 @@ def _last_closed_opt_bar_vol(data_src, occ: str, bar_time) -> Optional[int]:
         return None
 
 
+_rs_diverged_today: set = set()   # (symbol, date) already logged as an intraday divergence
+
+
+def _session_pct(session_bars: list, live_spot=None):
+    """% change from the first session bar to the live spot (or last close). (pct, ref_spot)."""
+    if not session_bars:
+        return None, None
+    ref = session_bars[0].get('close')
+    cur = live_spot if live_spot is not None else session_bars[-1].get('close')
+    return rs.pct_change(cur, ref), cur
+
+
+def _qqq_intraday_context(dbc, data_src):
+    """QQQ (RS_BENCHMARK) % change since the session open + current spot; None if off/unavailable."""
+    if not config.RELATIVE_STRENGTH_ENABLED:
+        return None
+    bench = config.RS_BENCHMARK
+    try:
+        sb = data_src.get_bars(bench, count=config.SESSION_BARS) if data_src else (dbc.get_bars(bench) if dbc else None)
+        if not sb:
+            return None
+        spot = sb[-1].get('close')
+        if data_src:
+            try:
+                q = data_src.get_quote(bench)
+                if q and q.get('price'):
+                    spot = float(q['price'])
+            except Exception:
+                pass
+        pct, _ = _session_pct(sb, spot)
+        return {'pct': pct, 'spot': spot}
+    except Exception:
+        logger.warning("%s intraday context fetch failed", bench, exc_info=True)
+        return None
+
+
+def _record_intraday_rs(symbol, session_bars, live_spot, qqq_ctx, today, now) -> None:
+    """Compute + persist one symbol's intraday relative strength vs QQQ; log/alert on
+    the first hard divergence of the day (Discord gated by RS_INTRADAY_DISCORD_ALERT)."""
+    spct, _ = _session_pct(session_bars, live_spot)
+    if spct is None or qqq_ctx.get('pct') is None:
+        return
+    thr = config.RS_INTRADAY_DIVERGENCE_PCT
+    r   = rs.relative_strength(spct, qqq_ctx['pct'])
+    cls = rs.classify_rs(r, thr)
+    row = {'symbol': symbol, 'pct': spct, 'rs': r, 'rs_class': cls, 'spot': live_spot}
+    try:
+        db.save_relative_strength([row], scope='INTRADAY', bench_symbol=config.RS_BENCHMARK,
+                                  bench_pct=qqq_ctx['pct'], bench_spot=qqq_ctx.get('spot'),
+                                  session_date=today, ts=now)
+    except Exception:
+        logger.warning("%s intraday RS save failed", symbol, exc_info=True)
+    if cls in ('RELATIVELY_STRONG', 'RELATIVELY_WEAK') and (symbol, today) not in _rs_diverged_today:
+        _rs_diverged_today.add((symbol, today))
+        logger.info("RS-INTRADAY %s %s vs %s: %+.2f%%  (own %+.2f%% · %s %+.2f%%)",
+                    symbol, cls, config.RS_BENCHMARK, r, spct, config.RS_BENCHMARK, qqq_ctx['pct'])
+        if config.RS_INTRADAY_DISCORD_ALERT:
+            try:
+                from output.discord_notifier import send_rs_divergence_alert
+                send_rs_divergence_alert(symbol, r, spct, qqq_ctx['pct'], cls, config.RS_BENCHMARK)
+            except Exception:
+                logger.warning("RS divergence Discord failed", exc_info=True)
+
+
 def intraday_check(
     dbc: DatabentoClient,
     detector: SignalDetector,
@@ -388,6 +525,9 @@ def intraday_check(
     price_to_enter / price_to_exit. Databento (`dbc`) is the fallback.
     """
     today = today_cst()
+
+    # QQQ benchmark context for relative strength (fetched once per cycle; context only).
+    qqq_ctx = _qqq_intraday_context(dbc, data_src)
 
     for symbol in config.SYMBOLS:
         try:
@@ -438,6 +578,10 @@ def intraday_check(
             # The detector reads the latest bar's close as spot — feed it the live
             # spot (persisted bars keep their true candle close).
             bars = bars[:-1] + [{**bars[-1], 'close': underlying_price}]
+
+            # ── Relative strength vs QQQ (monitor alongside MAG7; context only) ──
+            if qqq_ctx:
+                _record_intraday_rs(symbol, session_bars, underlying_price, qqq_ctx, today, now_cst())
 
             # Load today's OI-derived S/R levels
             levels = db.get_today_levels(symbol, today)

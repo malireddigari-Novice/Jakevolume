@@ -59,6 +59,57 @@ def event_time_eligible(event_state, window_strikes: int, increment: float) -> b
     return d is not None and d <= window_strikes
 
 
+def opening_side_confirmed(option_type: str, story: str) -> bool:
+    """
+    Fix (2) directional safety gate: a promotable opening candidate must be on the
+    demand-dominant side of the both-sided story. A large PUT print is only promotable
+    when the story is OPENING_PUT_DEMAND_DOMINANT — never on put-supply-bullish,
+    no-conviction, or mixed. This is the single most important gate for the opening path.
+    """
+    if option_type == 'CALL':
+        return story == 'OPENING_CALL_DEMAND_DOMINANT'
+    if option_type == 'PUT':
+        return story == 'OPENING_PUT_DEMAND_DOMINANT'
+    return False
+
+
+def opening_story(symbol: str, option_quotes: dict, event_reg, leadership: Optional[dict],
+                  close_price: float, spot_open: Optional[float]) -> str:
+    """
+    Build the both-sided opening directional story from the ATM call/put event state.
+    Volume + premium-change come from the FROZEN event-time quotes (final revised volume
+    and last_at_threshold mark vs the current mark); leadership + spot change give the
+    directional context. Returns a classify_opening_story() label.
+    """
+    calls = [s for (s, ot) in option_quotes if ot == 'CALL']
+    puts  = [s for (s, ot) in option_quotes if ot == 'PUT']
+
+    def _atm(strikes):
+        return min(strikes, key=lambda s: abs(s - close_price)) if strikes else None
+
+    def _vol_premchg(strike, ot):
+        if strike is None:
+            return 0, 0.0
+        es = event_reg.get(symbol, float(strike), ot)
+        cur = (option_quotes.get((strike, ot)) or {}).get('mark')
+        if es is not None and es.crossed:
+            vol = es.final_revised_volume or es.r180_at_threshold or 0
+            base = es.last_at_threshold
+            prem_chg = (float(cur) - float(base)) if (cur and base) else 0.0
+            return vol, prem_chg
+        return 0, 0.0
+
+    ac, ap = _atm(calls), _atm(puts)
+    cv, cpc = _vol_premchg(ac, 'CALL')
+    pv, ppc = _vol_premchg(ap, 'PUT')
+    cl = (leadership or {}).get('call_leadership', 0.0)
+    pl = (leadership or {}).get('put_leadership', 0.0)
+    spot_chg = (close_price - spot_open) if spot_open else 0.0
+    return classify_opening_story(call_vol=cv, put_vol=pv, call_prem_chg=cpc,
+                                  put_prem_chg=ppc, call_lead=cl, put_lead=pl,
+                                  spot_chg=spot_chg)
+
+
 def scan_opening(symbol: str, option_quotes: dict, event_reg,
                  *, window_strikes: int, increment: Optional[float] = None) -> list:
     """

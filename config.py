@@ -14,6 +14,20 @@ SYMBOLS: list[str] = [
 
 MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
 
+# ── Benchmarks & relative strength ────────────────────────────────────────────
+# SPY/QQQ are CONTEXT ONLY — tracked for price + relative strength, never traded
+# and never run through the signal detector. MAG7 usually moves with QQQ; the point
+# is to surface names moving relatively strong/weak INDEPENDENT of QQQ.
+BENCHMARKS: list[str] = ['SPY', 'QQQ']
+RELATIVE_STRENGTH_ENABLED = os.getenv('RELATIVE_STRENGTH_ENABLED', 'true').lower() == 'true'
+RS_BENCHMARK              = os.getenv('RS_BENCHMARK', 'QQQ')          # MAG7 measured vs this
+# Raw relative return: RS = stock %change - benchmark %change (percentage points).
+# |RS| at/above the threshold flags a name as relatively strong / weak (a divergence).
+RS_DIVERGENCE_PCT          = float(os.getenv('RS_DIVERGENCE_PCT',          '0.5'))  # morning (pre-mkt drift)
+RS_INTRADAY_DIVERGENCE_PCT = float(os.getenv('RS_INTRADAY_DIVERGENCE_PCT', '0.4'))  # intraday (since open)
+# Intraday: post a Discord note the first time a name crosses into a hard divergence.
+RS_INTRADAY_DISCORD_ALERT  = os.getenv('RS_INTRADAY_DISCORD_ALERT', 'false').lower() == 'true'
+
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
 
@@ -158,6 +172,12 @@ EVENT_TIME_ELIGIBILITY_ENABLED = os.getenv('EVENT_TIME_ELIGIBILITY_ENABLED', 'fa
 OPENING_STRIKE_WINDOW          = int(os.getenv('OPENING_STRIKE_WINDOW',          '5'))   # ATM ± N strikes in the opening 15m
 OPENING_EVENT_WATCH_VOLUME     = int(os.getenv('OPENING_EVENT_WATCH_VOLUME',     '500'))  # r60 that registers a watch event
 OPENING_EVENT_CONTRACT_TTL_MIN = int(os.getenv('OPENING_EVENT_CONTRACT_TTL_MIN', '30'))   # keep a registered contract alive this long
+# Fix (2), Option C — promote opening-window event-time-eligible contracts to PRODUCTION
+# (not just research logging). A candidate fires only when the both-sided opening story is
+# demand-dominant on its side, priced at commit time (no retrospective qualification), and
+# it clears the full chain-led/Route-B economic + veto + Gold gates. Default OFF — ships
+# dark; validate on replay before enabling.
+OPENING_SCAN_PRODUCTION_ENABLED = os.getenv('OPENING_SCAN_PRODUCTION_ENABLED', 'false').lower() == 'true'
 
 # Breakout/breakdown continuation (P-BD) — primary levels also produce continuation
 # when price ACCEPTS through them (resistance->CALL breakout, support->PUT breakdown),

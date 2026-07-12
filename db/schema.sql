@@ -603,6 +603,27 @@ CREATE TABLE IF NOT EXISTS volume_leadership (
 );
 CREATE INDEX IF NOT EXISTS idx_vol_lead_date ON volume_leadership (symbol, session_date);
 
+-- ── Relative strength vs benchmark (QQQ) — MAG7 independence from the index ────
+-- Raw relative return RS = stock %change - benchmark %change. One MORNING row per
+-- symbol at the snapshot, plus INTRADAY rows tracked alongside MAG7 during the day.
+CREATE TABLE IF NOT EXISTS relative_strength (
+    id            BIGSERIAL   PRIMARY KEY,
+    symbol        VARCHAR(10) NOT NULL,
+    session_date  DATE        NOT NULL,
+    ts            TIMESTAMPTZ NOT NULL,
+    scope         VARCHAR(10) NOT NULL,     -- MORNING | INTRADAY
+    bench_symbol  VARCHAR(10) NOT NULL,
+    stock_pct     NUMERIC(8,3),             -- % change vs its reference (prev_close / open)
+    bench_pct     NUMERIC(8,3),
+    rs            NUMERIC(8,3),             -- stock_pct - bench_pct (pct points)
+    rs_class      VARCHAR(20),              -- RELATIVELY_STRONG | RELATIVELY_WEAK | IN_LINE
+    spot          NUMERIC(12,4),
+    bench_spot    NUMERIC(12,4),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rs_symbol_date ON relative_strength (symbol, session_date);
+CREATE INDEX IF NOT EXISTS idx_rs_scope_date  ON relative_strength (scope, session_date);
+
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.

@@ -42,7 +42,7 @@ from analysis.volume_analytics import compute_leadership_scores
 from analysis.trend import IntradayTrend
 from analysis.event_state import EventRegistry
 from analysis.rolling_volume import RollingVolume
-from analysis.opening_scan import scan_opening
+from analysis.opening_scan import scan_opening, opening_story, opening_side_confirmed
 from analysis import breakout as _breakout
 from analysis.route_b import route_b_qualifies
 from analysis.gold_mode import contract_low_region
@@ -701,6 +701,40 @@ class SignalDetector:
                     fired.append(csig)
                 elif creason:
                     logger.info("CHAIN-LED  %s %s  → %s", symbol, confirm_type, creason)
+
+        # ── Fix (2), Option C — opening event-time production promotion (default-off).
+        # Promote an opening-window, event-time-eligible contract (frozen ATM±window at
+        # event time) to a production entry when its side's opening story is demand-
+        # dominant. Reuses the full chain-led/Route-B economic + veto + Gold machinery
+        # via force_strike; priced at commit time (no retrospective qualification), and
+        # bound by the same one-per-direction-per-day dedup as every other path.
+        if (config.OPENING_SCAN_PRODUCTION_ENABLED and opening_range
+                and self.last_opening_candidates and option_quotes):
+            story = opening_story(symbol, option_quotes, self._event_reg, leadership,
+                                  close_price, float(bars[0]['close']) if bars else None)
+            for c in self.last_opening_candidates:
+                side = c['option_type']
+                st = 'BULLISH' if side == 'CALL' else 'BEARISH'
+                if self._fired_today.get((symbol, st)):
+                    continue
+                if not opening_side_confirmed(side, story):
+                    continue
+                osig, oreason = self._chain_led_entry(
+                    symbol, side, opt_data_map, vol_deltas, levels, close_price,
+                    expiry, bars, bar_time, bar_time, next_day_mode, None, pc_ratio,
+                    leadership=leadership, peak1m_floor=peak1m_floor,
+                    vol3m_floor=vol3m_floor, force_strike=c['strike'])
+                if osig is not None:
+                    osig['opening_event'] = True
+                    osig['opening_story'] = story
+                    osig['no_retro_label'] = c['no_retro']
+                    self._fired_today[(symbol, st)] = True
+                    fired.append(osig)
+                    logger.info("OPENING-PROD fired %s %s $%.2f  story=%s  retro=%s",
+                                symbol, side, c['strike'], story, c['no_retro'])
+                elif oreason:
+                    logger.info("OPENING-PROD %s %s $%.2f → %s  (story=%s)",
+                                symbol, side, c['strike'], oreason, story)
         return fired
 
     # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
@@ -1102,7 +1136,7 @@ class SignalDetector:
     def _chain_led_entry(self, symbol, confirm_type, opt_data_map, vol_deltas, levels,
                          close_price, expiry, bars, bar_time, now, next_day_mode,
                          hv_pctile, pc_ratio, leadership=None,
-                         peak1m_floor=None, vol3m_floor=None):
+                         peak1m_floor=None, vol3m_floor=None, force_strike=None):
         """
         §3-7 — chain-led emergent entry. Coordinated ATM + adjacent-strike volume builds a
         new emergent support/resistance before spot reaches a primary level. Returns
@@ -1119,7 +1153,15 @@ class SignalDetector:
         ct = [(s, ot) for (s, ot) in opt_data_map if ot == confirm_type]
         if len(ct) < 2:
             return None, 'CHAIN_CONFIRMATION_MISSING'
-        atm_key = min(ct, key=lambda k: abs(k[0] - close_price))
+        if force_strike is not None:
+            # Fix (2): opening event-time promotion anchors the ATM to the FROZEN
+            # event-time strike (which may differ from live-ATM after spot moved),
+            # not live proximity — the whole point of event-time eligibility.
+            atm_key = next((k for k in ct if abs(k[0] - float(force_strike)) < 1e-6), None)
+            if atm_key is None:
+                return None, 'OPENING_STRIKE_NOT_QUOTED'
+        else:
+            atm_key = min(ct, key=lambda k: abs(k[0] - close_price))
         a_strike = atm_key[0]
         if confirm_type == 'CALL':           # ITM below spot, OTM above
             itm = [k for k in ct if k[0] < a_strike]; otm = [k for k in ct if k[0] > a_strike]

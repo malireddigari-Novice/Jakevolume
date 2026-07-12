@@ -294,14 +294,22 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
     pc   = s.get('pc_ratio')
     prev_str = f"${prev:.2f}" if prev is not None else 'n/a'
     pc_str   = f"{pc:.3f}" if pc is not None else 'n/a'
+    desc = (
+        f"**Previous Close:** {prev_str}\n"
+        f"**Expiry:** {_fmt_expiry(r.get('expiry'))}\n"
+        f"**Put/Call OI:** {pc_str}"
+    )
+    # Relative strength vs QQQ (only when computed). Flags names moving independent
+    # of the index: 🟢 relatively strong, 🔴 relatively weak, · in-line.
+    rs_val = s.get('rs')
+    if rs_val is not None:
+        cls  = s.get('rs_class', 'IN_LINE')
+        icon = '🟢' if cls == 'RELATIVELY_STRONG' else '🔴' if cls == 'RELATIVELY_WEAK' else '·'
+        desc += f"\n**vs QQQ:** {icon} {rs_val:+.2f}% ({s.get('rs_tag', 'in-line')})"
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),
-        'description': (
-            f"**Previous Close:** {prev_str}\n"
-            f"**Expiry:** {_fmt_expiry(r.get('expiry'))}\n"
-            f"**Put/Call OI:** {pc_str}"
-        ),
+        'description': desc,
         'fields': [
             {'name': 'Support Levels',
              'value': _level_lines(r.get('supports', []), 'S'),
@@ -357,12 +365,53 @@ def _open_positions_embed(summary: dict | None, footer: dict) -> dict | None:
     }
 
 
+def _benchmark_embed(benchmarks: list, footer: dict) -> dict | None:
+    """Compact SPY/QQQ context line (pre-market % change). None when unavailable."""
+    if not benchmarks:
+        return None
+    def _fmt(b):
+        p = b.get('pct')
+        spot = b.get('pm_price')
+        pstr = f"{p:+.2f}%" if p is not None else 'n/a'
+        arrow = '▲' if (p or 0) > 0 else '▼' if (p or 0) < 0 else '■'
+        return f"{arrow} **{b['symbol']}** {pstr}" + (f" (${spot:.2f})" if spot else "")
+    return {
+        'title': '📊 Benchmarks (context)',
+        'color': 0x6E7781,
+        'description': "  ·  ".join(_fmt(b) for b in benchmarks),
+        'footer': footer,
+    }
+
+
+def _rs_divergence_embed(divergences: list, bench: str, footer: dict) -> dict | None:
+    """Names moving relatively strong/weak INDEPENDENT of the benchmark. None if none."""
+    if not divergences:
+        return None
+    strong = [d for d in divergences if d.get('rs_class') == 'RELATIVELY_STRONG']
+    weak   = [d for d in divergences if d.get('rs_class') == 'RELATIVELY_WEAK']
+    def _line(d):
+        return f"{d['symbol']} {d['rs']:+.2f}%" + (f" (own {d['pct']:+.2f}%)" if d.get('pct') is not None else "")
+    parts = []
+    if strong:
+        parts.append("🟢 **Relatively strong:** " + " · ".join(_line(d) for d in strong))
+    if weak:
+        parts.append("🔴 **Relatively weak:** " + " · ".join(_line(d) for d in weak))
+    return {
+        'title': f'⚖️ Relative Strength vs {bench} (divergences)',
+        'color': 0x0969DA,
+        'description': "\n".join(parts) + f"\n_Raw relative return = stock %chg − {bench} %chg._",
+        'footer': footer,
+    }
+
+
 def send_morning_briefing(
     results: list,
     now: datetime,
     oi_buildup: list | None = None,
     weekend_gaps: list | None = None,
     open_positions: dict | None = None,
+    benchmarks: list | None = None,
+    rs_divergences: list | None = None,
 ) -> None:
     """
     Send the 8:20 AM morning briefing to Discord as one mobile-first embed per
@@ -393,6 +442,16 @@ def send_morning_briefing(
     footer = {'text': f"Jakevolume Morning Briefing · {time_str} CST"}
 
     embeds = []
+
+    # Benchmark context (SPY/QQQ) + relative-strength divergences ride up top with
+    # the header, before the per-symbol embeds (which each carry their own vs-QQQ tag).
+    be = _benchmark_embed(benchmarks or [], footer)
+    if be:
+        embeds.append(be)
+    de = _rs_divergence_embed(rs_divergences or [], config.RS_BENCHMARK, footer)
+    if de:
+        embeds.append(de)
+
     for r in results:
         try:
             embeds.append(_build_symbol_embed(r, footer))
@@ -460,6 +519,26 @@ def send_morning_briefing(
         _post(url, payload)
 
     logger.info("Discord: morning briefing sent (%d symbols, embed format)", len(results))
+
+
+def send_rs_divergence_alert(symbol: str, rs_val: float, own_pct: float,
+                             bench_pct: float, rs_class: str, bench: str) -> None:
+    """Intraday note: a name has diverged hard from the benchmark (gated, default off)."""
+    url = config.DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    strong = rs_class == 'RELATIVELY_STRONG'
+    icon   = '🟢' if strong else '🔴'
+    color  = 0x2DA44E if strong else 0xCF222E
+    word   = 'relatively STRONG' if strong else 'relatively WEAK'
+    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
+    _post(url, {"embeds": [{
+        "description": (f"{prefix}{icon} **{symbol}** {word} vs {bench}\n"
+                        f"RS **{rs_val:+.2f}%**  ({symbol} {own_pct:+.2f}% · {bench} {bench_pct:+.2f}%)"),
+        "color": color,
+        "footer": {"text": "Jakevolume · Relative Strength"},
+    }]})
+    logger.info("Discord: RS divergence %s %s vs %s", symbol, rs_class, bench)
 
 
 def send_reversal_alert(rev: dict) -> None:
