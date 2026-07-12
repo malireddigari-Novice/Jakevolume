@@ -14,6 +14,20 @@ SYMBOLS: list[str] = [
 
 MAG7: list[str] = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NVDA', 'TSLA']
 
+# ── Benchmarks & relative strength ────────────────────────────────────────────
+# SPY/QQQ are CONTEXT ONLY — tracked for price + relative strength, never traded
+# and never run through the signal detector. MAG7 usually moves with QQQ; the point
+# is to surface names moving relatively strong/weak INDEPENDENT of QQQ.
+BENCHMARKS: list[str] = ['SPY', 'QQQ']
+RELATIVE_STRENGTH_ENABLED = os.getenv('RELATIVE_STRENGTH_ENABLED', 'true').lower() == 'true'
+RS_BENCHMARK              = os.getenv('RS_BENCHMARK', 'QQQ')          # MAG7 measured vs this
+# Raw relative return: RS = stock %change - benchmark %change (percentage points).
+# |RS| at/above the threshold flags a name as relatively strong / weak (a divergence).
+RS_DIVERGENCE_PCT          = float(os.getenv('RS_DIVERGENCE_PCT',          '0.5'))  # morning (pre-mkt drift)
+RS_INTRADAY_DIVERGENCE_PCT = float(os.getenv('RS_INTRADAY_DIVERGENCE_PCT', '0.4'))  # intraday (since open)
+# Intraday: post a Discord note the first time a name crosses into a hard divergence.
+RS_INTRADAY_DISCORD_ALERT  = os.getenv('RS_INTRADAY_DISCORD_ALERT', 'false').lower() == 'true'
+
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
 
