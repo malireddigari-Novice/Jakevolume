@@ -448,7 +448,7 @@ REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) #
 #   Price:   the underlying must confirm — VWAP loss for a call position, VWAP reclaim for
 #            a put position (price moving against the held side).
 REVERSAL_PREMIUM_CONFIRM_ENABLED = os.getenv('REVERSAL_PREMIUM_CONFIRM_ENABLED', 'true').lower() == 'true'
-REVERSAL_PREMIUM_EXPANSION_PCT   = float(os.getenv('REVERSAL_PREMIUM_EXPANSION_PCT', '0.15'))  # +15% from streak low
+REVERSAL_PREMIUM_EXPANSION_PCT   = float(os.getenv('REVERSAL_PREMIUM_EXPANSION_PCT', '0.05'))  # +5% from streak low (tuned: blocks all penny flips at 0% expansion, keeps AMZN +6%)
 REVERSAL_PRICE_CONFIRM_ENABLED   = os.getenv('REVERSAL_PRICE_CONFIRM_ENABLED', 'true').lower() == 'true'
 
 # Step 10: Target room thresholds (nearest opposing level distance from spot)
