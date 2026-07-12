@@ -455,6 +455,20 @@ def _session_pct(session_bars: list, live_spot=None):
     return rs.pct_change(cur, ref), cur
 
 
+def _session_vwap(bars: list):
+    """Volume-weighted average price over the session bars (typical price × volume), or None."""
+    num = den = 0.0
+    for b in bars or []:
+        v = b.get('volume') or 0
+        c = b.get('close')
+        if c is None or v <= 0:
+            continue
+        tp = (b.get('high', c) + b.get('low', c) + c) / 3.0
+        num += tp * v
+        den += v
+    return round(num / den, 4) if den > 0 else None
+
+
 def _qqq_intraday_context(dbc, data_src):
     """QQQ (RS_BENCHMARK) % change since the session open + current spot; None if off/unavailable."""
     if not config.RELATIVE_STRENGTH_ENABLED:
@@ -1242,13 +1256,23 @@ def check_exits(
                     'mark': q.get('mark'),
                 }
                 (same_events if ot == pos_type else opp_events).append(item)
-            rev = _reversal_engine.evaluate(symbol, pos_type, same_events, opp_events, now)
+            # V2 price confirmation: the underlying must validate the control shift —
+            # a call position needs VWAP LOSS (price below VWAP), a put position needs
+            # VWAP RECLAIM (price above VWAP). Only computed when the layer is on.
+            price_confirmed = None
+            if config.REVERSAL_PRICE_CONFIRM_ENABLED and bars:
+                vwap = _session_vwap(bars)
+                if vwap:
+                    price_confirmed = ((underlying_price < vwap) if pos_type == 'CALL'
+                                       else (underlying_price > vwap))
+            rev = _reversal_engine.evaluate(symbol, pos_type, same_events, opp_events, now,
+                                            price_confirmed=price_confirmed)
             if rev['state'] != 'ACTIVE':
                 logger.info("REVERSAL %-17s %s  same_lead=%.2f opp_lead=%.2f diff=%.2f "
-                            "fading=%s streak=%d window=%s",
+                            "fading=%s streak=%d window=%s prem=%s price=%s",
                             rev['state'], occ, rev['same_leadership'], rev['opp_leadership'],
                             rev['leadership_diff'], rev['same_fading'], rev['opp_streak'],
-                            rev['window_ok'])
+                            rev['window_ok'], rev['premium_confirmed'], rev['price_confirmed'])
             if rev['reversal_confirmed']:
                 _handle_reversal(trade, occ, symbol, underlying_price, rev,
                                  alpaca, now, sheets, option_quotes)

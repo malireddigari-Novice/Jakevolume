@@ -440,6 +440,16 @@ REVERSAL_DOMINANT_BURST = float(os.getenv('REVERSAL_DOMINANT_BURST', '5.0'))
 REVERSAL_DOMINANT_SHARE = float(os.getenv('REVERSAL_DOMINANT_SHARE', '0.60'))
 REVERSAL_LEADERSHIP_MIN = float(os.getenv('REVERSAL_LEADERSHIP_MIN', '0.75'))  # opp leadership floor
 REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) # opp - same
+# V2 control-exit confirmation layers (§ ownership change). These bind the reversal-
+# confirmed exit ONLY when FLOW_REVERSAL_ENABLED is on, and are the fix for why the
+# engine flipped into penny options: flow alone declared a reversal with nothing checking
+# that the taking-control side's PREMIUM was actually expanding or that PRICE validated it.
+#   Premium: the opposite (taking-control) side's premium must expand during the takeover.
+#   Price:   the underlying must confirm — VWAP loss for a call position, VWAP reclaim for
+#            a put position (price moving against the held side).
+REVERSAL_PREMIUM_CONFIRM_ENABLED = os.getenv('REVERSAL_PREMIUM_CONFIRM_ENABLED', 'true').lower() == 'true'
+REVERSAL_PREMIUM_EXPANSION_PCT   = float(os.getenv('REVERSAL_PREMIUM_EXPANSION_PCT', '0.15'))  # +15% from streak low
+REVERSAL_PRICE_CONFIRM_ENABLED   = os.getenv('REVERSAL_PRICE_CONFIRM_ENABLED', 'true').lower() == 'true'
 
 # Step 10: Target room thresholds (nearest opposing level distance from spot)
 TARGET_ROOM_HIGH = float(os.getenv('TARGET_ROOM_HIGH', '0.0075'))  # score 1.00 (≥0.75%)
