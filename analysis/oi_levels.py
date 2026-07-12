@@ -26,6 +26,27 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def atm_0dte(chain: dict, underlying_price: float) -> dict:
+    """
+    Capture the AT-THE-MONEY call and put for the front (0DTE) expiry — strike + premium
+    (bid/ask/mark) on BOTH sides. Deliberately NOT OI-based (0DTE OI is near-zero and
+    useless); the ATM contract is chosen purely by proximity to spot.
+
+    Returns {'expiry', 'call': {strike,bid,ask,mark}, 'put': {...}} — call/put may be None
+    if that side has no quotes.
+    """
+    def _nearest(contracts):
+        cs = [c for c in (contracts or []) if c.get('strike') is not None]
+        if not cs:
+            return None
+        c = min(cs, key=lambda x: abs(float(x['strike']) - underlying_price))
+        return {'strike': float(c['strike']), 'bid': c.get('bid'),
+                'ask': c.get('ask'), 'mark': c.get('mark')}
+    return {'expiry': chain.get('expiry'),
+            'call': _nearest(chain.get('calls')),
+            'put':  _nearest(chain.get('puts'))}
+
+
 def compute_oi_levels(
     chain: dict,
     underlying_price: float,

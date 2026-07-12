@@ -27,7 +27,7 @@ from typing import Optional
 import config
 import db.ops as db
 import single_instance
-from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot, compute_secondary_watchlist
+from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot, compute_secondary_watchlist, atm_0dte
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector, compute_exit_targets
@@ -222,6 +222,15 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
             # Sentiment (pre-market drift + put/call OI ratio)
             sentiment = compute_sentiment(chain, pm_price, prev_close)
             sentiment['levels'] = levels   # carried into _print_mag7_briefing
+
+            # ATM 0DTE capture — both sides, premium only (NOT OI). Persist + brief.
+            try:
+                atm = atm_0dte(chain, pm_price)
+                sentiment['atm_0dte'] = atm
+                db.save_atm_0dte(symbol, today, now, pm_price, atm)
+            except Exception:
+                logger.warning("%s: ATM 0DTE capture failed", symbol, exc_info=True)
+
             sentiments.append(sentiment)
 
             # ── Persist to Postgres ──

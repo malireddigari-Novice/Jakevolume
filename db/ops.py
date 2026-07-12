@@ -1111,6 +1111,38 @@ def save_volume_leadership(
         _put(conn)
 
 
+def save_atm_0dte(symbol: str, snap_date: date, snap_time, spot, atm: dict) -> None:
+    """Upsert the morning ATM 0DTE call+put capture (premium only, no OI). No-op if empty."""
+    if not atm:
+        return
+    call = atm.get('call') or {}
+    put  = atm.get('put') or {}
+    sql = """
+        INSERT INTO atm_0dte_snapshots
+            (symbol, snap_date, snap_time, expiry, spot,
+             call_strike, call_bid, call_ask, call_mark,
+             put_strike,  put_bid,  put_ask,  put_mark)
+        VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s)
+        ON CONFLICT (symbol, snap_date) DO UPDATE SET
+            snap_time = EXCLUDED.snap_time, expiry = EXCLUDED.expiry, spot = EXCLUDED.spot,
+            call_strike = EXCLUDED.call_strike, call_bid = EXCLUDED.call_bid,
+            call_ask = EXCLUDED.call_ask, call_mark = EXCLUDED.call_mark,
+            put_strike = EXCLUDED.put_strike, put_bid = EXCLUDED.put_bid,
+            put_ask = EXCLUDED.put_ask, put_mark = EXCLUDED.put_mark
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                symbol, snap_date, snap_time, atm.get('expiry'), spot,
+                call.get('strike'), call.get('bid'), call.get('ask'), call.get('mark'),
+                put.get('strike'),  put.get('bid'),  put.get('ask'),  put.get('mark'),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_relative_strength(rows: list, *, scope: str, bench_symbol: str,
                            bench_pct, bench_spot, session_date: date, ts) -> None:
     """Bulk-insert relative-strength rows (MORNING or INTRADAY). `rows` are

@@ -306,6 +306,21 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
         cls  = s.get('rs_class', 'IN_LINE')
         icon = '🟢' if cls == 'RELATIVELY_STRONG' else '🔴' if cls == 'RELATIVELY_WEAK' else '·'
         desc += f"\n**vs QQQ:** {icon} {rs_val:+.2f}% ({s.get('rs_tag', 'in-line')})"
+
+    # ATM 0DTE straddle (both sides, premium only — no OI).
+    atm = s.get('atm_0dte')
+    if atm:
+        def _leg(side, suffix):
+            d = atm.get(side)
+            if not d or d.get('strike') is None:
+                return None
+            px = d.get('mark')
+            if px is None and d.get('bid') is not None and d.get('ask') is not None:
+                px = (d['bid'] + d['ask']) / 2
+            return f"{_fmt_level(d['strike'])}{suffix} " + (f"${px:.2f}" if px is not None else "n/a")
+        legs = [x for x in (_leg('call', 'C'), _leg('put', 'P')) if x]
+        if legs:
+            desc += f"\n**ATM 0DTE:** " + "  ·  ".join(legs)
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),
