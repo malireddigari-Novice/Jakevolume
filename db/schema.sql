@@ -624,6 +624,42 @@ CREATE TABLE IF NOT EXISTS relative_strength (
 CREATE INDEX IF NOT EXISTS idx_rs_symbol_date ON relative_strength (symbol, session_date);
 CREATE INDEX IF NOT EXISTS idx_rs_scope_date  ON relative_strength (scope, session_date);
 
+-- ── ATM 0DTE capture (both sides, premium only — NOT OI) ──────────────────────
+-- The at-the-money call + put for the front (0DTE) expiry at the morning snapshot,
+-- chosen by proximity to spot (0DTE OI is near-zero and useless). Strike + bid/ask/mark.
+CREATE TABLE IF NOT EXISTS atm_0dte_snapshots (
+    id           BIGSERIAL   PRIMARY KEY,
+    symbol       VARCHAR(10) NOT NULL,
+    snap_date    DATE        NOT NULL,
+    snap_time    TIMESTAMPTZ NOT NULL,
+    expiry       DATE,
+    spot         NUMERIC(12,4),
+    call_strike  NUMERIC(12,4),
+    call_bid     NUMERIC(12,4),
+    call_ask     NUMERIC(12,4),
+    call_mark    NUMERIC(12,4),
+    put_strike   NUMERIC(12,4),
+    put_bid      NUMERIC(12,4),
+    put_ask      NUMERIC(12,4),
+    put_mark     NUMERIC(12,4),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, snap_date)
+);
+CREATE INDEX IF NOT EXISTS idx_atm0dte_date ON atm_0dte_snapshots (symbol, snap_date);
+-- OI for the ATM strikes + the next 1-OTM strike on each side (317.5C / 312.5P style).
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_oi         BIGINT;
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_oi          BIGINT;
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_otm_strike NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_otm_bid    NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_otm_ask    NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_otm_mark   NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS call_otm_oi     BIGINT;
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_strike  NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_bid     NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_ask     NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_mark    NUMERIC(12,4);
+ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_oi      BIGINT;
+
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.

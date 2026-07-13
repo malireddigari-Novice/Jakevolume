@@ -27,7 +27,7 @@ from typing import Optional
 import config
 import db.ops as db
 import single_instance
-from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot, compute_secondary_watchlist
+from analysis.oi_levels import compute_oi_levels, get_top_oi_snapshot, compute_secondary_watchlist, atm_0dte
 from analysis.positioning_monitor import PositioningMonitor
 from analysis.sentiment import compute_sentiment
 from analysis.signal_detector import SignalDetector, compute_exit_targets
@@ -38,6 +38,7 @@ from analysis.volume_analytics import compute_leadership_scores
 from analysis.open_positions import collect_open_positions
 from analysis import gold_mode
 from analysis import relative_strength as rs
+from analysis import chandelier
 from analysis.intent_gate import IntentGate
 from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
@@ -221,6 +222,15 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
             # Sentiment (pre-market drift + put/call OI ratio)
             sentiment = compute_sentiment(chain, pm_price, prev_close)
             sentiment['levels'] = levels   # carried into _print_mag7_briefing
+
+            # ATM 0DTE capture — both sides, premium only (NOT OI). Persist + brief.
+            try:
+                atm = atm_0dte(chain, pm_price)
+                sentiment['atm_0dte'] = atm
+                db.save_atm_0dte(symbol, today, now, pm_price, atm)
+            except Exception:
+                logger.warning("%s: ATM 0DTE capture failed", symbol, exc_info=True)
+
             sentiments.append(sentiment)
 
             # ── Persist to Postgres ──
@@ -452,6 +462,20 @@ def _session_pct(session_bars: list, live_spot=None):
     ref = session_bars[0].get('close')
     cur = live_spot if live_spot is not None else session_bars[-1].get('close')
     return rs.pct_change(cur, ref), cur
+
+
+def _session_vwap(bars: list):
+    """Volume-weighted average price over the session bars (typical price × volume), or None."""
+    num = den = 0.0
+    for b in bars or []:
+        v = b.get('volume') or 0
+        c = b.get('close')
+        if c is None or v <= 0:
+            continue
+        tp = (b.get('high', c) + b.get('low', c) + c) / 3.0
+        num += tp * v
+        den += v
+    return round(num / den, 4) if den > 0 else None
 
 
 def _qqq_intraday_context(dbc, data_src):
@@ -718,7 +742,8 @@ def intraday_check(
 
             # Exit monitoring — check R1/R2 or S1/S2 targets for open trades
             if alpaca and config.ALPACA_ENABLED:
-                check_exits(symbol, underlying_price, alpaca, now_cst(), sheets, option_quotes, detector)
+                check_exits(symbol, underlying_price, alpaca, now_cst(), sheets, option_quotes, detector,
+                            bars=session_bars)
 
             # Volume cluster positioning monitor (Postgres only, no signals)
             if dbc:
@@ -1198,6 +1223,7 @@ def check_exits(
     sheets: SheetsLogger,
     option_quotes: dict,
     detector: SignalDetector,
+    bars: Optional[list] = None,
 ) -> None:
     """
     For every open trade on this symbol:
@@ -1239,13 +1265,23 @@ def check_exits(
                     'mark': q.get('mark'),
                 }
                 (same_events if ot == pos_type else opp_events).append(item)
-            rev = _reversal_engine.evaluate(symbol, pos_type, same_events, opp_events, now)
+            # V2 price confirmation: the underlying must validate the control shift —
+            # a call position needs VWAP LOSS (price below VWAP), a put position needs
+            # VWAP RECLAIM (price above VWAP). Only computed when the layer is on.
+            price_confirmed = None
+            if config.REVERSAL_PRICE_CONFIRM_ENABLED and bars:
+                vwap = _session_vwap(bars)
+                if vwap:
+                    price_confirmed = ((underlying_price < vwap) if pos_type == 'CALL'
+                                       else (underlying_price > vwap))
+            rev = _reversal_engine.evaluate(symbol, pos_type, same_events, opp_events, now,
+                                            price_confirmed=price_confirmed)
             if rev['state'] != 'ACTIVE':
                 logger.info("REVERSAL %-17s %s  same_lead=%.2f opp_lead=%.2f diff=%.2f "
-                            "fading=%s streak=%d window=%s",
+                            "fading=%s streak=%d window=%s prem=%s price=%s",
                             rev['state'], occ, rev['same_leadership'], rev['opp_leadership'],
                             rev['leadership_diff'], rev['same_fading'], rev['opp_streak'],
-                            rev['window_ok'])
+                            rev['window_ok'], rev['premium_confirmed'], rev['price_confirmed'])
             if rev['reversal_confirmed']:
                 _handle_reversal(trade, occ, symbol, underlying_price, rev,
                                  alpaca, now, sheets, option_quotes)
@@ -1342,10 +1378,34 @@ def check_exits(
             target1  = float(trade['exit1_underlying']) if trade.get('exit1_underlying') else 0.0
             r2_label = 'R2' if sig_type == 'BULLISH' else 'S2'
 
-            price_hit = (
+            level_hit = (
                 (sig_type == 'BULLISH' and underlying_price >= target2) or
                 (sig_type == 'BEARISH' and underlying_price <= target2)
             )
+
+            # ── Chandelier trail on the runner (trail the runner) ──────────────
+            # When enabled, the chandelier stop on the underlying REPLACES the fixed
+            # Exit2 level once its ATR is ready — the runner rides the trend and stops
+            # out on a reversal. Until the ATR is ready (need ~ATR_PERIOD+1 bars since
+            # entry) the fixed level target still applies as a fallback.
+            chand = None
+            if config.CHANDELIER_EXIT_ENABLED and bars and trade.get('created_at'):
+                since = [b for b in bars if b.get('bar_time')
+                         and b['bar_time'] >= trade['created_at']] or bars
+                chand = chandelier.evaluate(
+                    sig_type, underlying_price, since,
+                    period=config.CHANDELIER_ATR_PERIOD, mult=config.CHANDELIER_ATR_MULT)
+            if chand and chand['ready']:
+                price_hit  = bool(chand['exit'])
+                exit_kind  = 'chandelier'
+                exit_label = f"trail ${chand['stop']:.2f}"
+                if not price_hit:
+                    logger.debug("Chandelier hold %s runner  spot=%.2f  stop=%.2f  atr=%.3f",
+                                 occ, underlying_price, chand['stop'], chand['atr'])
+            else:
+                price_hit  = level_hit
+                exit_kind  = 'price'
+                exit_label = r2_label
 
             # Still watching opposite side at exit1 level each bar
             opp_valid = False
@@ -1355,16 +1415,17 @@ def check_exits(
                 )
 
             if price_hit or opp_valid:
-                trigger_reason = 'price' if price_hit else 'opp-side'
+                trigger_reason = exit_kind if price_hit else 'opp-side'
+                stop_disp = (chand['stop'] if exit_kind == 'chandelier' and chand else target2)
                 logger.info(
-                    "Exit2 triggered (%s)  %s  spot=%.2f  target=%.2f  qty=%d",
-                    trigger_reason, occ, underlying_price, target2, trade['exit2_qty'],
+                    "Exit2 triggered (%s)  %s  spot=%.2f  level=%.2f  qty=%d",
+                    trigger_reason, occ, underlying_price, stop_disp, trade['exit2_qty'],
                 )
                 order = alpaca.close_position_qty(occ, trade['exit2_qty'])
                 if order:
                     db.mark_exit2_filled(trade['id'], now)
                     suffix = ' (opp-side early)' if opp_valid and not price_hit else ''
-                    label  = f"Exit 2/2 @ {r2_label}{suffix}"
+                    label  = f"Exit 2/2 @ {exit_label}{suffix}"
                     sheets.log_trade_exit(order, dict(trade), label, underlying_price)
                     if opp_valid and config.FLIP_ENABLED:
                         logger.info(

@@ -1,10 +1,18 @@
-"""Unit checks for the Flow Leadership Reversal Engine (V1)."""
+"""Unit checks for the Flow Leadership Reversal Engine + V2 confirmation layers.
+
+The reversal-confirmed exit now also requires (both default-on):
+  - PREMIUM confirmation: the taking-control side's premium expands during the takeover
+    (>= REVERSAL_PREMIUM_EXPANSION_PCT off the streak low — so it needs >=2 opp polls).
+  - PRICE confirmation: the caller's price verdict (VWAP loss/reclaim) is True.
+"""
+import sys
 from datetime import datetime, timedelta
+sys.path.insert(0, r"C:\Users\malir\Projects\Python\Jakevolume")
 from analysis.flow_reversal import volume_event, FlowReversalEngine
 
-QUIET = [5] * 20                                  # flat low background -> no event
-BURST = [5] * 15 + [200, 220, 210, 230, 240]      # quiet then a 5-bar burst -> valid event
-PERSIST = [100] * 20                              # broad persistent flow -> rejected
+QUIET = [5] * 20
+BURST = [5] * 15 + [200, 220, 210, 230, 240]
+PERSIST = [100] * 20
 
 # 1) Concentrated burst is a valid event.
 ev = volume_event(BURST)
@@ -14,39 +22,60 @@ print(f"PASS  burst event valid (burst={ev['burst']} share={ev['share']} active=
 # 2) Quiet background -> not a valid event.
 ev = volume_event(QUIET)
 assert ev and not ev['valid'], ev
-print(f"PASS  quiet background -> not valid (burst={ev['burst']} share={ev['share']})")
+print("PASS  quiet background -> not valid")
 
-# 3) Persistent broad flow -> rejected even though volume is high.
+# 3) Persistent broad flow -> rejected.
 ev = volume_event(PERSIST)
 assert ev and ev['persistent_bg'] and not ev['valid'], ev
-print(f"PASS  persistent background -> rejected (active_bg={ev['active_bg']} share={ev['share']})")
+print("PASS  persistent background -> rejected")
 
-# 4) Full PUT->CALL reversal scenario.
-eng = FlowReversalEngine()
 t0 = datetime(2026, 6, 12, 12, 0)
-def items(hist, low_dist):
-    return [{'strike': 100.0, 'ev': volume_event(hist), 'low_dist': low_dist, 'mark': 1.0},
-            {'strike': 102.5, 'ev': volume_event(hist), 'low_dist': low_dist, 'mark': 0.9}]
+def items(hist, low_dist, mark):
+    return [{'strike': 100.0, 'ev': volume_event(hist), 'low_dist': low_dist, 'mark': mark},
+            {'strike': 102.5, 'ev': volume_event(hist), 'low_dist': low_dist, 'mark': mark - 0.1}]
 
-# t0: PUT (position side) has the burst; CALL (opp) quiet -> ACTIVE, seeds same peak.
-r = eng.evaluate('TSLA', 'PUT', same_events=items(BURST, 1.2), opp_events=items(QUIET, 3.0), now=t0)
+# 4) PUT->CALL reversal that CONFIRMS: same fades, opp leads with EXPANDING premium and
+#    price confirmation. Needs >=2 opp polls for premium expansion to register.
+eng = FlowReversalEngine()
+r = eng.evaluate('TSLA', 'PUT', items(BURST, 1.2, 1.0), items(QUIET, 3.0, 0.5), now=t0)
 assert r['state'] == 'ACTIVE' and not r['reversal_confirmed'], r
-print(f"PASS  t0: PUT active, no reversal (state={r['state']})")
+# opp first appears (premium baseline set) — not yet confirmed (no expansion on poll 1)
+r = eng.evaluate('TSLA', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.00),
+                 now=t0 + timedelta(minutes=11), price_confirmed=True)
+assert not r['reversal_confirmed'] and not r['premium_confirmed'], r
+# opp premium expands +20% off the baseline, price confirms -> CONFIRMED
+r = eng.evaluate('TSLA', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.20),
+                 now=t0 + timedelta(minutes=12), price_confirmed=True)
+assert r['reversal_confirmed'] and r['premium_confirmed'] and r['price_confirmed'], r
+print(f"PASS  reversal CONFIRMED with premium expansion + price (opp_lead={r['opp_leadership']} "
+      f"prem={r['premium_confirmed']} price={r['price_confirmed']})")
 
-# t0+11m: PUT now quiet (faded), CALL produces a dominant near-low burst across 2 strikes.
-r = eng.evaluate('TSLA', 'PUT', same_events=items(QUIET, 3.0), opp_events=items(BURST, 1.2),
-                 now=t0 + timedelta(minutes=11))
-assert r['reversal_confirmed'], r
-assert r['opp_type'] == 'CALL' and r['same_fading'] and r['opp_leadership'] >= 0.75, r
-print(f"PASS  t0+11: CALL reversal CONFIRMED (opp_lead={r['opp_leadership']} "
-      f"same_lead={r['same_leadership']} diff={r['leadership_diff']} fading={r['same_fading']})")
-
-# 5) Mirror: a quiet opposite side does NOT trigger a reversal.
+# 5) Same takeover but premium does NOT expand (opp mark flat) -> BLOCKED.
 eng2 = FlowReversalEngine()
-eng2.evaluate('AAPL', 'CALL', same_events=items(BURST, 1.2), opp_events=items(QUIET, 3.0), now=t0)
-r = eng2.evaluate('AAPL', 'CALL', same_events=items(QUIET, 3.0), opp_events=items(QUIET, 3.0),
-                  now=t0 + timedelta(minutes=11))
-assert not r['reversal_confirmed'], r
-print(f"PASS  quiet opposite side -> no reversal (state={r['state']})")
+eng2.evaluate('AAPL', 'PUT', items(BURST, 1.2, 1.0), items(QUIET, 3.0, 0.5), now=t0)
+eng2.evaluate('AAPL', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.00),
+              now=t0 + timedelta(minutes=11), price_confirmed=True)
+r = eng2.evaluate('AAPL', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.00),
+                  now=t0 + timedelta(minutes=12), price_confirmed=True)
+assert not r['reversal_confirmed'] and not r['premium_confirmed'], r
+print("PASS  premium NOT expanding -> reversal blocked")
 
-print("\nAll flow-reversal unit checks passed.")
+# 6) Premium expands but PRICE does not confirm (price_confirmed=False) -> BLOCKED.
+eng3 = FlowReversalEngine()
+eng3.evaluate('NVDA', 'PUT', items(BURST, 1.2, 1.0), items(QUIET, 3.0, 0.5), now=t0)
+eng3.evaluate('NVDA', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.00),
+              now=t0 + timedelta(minutes=11), price_confirmed=False)
+r = eng3.evaluate('NVDA', 'PUT', items(QUIET, 3.0, 0.5), items(BURST, 1.2, 1.20),
+                  now=t0 + timedelta(minutes=12), price_confirmed=False)
+assert not r['reversal_confirmed'] and r['premium_confirmed'] and not r['price_confirmed'], r
+print("PASS  price NOT confirming -> reversal blocked")
+
+# 7) Quiet opposite side -> never reverses.
+eng4 = FlowReversalEngine()
+eng4.evaluate('MSFT', 'CALL', items(BURST, 1.2, 1.0), items(QUIET, 3.0, 0.5), now=t0)
+r = eng4.evaluate('MSFT', 'CALL', items(QUIET, 3.0, 0.5), items(QUIET, 3.0, 0.5),
+                  now=t0 + timedelta(minutes=11), price_confirmed=True)
+assert not r['reversal_confirmed'], r
+print("PASS  quiet opposite side -> no reversal")
+
+print("\nAll flow-reversal + V2 confirmation checks passed.")

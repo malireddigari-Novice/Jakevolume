@@ -393,6 +393,17 @@ OPENING_RANGE_EXCITATION_MIN = float(os.getenv('OPENING_RANGE_EXCITATION_MIN', '
 # shift, drop any target still within EXIT_MIN_ROOM_PCT of the entry spot.
 EXIT_MIN_ROOM_PCT = float(os.getenv('EXIT_MIN_ROOM_PCT', '0.0025'))   # 0.25%
 
+# ── Chandelier trailing exit (trail the runner) ───────────────────────────────
+# After Exit1 banks the first half at level 1, the remaining half is trailed with a
+# chandelier stop on the UNDERLYING instead of the fixed Exit2 level: the trail sits
+# ATR*mult below the highest high since entry (mirror for puts) and ratchets up (never
+# loosens); the runner stops out when the underlying reverses through it. Lets winners
+# run into the fat tail while protecting the open gain. Default OFF — validate on the
+# counterfactual replay before enabling.
+CHANDELIER_EXIT_ENABLED = os.getenv('CHANDELIER_EXIT_ENABLED', 'false').lower() == 'true'
+CHANDELIER_ATR_PERIOD   = int(os.getenv('CHANDELIER_ATR_PERIOD', '14'))   # 1-min bars
+CHANDELIER_ATR_MULT     = float(os.getenv('CHANDELIER_ATR_MULT', '3.0'))  # classic 3x ATR
+
 # ClusterStrength minimum thresholds by level rank (enforced gate, not informational)
 CS_THRESHOLD_RANK1 = float(os.getenv('CS_THRESHOLD_RANK1', '0.80'))  # S1/R1
 CS_THRESHOLD_RANK2 = float(os.getenv('CS_THRESHOLD_RANK2', '0.70'))  # S2/R2
@@ -429,6 +440,16 @@ REVERSAL_DOMINANT_BURST = float(os.getenv('REVERSAL_DOMINANT_BURST', '5.0'))
 REVERSAL_DOMINANT_SHARE = float(os.getenv('REVERSAL_DOMINANT_SHARE', '0.60'))
 REVERSAL_LEADERSHIP_MIN = float(os.getenv('REVERSAL_LEADERSHIP_MIN', '0.75'))  # opp leadership floor
 REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) # opp - same
+# V2 control-exit confirmation layers (§ ownership change). These bind the reversal-
+# confirmed exit ONLY when FLOW_REVERSAL_ENABLED is on, and are the fix for why the
+# engine flipped into penny options: flow alone declared a reversal with nothing checking
+# that the taking-control side's PREMIUM was actually expanding or that PRICE validated it.
+#   Premium: the opposite (taking-control) side's premium must expand during the takeover.
+#   Price:   the underlying must confirm — VWAP loss for a call position, VWAP reclaim for
+#            a put position (price moving against the held side).
+REVERSAL_PREMIUM_CONFIRM_ENABLED = os.getenv('REVERSAL_PREMIUM_CONFIRM_ENABLED', 'true').lower() == 'true'
+REVERSAL_PREMIUM_EXPANSION_PCT   = float(os.getenv('REVERSAL_PREMIUM_EXPANSION_PCT', '0.05'))  # +5% from streak low (tuned: blocks all penny flips at 0% expansion, keeps AMZN +6%)
+REVERSAL_PRICE_CONFIRM_ENABLED   = os.getenv('REVERSAL_PRICE_CONFIRM_ENABLED', 'true').lower() == 'true'
 
 # Step 10: Target room thresholds (nearest opposing level distance from spot)
 TARGET_ROOM_HIGH = float(os.getenv('TARGET_ROOM_HIGH', '0.0075'))  # score 1.00 (≥0.75%)

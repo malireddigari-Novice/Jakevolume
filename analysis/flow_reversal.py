@@ -116,16 +116,18 @@ class FlowReversalEngine:
         self._state.pop(symbol, None)
 
     def evaluate(self, symbol: str, pos_type: str, same_events: list,
-                 opp_events: list, now) -> dict:
+                 opp_events: list, now, price_confirmed=None) -> dict:
         """
         pos_type    : 'CALL' or 'PUT' (the open position's option side)
-        same_events : watched contracts on the position side  [{strike, ev, low_dist}]
+        same_events : watched contracts on the position side  [{strike, ev, low_dist, mark}]
         opp_events  : watched contracts on the opposite side
+        price_confirmed : caller's price-confirmation verdict (VWAP loss for a call
+                          position / reclaim for a put). None when the layer is off.
         Returns a dict with state, reversal_confirmed flag, leadership scores, and log fields.
         """
         st = self._state.setdefault(symbol, dict(
             last_same_t=now, same_peak=0.0, last_opp_t=None, opp_streak=0,
-            state=ACTIVE))
+            opp_mark_ref=None, state=ACTIVE))
 
         same = _leadership(same_events)
         opp  = _leadership(opp_events)
@@ -153,6 +155,29 @@ class FlowReversalEngine:
         else:
             st['opp_streak'] = 0
 
+        # ── Premium confirmation (V2): the taking-control (opp) side's premium must
+        # EXPAND during the takeover. Track the streak-low opp mark; require the
+        # current opp mark to have risen off it by REVERSAL_PREMIUM_EXPANSION_PCT.
+        # This blocks flips into stagnant/decaying far-OTM pennies (why the engine
+        # was disabled). Same-side stagnation is already captured by `same_fading`.
+        opp_mark = opp_best.get('mark') if opp_best else None
+        if st['opp_streak'] == 0:
+            st['opp_mark_ref'] = None                       # streak broke → forget reference
+        elif opp_mark and opp_mark > 0:
+            st['opp_mark_ref'] = (opp_mark if st.get('opp_mark_ref') is None
+                                  else min(st['opp_mark_ref'], opp_mark))
+        premium_confirmed = True
+        if config.REVERSAL_PREMIUM_CONFIRM_ENABLED:
+            ref = st.get('opp_mark_ref')
+            premium_confirmed = bool(opp_mark and ref
+                                     and opp_mark >= ref * (1 + config.REVERSAL_PREMIUM_EXPANSION_PCT))
+
+        # ── Price confirmation (V2): the underlying must validate the shift (caller
+        # passes VWAP-loss for a call position / VWAP-reclaim for a put position). ──
+        price_ok = True
+        if config.REVERSAL_PRICE_CONFIRM_ENABLED:
+            price_ok = bool(price_confirmed)
+
         # transition window (§11): opp & same events within REVERSAL_WINDOW_MIN
         window_ok = (st['last_opp_t'] is not None and st['last_same_t'] is not None
                      and abs((st['last_opp_t'] - st['last_same_t']).total_seconds())
@@ -174,7 +199,8 @@ class FlowReversalEngine:
 
         watch = opp_valid and same_fading and not (opp_best and opp_best['ev']['persistent_bg'])
         confirmed = bool(watch and leadership_change and window_ok
-                         and confirmation and no_stronger_same)
+                         and confirmation and no_stronger_same
+                         and premium_confirmed and price_ok)
 
         st['state'] = (REVERSAL_CONFIRMED if confirmed else
                        REVERSAL_WATCH if watch else ACTIVE)
@@ -189,4 +215,6 @@ class FlowReversalEngine:
             'opp_valid': opp_valid, 'opp_streak': st['opp_streak'],
             'window_ok': window_ok, 'confirmation': confirmation, 'dominant': dominant,
             'opp_best': opp_best, 'same_now_vol': same_now_vol, 'opp_vol': opp_vol,
+            'premium_confirmed': premium_confirmed, 'price_confirmed': bool(price_confirmed),
+            'opp_mark_ref': st.get('opp_mark_ref'),
         }

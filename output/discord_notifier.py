@@ -306,6 +306,25 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
         cls  = s.get('rs_class', 'IN_LINE')
         icon = '🟢' if cls == 'RELATIVELY_STRONG' else '🔴' if cls == 'RELATIVELY_WEAK' else '·'
         desc += f"\n**vs QQQ:** {icon} {rs_val:+.2f}% ({s.get('rs_tag', 'in-line')})"
+
+    # ATM 0DTE window (ATM + 1-OTM per side): strike, premium, and OI.
+    atm = s.get('atm_0dte')
+    if atm:
+        def _leg(d, suffix):
+            if not d or d.get('strike') is None:
+                return None
+            px = d.get('mark')
+            if px is None and d.get('bid') is not None and d.get('ask') is not None:
+                px = (d['bid'] + d['ask']) / 2
+            oi = d.get('open_interest')
+            oi_s = f" · {int(oi):,} OI" if oi is not None else ""
+            return f"{_fmt_level(d['strike'])}{suffix} " + (f"${px:.2f}" if px is not None else "n/a") + oi_s
+        calls = [x for x in (_leg(c, 'C') for c in (atm.get('call') or [])) if x]
+        puts  = [x for x in (_leg(p, 'P') for p in (atm.get('put') or [])) if x]
+        if calls:
+            desc += "\n**ATM 0DTE C:** " + "  ·  ".join(calls)
+        if puts:
+            desc += "\n**ATM 0DTE P:** " + "  ·  ".join(puts)
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),
