@@ -1112,31 +1112,45 @@ def save_volume_leadership(
 
 
 def save_atm_0dte(symbol: str, snap_date: date, snap_time, spot, atm: dict) -> None:
-    """Upsert the morning ATM 0DTE call+put capture (premium only, no OI). No-op if empty."""
+    """Upsert the morning ATM 0DTE window (ATM + 1-OTM per side) — premium + OI. No-op if empty."""
     if not atm:
         return
-    call = atm.get('call') or {}
-    put  = atm.get('put') or {}
+    calls = atm.get('call') or []
+    puts  = atm.get('put') or []
+    c0 = calls[0] if len(calls) > 0 else {}      # ATM call
+    c1 = calls[1] if len(calls) > 1 else {}      # 1-OTM call
+    p0 = puts[0]  if len(puts)  > 0 else {}       # ATM put
+    p1 = puts[1]  if len(puts)  > 1 else {}       # 1-OTM put
     sql = """
         INSERT INTO atm_0dte_snapshots
             (symbol, snap_date, snap_time, expiry, spot,
-             call_strike, call_bid, call_ask, call_mark,
-             put_strike,  put_bid,  put_ask,  put_mark)
-        VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s)
+             call_strike, call_bid, call_ask, call_mark, call_oi,
+             put_strike,  put_bid,  put_ask,  put_mark,  put_oi,
+             call_otm_strike, call_otm_bid, call_otm_ask, call_otm_mark, call_otm_oi,
+             put_otm_strike,  put_otm_bid,  put_otm_ask,  put_otm_mark,  put_otm_oi)
+        VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s)
         ON CONFLICT (symbol, snap_date) DO UPDATE SET
             snap_time = EXCLUDED.snap_time, expiry = EXCLUDED.expiry, spot = EXCLUDED.spot,
             call_strike = EXCLUDED.call_strike, call_bid = EXCLUDED.call_bid,
-            call_ask = EXCLUDED.call_ask, call_mark = EXCLUDED.call_mark,
+            call_ask = EXCLUDED.call_ask, call_mark = EXCLUDED.call_mark, call_oi = EXCLUDED.call_oi,
             put_strike = EXCLUDED.put_strike, put_bid = EXCLUDED.put_bid,
-            put_ask = EXCLUDED.put_ask, put_mark = EXCLUDED.put_mark
+            put_ask = EXCLUDED.put_ask, put_mark = EXCLUDED.put_mark, put_oi = EXCLUDED.put_oi,
+            call_otm_strike = EXCLUDED.call_otm_strike, call_otm_bid = EXCLUDED.call_otm_bid,
+            call_otm_ask = EXCLUDED.call_otm_ask, call_otm_mark = EXCLUDED.call_otm_mark,
+            call_otm_oi = EXCLUDED.call_otm_oi,
+            put_otm_strike = EXCLUDED.put_otm_strike, put_otm_bid = EXCLUDED.put_otm_bid,
+            put_otm_ask = EXCLUDED.put_otm_ask, put_otm_mark = EXCLUDED.put_otm_mark,
+            put_otm_oi = EXCLUDED.put_otm_oi
     """
     conn = _get()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, (
                 symbol, snap_date, snap_time, atm.get('expiry'), spot,
-                call.get('strike'), call.get('bid'), call.get('ask'), call.get('mark'),
-                put.get('strike'),  put.get('bid'),  put.get('ask'),  put.get('mark'),
+                c0.get('strike'), c0.get('bid'), c0.get('ask'), c0.get('mark'), c0.get('open_interest'),
+                p0.get('strike'), p0.get('bid'), p0.get('ask'), p0.get('mark'), p0.get('open_interest'),
+                c1.get('strike'), c1.get('bid'), c1.get('ask'), c1.get('mark'), c1.get('open_interest'),
+                p1.get('strike'), p1.get('bid'), p1.get('ask'), p1.get('mark'), p1.get('open_interest'),
             ))
         conn.commit()
     finally:

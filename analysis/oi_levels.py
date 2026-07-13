@@ -26,25 +26,37 @@ import config
 logger = logging.getLogger(__name__)
 
 
-def atm_0dte(chain: dict, underlying_price: float) -> dict:
+def atm_0dte(chain: dict, underlying_price: float, otm_steps: int = 1) -> dict:
     """
-    Capture the AT-THE-MONEY call and put for the front (0DTE) expiry — strike + premium
-    (bid/ask/mark) on BOTH sides. Deliberately NOT OI-based (0DTE OI is near-zero and
-    useless); the ATM contract is chosen purely by proximity to spot.
+    Capture the front (0DTE) ATM window on BOTH sides — the AT-THE-MONEY strike plus the
+    next `otm_steps` OUT-OF-THE-MONEY strikes (calls above spot, puts below): e.g. at spot
+    ~314 → 315C + 317.5C and 315P + 312.5P. Strike + premium (bid/ask/mark) AND open
+    interest per contract. The ATM is chosen by proximity to spot (not OI).
 
-    Returns {'expiry', 'call': {strike,bid,ask,mark}, 'put': {...}} — call/put may be None
-    if that side has no quotes.
+    Returns {'expiry', 'call': [ATM, OTM1, ...], 'put': [ATM, OTM1, ...]} — ATM first,
+    then progressively-OTM strikes; either list may be empty if that side has no quotes.
     """
-    def _nearest(contracts):
-        cs = [c for c in (contracts or []) if c.get('strike') is not None]
+    def _mk(c):
+        return {'strike': float(c['strike']), 'bid': c.get('bid'), 'ask': c.get('ask'),
+                'mark': c.get('mark'), 'open_interest': c.get('open_interest')}
+
+    def _side(contracts, otm_above: bool):
+        cs = sorted((c for c in (contracts or []) if c.get('strike') is not None),
+                    key=lambda x: float(x['strike']))
         if not cs:
-            return None
-        c = min(cs, key=lambda x: abs(float(x['strike']) - underlying_price))
-        return {'strike': float(c['strike']), 'bid': c.get('bid'),
-                'ask': c.get('ask'), 'mark': c.get('mark')}
+            return []
+        atm_i = min(range(len(cs)), key=lambda i: abs(float(cs[i]['strike']) - underlying_price))
+        step = 1 if otm_above else -1                 # OTM = above for calls, below for puts
+        out = [_mk(cs[atm_i])]
+        i = atm_i + step
+        while len(out) <= otm_steps and 0 <= i < len(cs):
+            out.append(_mk(cs[i]))
+            i += step
+        return out
+
     return {'expiry': chain.get('expiry'),
-            'call': _nearest(chain.get('calls')),
-            'put':  _nearest(chain.get('puts'))}
+            'call': _side(chain.get('calls'), otm_above=True),
+            'put':  _side(chain.get('puts'),  otm_above=False)}
 
 
 def compute_oi_levels(
