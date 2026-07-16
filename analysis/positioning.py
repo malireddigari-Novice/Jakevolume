@@ -82,6 +82,44 @@ def _concentration(fresh: list, spot: float, band_pct: float) -> tuple:
     return round(factor, 3), label, lo, hi
 
 
+def _strike_in_cluster(strike, hm: dict) -> bool:
+    lo, hi = hm.get('cluster_low'), hm.get('cluster_high')
+    if strike is None or lo is None or hi is None:
+        return False
+    return float(lo) - 1e-9 <= float(strike) <= float(hi) + 1e-9
+
+
+def confidence_adjustment(signal_type: str, traded_strike, hm: dict, *,
+                          align_bonus: int = 15, contra_penalty: int = 10) -> dict:
+    """
+    Layer-3 confidence weighting from the morning fresh-OI positioning (NEVER rejects).
+    Compares a live signal's direction (+traded strike) to where institutions placed fresh
+    risk overnight:
+      ALIGNED  — signal side matches the dominant fresh-OI side → +bonus (scaled by the
+                 side's 0-10 score; full when the traded strike sits in the fresh cluster,
+                 60% off-cluster)
+      CONTRA   — signal opposes where fresh OI concentrated → small fixed penalty
+      NEUTRAL  — positioning was balanced
+      NONE     — no fresh positioning
+    Returns {alignment, delta (confidence points), note}.
+    """
+    if not hm or not hm.get('fresh_count'):
+        return {'alignment': 'NONE', 'delta': 0, 'note': 'no fresh positioning'}
+    dom = hm.get('dominant_side')
+    want = 'CALL' if signal_type == 'BULLISH' else 'PUT'
+    if not dom or dom == 'NEUTRAL':
+        return {'alignment': 'NEUTRAL', 'delta': 0, 'note': 'positioning neutral'}
+    if dom == want:
+        score = float(hm.get('bull_score') if want == 'CALL' else hm.get('bear_score') or 0)
+        near = _strike_in_cluster(traded_strike, hm)
+        delta = round(align_bonus * (score / 10.0) * (1.0 if near else 0.6))
+        return {'alignment': 'ALIGNED', 'delta': int(delta),
+                'note': f"aligned {want} {score:.1f}/10" + ("" if near else " (off-cluster)")}
+    other = float(hm.get('bear_score') if want == 'CALL' else hm.get('bull_score') or 0)
+    return {'alignment': 'CONTRA', 'delta': -int(contra_penalty),
+            'note': f"contra: fresh OI favored {dom} {other:.1f}/10"}
+
+
 def heatmap(symbol: str, contracts: list, oi_changes: dict, spot: float, *,
             near_band_pct: float = 0.05, target_notional: float = 500_000.0,
             build_min: int = 250, unwind_min: int = 250,

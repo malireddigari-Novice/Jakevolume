@@ -53,5 +53,17 @@ u_oi = {(300.0, 'CALL'): {'oi_change': -8000}}
 hu = p.heatmap('X', u, u_oi, 300.0)
 ck("unwind captured, no bullish build", hu['fresh_count'] == 0 and len(hu['unwind']) == 1)
 
+# ── 5. Layer-3 confidence hook ──
+# AAPL heat-map h (bull 9.4, dominant CALL, cluster 320-325).
+a_in  = p.confidence_adjustment('BULLISH', 322.5, h, align_bonus=15, contra_penalty=10)
+ck("aligned bullish in-cluster -> ALIGNED + bonus", a_in['alignment'] == 'ALIGNED' and a_in['delta'] > 0)
+a_off = p.confidence_adjustment('BULLISH', 300.0, h, align_bonus=15, contra_penalty=10)
+ck("aligned but off-cluster -> smaller bonus", a_off['alignment'] == 'ALIGNED' and 0 < a_off['delta'] < a_in['delta'])
+a_con = p.confidence_adjustment('BEARISH', 310.0, h, align_bonus=15, contra_penalty=10)
+ck("bearish vs bullish positioning -> CONTRA + penalty", a_con['alignment'] == 'CONTRA' and a_con['delta'] == -10)
+a_none = p.confidence_adjustment('BULLISH', 320.0, {'fresh_count': 0}, align_bonus=15, contra_penalty=10)
+ck("no positioning -> NONE, delta 0", a_none['alignment'] == 'NONE' and a_none['delta'] == 0)
+print(f"     -> in-cluster {a_in['delta']:+d}, off-cluster {a_off['delta']:+d}, contra {a_con['delta']:+d}")
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")
 sys.exit(1 if fails else 0)

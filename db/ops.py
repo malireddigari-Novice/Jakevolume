@@ -1193,6 +1193,27 @@ def save_positioning(symbol: str, snap_date: date, snap_time, hm: dict) -> None:
         _put(conn)
 
 
+def get_positioning(symbol: str, snap_date: date) -> Optional[dict]:
+    """The morning Fresh-OI positioning heat-map for a symbol/day, or None."""
+    sql = """
+        SELECT spot, dominant_side, bull_score, bear_score, net_notional, call_notional,
+               put_notional, concentration, cluster_low, cluster_high, weighted_distance_pct,
+               fresh_count, top_strikes
+        FROM positioning_snapshots WHERE symbol = %s AND snap_date = %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (symbol, snap_date))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        logger.warning("get_positioning failed for %s %s", symbol, snap_date, exc_info=True)
+        return None
+    finally:
+        _put(conn)
+
+
 def save_relative_strength(rows: list, *, scope: str, bench_symbol: str,
                            bench_pct, bench_spot, session_date: date, ts) -> None:
     """Bulk-insert relative-strength rows (MORNING or INTRADAY). `rows` are

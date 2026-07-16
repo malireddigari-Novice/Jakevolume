@@ -901,8 +901,41 @@ def _collect_hourly_option_bars(symbol, levels, expiry, snap_date, adata) -> Non
 
 # ── Desktop notification ──────────────────────────────────────────────────────
 
+_positioning_cache: dict = {}
+
+
+def _apply_positioning_confidence(sig: dict) -> None:
+    """Layer-3: nudge a fired signal's confidence by its agreement with the morning
+    fresh-OI positioning (aligned → up, contra → down slightly, never reject). Stamps
+    positioning_alignment/delta/note on the sig; adjusts a numeric leadership confidence."""
+    if not (config.POSITIONING_ENABLED and config.POSITIONING_CONFIDENCE_ENABLED):
+        return
+    key = (sig.get('symbol'), today_cst())
+    if key not in _positioning_cache:
+        try:
+            _positioning_cache[key] = db.get_positioning(sig.get('symbol'), today_cst())
+        except Exception:
+            _positioning_cache[key] = None
+    hm = _positioning_cache[key]
+    if not hm:
+        return
+    adj = positioning.confidence_adjustment(
+        sig.get('signal_type'), sig.get('traded_strike') or sig.get('level_price'), hm,
+        align_bonus=config.POSITIONING_ALIGN_BONUS, contra_penalty=config.POSITIONING_CONTRA_PENALTY)
+    sig['positioning_alignment'] = adj['alignment']
+    sig['positioning_delta'] = adj['delta']
+    sig['positioning_note'] = adj['note']
+    lead = sig.get('leadership')
+    if isinstance(lead, dict) and lead.get('confidence') is not None:
+        lead['confidence_adjusted'] = max(0, min(100, int(lead['confidence']) + adj['delta']))
+    if adj['alignment'] in ('ALIGNED', 'CONTRA'):
+        logger.info("POSITIONING-CONF %s %s: %s (delta %+d)",
+                    sig.get('symbol'), sig.get('signal_type'), adj['note'], adj['delta'])
+
+
 def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
     """Persist a signal (emergent FK + DB + Sheets + logged flag); return its id."""
+    _apply_positioning_confidence(sig)
     emergent = sig.pop('emergent', None)
     if emergent is not None:
         sig['emergent_location_id'] = db.save_emergent_location(emergent)

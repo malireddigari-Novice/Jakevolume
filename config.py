@@ -64,6 +64,11 @@ POSITIONING_BUILD_MIN        = int(os.getenv('POSITIONING_BUILD_MIN', '250'))   
 POSITIONING_UNWIND_MIN       = int(os.getenv('POSITIONING_UNWIND_MIN', '250'))         # OI drop = an UNWIND
 POSITIONING_ROTATION_VOL_MIN = int(os.getenv('POSITIONING_ROTATION_VOL_MIN', '1000'))  # flat-OI + this vol = ROTATION
 POSITIONING_FLAT_OI_MAX      = int(os.getenv('POSITIONING_FLAT_OI_MAX', '100'))
+# Layer-3 confidence hook: a fired signal that agrees with the morning fresh-OI positioning
+# gets a confidence bump; one that opposes it is nudged down slightly (never rejected).
+POSITIONING_CONFIDENCE_ENABLED = os.getenv('POSITIONING_CONFIDENCE_ENABLED', 'true').lower() == 'true'
+POSITIONING_ALIGN_BONUS        = int(os.getenv('POSITIONING_ALIGN_BONUS', '15'))
+POSITIONING_CONTRA_PENALTY     = int(os.getenv('POSITIONING_CONTRA_PENALTY', '10'))
 
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
