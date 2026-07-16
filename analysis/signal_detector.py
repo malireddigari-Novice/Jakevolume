@@ -45,6 +45,7 @@ from analysis.rolling_volume import RollingVolume
 from analysis.opening_scan import scan_opening, opening_story, opening_side_confirmed
 from analysis import breakout as _breakout
 from analysis.route_b import route_b_qualifies
+from analysis import chain_leadership as _chain_lead
 from analysis.gold_mode import contract_low_region
 from analysis.paper_fill import executable_fill as _executable_fill
 from data.alpaca_client import occ_symbol
@@ -735,6 +736,36 @@ class SignalDetector:
                 elif oreason:
                     logger.info("OPENING-PROD %s %s $%.2f → %s  (story=%s)",
                                 symbol, side, c['strike'], oreason, story)
+
+        # ── V2 chain-leadership (default-off) — did one side seize the chain? ──────
+        # Measures COORDINATED cross-strike control over the wide watched window (not a
+        # single-strike threshold), then trades the recommended convexity contract. This
+        # is what catches a "one event spread across five strikes" move (GOOGL 357.5-365C)
+        # that the ATM±1 window + per-strike floors never saw.
+        if config.CHAIN_LEADERSHIP_ENABLED and opt_data_map:
+            verdict = self._chain_leadership_scan(symbol, opt_data_map, vol_deltas,
+                                                  close_price, bar_time, expiry)
+            side = verdict['controlling_side']
+            if side and verdict['confidence'] >= config.CHAIN_LEADERSHIP_MIN_CONFIDENCE:
+                st = 'BULLISH' if side == 'CALL' else 'BEARISH'
+                if not self._fired_today.get((symbol, st)):
+                    lsig, lreason = self._chain_leadership_entry(
+                        symbol, verdict, opt_data_map, vol_deltas, levels, close_price,
+                        expiry, bars, bar_time, bar_time, next_day_mode, pc_ratio)
+                    if lsig is not None:
+                        self._fired_today[(symbol, st)] = True
+                        fired.append(lsig)
+                        logger.info("CHAIN-LEADERSHIP fired %s %s  leader=%s rec=%s breadth=%d "
+                                    "notional=$%d conf=%d  chain=%s", symbol, side,
+                                    verdict['leader_strike'], verdict['recommended_strike'],
+                                    verdict['breadth'], verdict['combined_notional'],
+                                    verdict['confidence'], verdict['supporting_strikes'])
+                    elif lreason:
+                        logger.info("CHAIN-LEADERSHIP %s %s → %s", symbol, side, lreason)
+            elif side:
+                logger.debug("CHAIN-LEADERSHIP %s %s conf=%d < %d (breadth=%d)",
+                             symbol, side, verdict['confidence'],
+                             config.CHAIN_LEADERSHIP_MIN_CONFIDENCE, verdict['breadth'])
         return fired
 
     # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
@@ -1315,6 +1346,82 @@ class SignalDetector:
         sig['chain_strikes'] = [x['strike'] for x in chain]
         sig['chain_combined_3m'] = c3
         sig['emergent_spot'] = emergent_spot
+        return sig, None
+
+    def _chain_leadership_scan(self, symbol, opt_data_map, vol_deltas, close_price,
+                               bar_time, expiry):
+        """
+        V2 chain-leadership scan: build per-side contract lists across the WIDE watched
+        window (strike, event volume, notional, mark, cheapness) and detect cross-strike
+        CALL/PUT control via analysis.chain_leadership.detect(). Returns the verdict dict.
+        """
+        def _contracts(ot):
+            out = []
+            for (s, o), q in opt_data_map.items():
+                if o != ot:
+                    continue
+                m = self._strike_metrics(symbol, (s, ot), q, vol_deltas.get((s, ot), 0),
+                                         bar_time, expiry)
+                out.append({'strike': float(s), 'vol': int(m['vol3m']),
+                            'mark': m['mark'], 'notional': m['notional'],
+                            'low_dist': m['low_dist']})
+            return out
+        return _chain_lead.detect(
+            _contracts('CALL'), _contracts('PUT'), float(close_price),
+            strike_min_vol=config.CHAIN_LEADERSHIP_STRIKE_MIN_VOL,
+            min_breadth=config.CHAIN_LEADERSHIP_MIN_BREADTH,
+            min_combined_vol=config.CHAIN_LEADERSHIP_MIN_COMBINED_VOL,
+            min_notional=config.CHAIN_LEADERSHIP_MIN_NOTIONAL,
+            leadership_margin=config.CHAIN_LEADERSHIP_MARGIN,
+            convexity_min_frac=config.CHAIN_LEADERSHIP_CONVEXITY_FRAC)
+
+    def _chain_leadership_entry(self, symbol, verdict, opt_data_map, vol_deltas, levels,
+                                close_price, expiry, bars, bar_time, now, next_day_mode, pc_ratio):
+        """
+        Build a production signal from a confirmed chain-leadership verdict — trading the
+        recommended (convexity) contract. Bypasses the old single-strike chain-led gates
+        (leadership is already established by detect()); keeps a contract-not-chased sanity
+        check. Returns (signal | None, block_reason | None).
+        """
+        side = verdict['controlling_side']
+        signal_type = 'BULLISH' if side == 'CALL' else 'BEARISH'
+        if self._fired_today.get((symbol, signal_type)):
+            return None, None
+        rec = float(verdict['recommended_strike'])
+        key = (rec, side)
+        if key not in opt_data_map:
+            return None, 'LEADERSHIP_STRIKE_NOT_QUOTED'
+        quote = opt_data_map[key]
+        delta = vol_deltas.get(key, 0)
+        m = self._strike_metrics(symbol, key, quote, delta, bar_time, expiry)
+        if m['low_dist'] is not None and m['low_dist'] > config.CHAIN_LEADERSHIP_MAX_LOW_DIST:
+            return None, 'LEADERSHIP_ENTRY_CHASED'
+        ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, rec, side), [])),
+                               delta, m['low_dist'], 300, 300, 3.0,
+                               config.STAIRSTEP_EXCITATION_MIN, mark=m['mark'],
+                               is_atm=True, next_day_mode=next_day_mode)
+        day_mode = 'NEXT_DAY' if next_day_mode else '0DTE'
+        loc_type = 'SUPPORT' if side == 'CALL' else 'RESISTANCE'
+        conf01 = round(verdict['confidence'] / 100.0, 3)
+        sig = self._build_signal(
+            symbol, {'strike': rec}, levels, 0, 'CHAIN_LEADER', loc_type,
+            side, signal_type, {'close': close_price}, expiry, quote, ev,
+            delta, m['low_dist'], ev, delta, True,
+            conf01, 'CHAIN_LEADERSHIP', None, pc_ratio,
+            _pc_conviction(signal_type, pc_ratio), next_day_mode, day_mode, quote,
+            rec, None)
+        sig['signal_context'] = 'CHAIN_LEADERSHIP_ENTRY'
+        sig['signal_shape'] = sig['flow_shape'] = 'CHAIN_LEADERSHIP'
+        sig['level_label'] = 'CHAIN_LEADER'
+        sig['bias'] = 'Chain leadership call' if side == 'CALL' else 'Chain leadership put'
+        sig['chain_strikes'] = verdict['supporting_strikes']
+        sig['chain_combined_3m'] = verdict['combined_volume']
+        sig['leadership'] = {
+            'controlling_side': side, 'leader_strike': verdict['leader_strike'],
+            'recommended_strike': rec, 'supporting_strikes': verdict['supporting_strikes'],
+            'breadth': verdict['breadth'], 'combined_notional': verdict['combined_notional'],
+            'confidence': verdict['confidence'],
+        }
         return sig, None
 
     def _countertrend_gate(self, symbol, signal_type, atm, itm, leadership, bar_time):

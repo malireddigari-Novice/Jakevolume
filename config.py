@@ -28,6 +28,29 @@ RS_INTRADAY_DIVERGENCE_PCT = float(os.getenv('RS_INTRADAY_DIVERGENCE_PCT', '0.4'
 # Intraday: post a Discord note the first time a name crosses into a hard divergence.
 RS_INTRADAY_DISCORD_ALERT  = os.getenv('RS_INTRADAY_DISCORD_ALERT', 'false').lower() == 'true'
 
+# ── V2 adaptive watched-contract window + chain leadership ─────────────────────
+# The old ATM±1 (n=3) window missed coordinated OTM chain moves (e.g. GOOGL 357.5-365C
+# on 2026-07-14 — all outside the window, never evaluated). Widen the nearest-N call/put
+# strikes fetched per poll, per underlying (fast movers reach farther), + a bonus for
+# next-day (1DTE) flow which can position farther OTM. Gated — n=3 when off.
+ADAPTIVE_WINDOW_ENABLED = os.getenv('ADAPTIVE_WINDOW_ENABLED', 'false').lower() == 'true'
+CHAIN_WINDOW_N = {'default': 5, 'AAPL': 5, 'MSFT': 5, 'AMZN': 5,
+                  'GOOGL': 6, 'META': 6, 'NVDA': 7, 'TSLA': 7}
+CHAIN_WINDOW_NEXTDAY_BONUS = int(os.getenv('CHAIN_WINDOW_NEXTDAY_BONUS', '1'))
+# Chain-leadership production path (measures cross-strike CALL/PUT control over the wider
+# window, not single-strike thresholds). Needs the adaptive window. Default OFF (ships dark).
+CHAIN_LEADERSHIP_ENABLED       = os.getenv('CHAIN_LEADERSHIP_ENABLED', 'false').lower() == 'true'
+CHAIN_LEADERSHIP_STRIKE_MIN_VOL = int(os.getenv('CHAIN_LEADERSHIP_STRIKE_MIN_VOL', '200'))  # per-strike participation floor
+CHAIN_LEADERSHIP_MIN_BREADTH    = int(os.getenv('CHAIN_LEADERSHIP_MIN_BREADTH', '3'))       # coordinated strikes
+CHAIN_LEADERSHIP_MIN_COMBINED_VOL = int(os.getenv('CHAIN_LEADERSHIP_MIN_COMBINED_VOL', '1500'))
+CHAIN_LEADERSHIP_MIN_NOTIONAL   = int(os.getenv('CHAIN_LEADERSHIP_MIN_NOTIONAL', '100000'))
+CHAIN_LEADERSHIP_MARGIN         = float(os.getenv('CHAIN_LEADERSHIP_MARGIN', '1.5'))        # controlling side dominance
+CHAIN_LEADERSHIP_CONVEXITY_FRAC = float(os.getenv('CHAIN_LEADERSHIP_CONVEXITY_FRAC', '0.4'))
+CHAIN_LEADERSHIP_MIN_CONFIDENCE = int(os.getenv('CHAIN_LEADERSHIP_MIN_CONFIDENCE', '60'))
+# Leadership is a momentum/breakout entry (the chain already moved), so the "not chased"
+# contract-low cap is more lenient than the value-entry path's CHAIN_SELECTED_LOW_DISTANCE_MAX.
+CHAIN_LEADERSHIP_MAX_LOW_DIST   = float(os.getenv('CHAIN_LEADERSHIP_MAX_LOW_DIST', '3.5'))
+
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
 
