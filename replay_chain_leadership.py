@@ -61,19 +61,34 @@ def main():
             spot = float(b['c'])
     spot = spot or 355.0
 
-    minutes = [f"09:{m:02d}" for m in range(15, int(TARGET[3:]) + 1)]
+    # Event window (the coordinated 09:31-09:33 burst). Per strike: the REAL total volume
+    # over the window (the "one event"), and a mark sanitized to the call/put price curve
+    # (1-min OTM bars are noisy → enforce monotonicity so a stale print can't invert it).
+    event = [f"09:{m:02d}" for m in range(29, 35)]
     opt_data_map, vol_deltas = {}, {}
     for strikes, cp, ot in ((CALL_STRIKES, 'C', 'CALL'), (PUT_STRIKES, 'P', 'PUT')):
+        raw = {}
         for s in strikes:
             ser = minute_series(c, s, cp)
-            vols = [ser.get(m, (0, None))[0] for m in minutes]
-            d._opt_vol_hist[('GOOGL', s, ot)] = deque([20] * 5 + vols, maxlen=d._hist_maxlen)
-            last_close = next((ser[m][1] for m in reversed(minutes) if ser.get(m) and ser[m][1]), None)
-            if last_close:
-                lo = min((v[1] for v in ser.values() if v[1]), default=last_close)
-                opt_data_map[(s, ot)] = {'mark': last_close, 'bid': round(last_close * 0.97, 2),
-                                         'ask': round(last_close * 1.03, 2), 'day_low': lo}
-                vol_deltas[(s, ot)] = vols[-1]
+            evol = sum(ser.get(m, (0, None))[0] for m in event)
+            closes = [ser[m][1] for m in event if ser.get(m) and ser[m][1]]
+            mark = sorted(closes)[len(closes) // 2] if closes else None   # median close in window
+            raw[s] = (evol, mark)
+        # sanitize marks -> non-increasing for calls as strike rises (mirror for puts)
+        ordered = sorted(strikes, reverse=(cp == 'P'))  # from most-ITM outward
+        prev = None
+        for s in ordered:
+            evol, mark = raw[s]
+            if mark is None:
+                continue
+            mark = min(mark, prev) if prev is not None else mark
+            prev = mark
+            mark = max(round(mark, 2), 0.05)
+            d._opt_vol_hist[('GOOGL', s, ot)] = deque([20] * 17 + [0, 0, evol], maxlen=d._hist_maxlen)
+            lo = round(mark * 0.6, 2)     # a plausible session low below the event mark
+            opt_data_map[(s, ot)] = {'mark': mark, 'bid': round(mark * 0.97, 2),
+                                     'ask': round(mark * 1.03, 2), 'day_low': lo}
+            vol_deltas[(s, ot)] = evol
 
     bt = CST.localize(datetime(2026, 7, 14, 9, 33))
     print(f"GOOGL {TARGET} spot={spot:.2f}  (watched call strikes: {CALL_STRIKES})\n")

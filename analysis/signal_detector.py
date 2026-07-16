@@ -1394,8 +1394,10 @@ class SignalDetector:
         quote = opt_data_map[key]
         delta = vol_deltas.get(key, 0)
         m = self._strike_metrics(symbol, key, quote, delta, bar_time, expiry)
-        if m['low_dist'] is not None and m['low_dist'] > config.CHAIN_LEADERSHIP_MAX_LOW_DIST:
-            return None, 'LEADERSHIP_ENTRY_CHASED'
+        # Momentum entry: no value "near-low" ratio gate (the chain already moved) — only a
+        # premium floor so we never chase into a worthless penny.
+        if (m['mark'] or 0) < config.CHAIN_LEADERSHIP_MIN_PREMIUM:
+            return None, 'LEADERSHIP_PREMIUM_TOO_LOW'
         ev = self._eval_volume(symbol, list(self._opt_vol_hist.get((symbol, rec, side), [])),
                                delta, m['low_dist'], 300, 300, 3.0,
                                config.STAIRSTEP_EXCITATION_MIN, mark=m['mark'],

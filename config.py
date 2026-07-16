@@ -47,9 +47,12 @@ CHAIN_LEADERSHIP_MIN_NOTIONAL   = int(os.getenv('CHAIN_LEADERSHIP_MIN_NOTIONAL',
 CHAIN_LEADERSHIP_MARGIN         = float(os.getenv('CHAIN_LEADERSHIP_MARGIN', '1.5'))        # controlling side dominance
 CHAIN_LEADERSHIP_CONVEXITY_FRAC = float(os.getenv('CHAIN_LEADERSHIP_CONVEXITY_FRAC', '0.4'))
 CHAIN_LEADERSHIP_MIN_CONFIDENCE = int(os.getenv('CHAIN_LEADERSHIP_MIN_CONFIDENCE', '60'))
-# Leadership is a momentum/breakout entry (the chain already moved), so the "not chased"
-# contract-low cap is more lenient than the value-entry path's CHAIN_SELECTED_LOW_DISTANCE_MAX.
-CHAIN_LEADERSHIP_MAX_LOW_DIST   = float(os.getenv('CHAIN_LEADERSHIP_MAX_LOW_DIST', '3.5'))
+# Leadership is a momentum/breakout entry: the chain has ALREADY moved, so the value
+# "near contract low" ratio (mark/session_low) is the wrong gate — a $0.28→$3 call reads
+# as 11x "chased" yet that run IS the leadership. Instead of a value ratio, the only entry
+# guard is an absolute premium floor (avoid dead sub-floor pennies); leadership confidence
+# + breadth + notional carry the entry.
+CHAIN_LEADERSHIP_MIN_PREMIUM    = float(os.getenv('CHAIN_LEADERSHIP_MIN_PREMIUM', '0.20'))
 
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
