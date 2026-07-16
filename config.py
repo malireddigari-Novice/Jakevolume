@@ -70,6 +70,17 @@ POSITIONING_CONFIDENCE_ENABLED = os.getenv('POSITIONING_CONFIDENCE_ENABLED', 'tr
 POSITIONING_ALIGN_BONUS        = int(os.getenv('POSITIONING_ALIGN_BONUS', '15'))
 POSITIONING_CONTRA_PENALTY     = int(os.getenv('POSITIONING_CONTRA_PENALTY', '10'))
 
+# ── Session classification (V2 — infer the session A/B/C from flow, context only) ──
+# A_EXPANSION (directional leadership + range expansion, 0DTE trade), B_POSITIONING
+# (balanced/chop, the move is being built for later), C_TRANSITION (B then expanded).
+SESSION_CLASSIFIER_ENABLED  = os.getenv('SESSION_CLASSIFIER_ENABLED', 'true').lower() == 'true'
+SESSION_WARMUP_MIN          = int(os.getenv('SESSION_WARMUP_MIN', '20'))
+SESSION_EXPANSION_RANGE_PCT = float(os.getenv('SESSION_EXPANSION_RANGE_PCT', '0.006'))  # session range = 'expanded'
+SESSION_DIRECTIONALITY_MIN  = float(os.getenv('SESSION_DIRECTIONALITY_MIN', '0.55'))    # |net|/range: trend vs chop
+SESSION_BALANCE_RANGE_PCT   = float(os.getenv('SESSION_BALANCE_RANGE_PCT', '0.004'))    # tight range = balanced
+SESSION_CHOP_MAX            = float(os.getenv('SESSION_CHOP_MAX', '0.40'))
+SESSION_LEADERSHIP_MIN      = float(os.getenv('SESSION_LEADERSHIP_MIN', '0.60'))
+
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
 

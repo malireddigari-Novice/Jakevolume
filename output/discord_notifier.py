@@ -152,6 +152,13 @@ def send_signal(sig: dict) -> None:
         d = sig.get('positioning_delta', 0)
         return f"Fresh-OI: {icon} {sig.get('positioning_note', al)} (conf {d:+d})"
 
+    def _session_line():
+        """A/B/C session context; None when undetermined/absent."""
+        stype = sig.get('session_type')
+        label = {'A_EXPANSION': 'A · Intraday Expansion', 'B_POSITIONING': 'B · Positioning Day',
+                 'C_TRANSITION': 'C · Transition'}.get(stype)
+        return f"Session: {label}" if label else None
+
     # Gold-mode classification line (only surfaced while the mode is active, so the
     # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
     if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
@@ -189,6 +196,9 @@ def send_signal(sig: dict) -> None:
         _pos = _positioning_line()
         if _pos:
             lines.append(_pos)
+        _ses = _session_line()
+        if _ses:
+            lines.append(_ses)
         prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
         _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
                     "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
@@ -237,6 +247,9 @@ def send_signal(sig: dict) -> None:
     _pos = _positioning_line()
     if _pos:
         lines.append(_pos)
+    _ses = _session_line()
+    if _ses:
+        lines.append(_ses)
 
     prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     payload = {
