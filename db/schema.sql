@@ -660,6 +660,29 @@ ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_ask     NUMERIC(
 ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_mark    NUMERIC(12,4);
 ALTER TABLE atm_0dte_snapshots ADD COLUMN IF NOT EXISTS put_otm_oi      BIGINT;
 
+-- ── Fresh-OI positioning heat-map (Engine 2 — overnight context, never a trigger) ─
+CREATE TABLE IF NOT EXISTS positioning_snapshots (
+    id                    BIGSERIAL   PRIMARY KEY,
+    symbol                VARCHAR(10) NOT NULL,
+    snap_date             DATE        NOT NULL,
+    snap_time             TIMESTAMPTZ NOT NULL,
+    spot                  NUMERIC(12,4),
+    dominant_side         VARCHAR(8),          -- CALL | PUT | NEUTRAL
+    bull_score            NUMERIC(4,1),        -- 0-10
+    bear_score            NUMERIC(4,1),
+    net_notional          BIGINT,              -- fresh notional added (contracts x premium x 100)
+    call_notional         BIGINT,              -- distance-weighted
+    put_notional          BIGINT,
+    concentration         VARCHAR(12),         -- VERY_HIGH | HIGH | MODERATE | LOW
+    cluster_low           NUMERIC(12,4),
+    cluster_high          NUMERIC(12,4),
+    weighted_distance_pct NUMERIC(8,4),
+    fresh_count           INT,
+    top_strikes           JSONB,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, snap_date)
+);
+CREATE INDEX IF NOT EXISTS idx_positioning_date ON positioning_snapshots (symbol, snap_date);
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.

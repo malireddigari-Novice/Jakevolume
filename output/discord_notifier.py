@@ -143,6 +143,15 @@ def send_signal(sig: dict) -> None:
         seg = f" (bar {bar_wait:.0f}s)" if bar_wait is not None else ""
         return f"Latency: {total:.0f}s event→alert{seg}"
 
+    def _positioning_line():
+        """Layer-3 fresh-OI alignment for this signal; None when not evaluated."""
+        al = sig.get('positioning_alignment')
+        if not al or al in ('NONE', 'NEUTRAL'):
+            return None
+        icon = '🟢' if al == 'ALIGNED' else '🔴'
+        d = sig.get('positioning_delta', 0)
+        return f"Fresh-OI: {icon} {sig.get('positioning_note', al)} (conf {d:+d})"
+
     # Gold-mode classification line (only surfaced while the mode is active, so the
     # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
     if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
@@ -177,6 +186,9 @@ def send_signal(sig: dict) -> None:
         _lat = _latency_line()
         if _lat:
             lines.append(_lat)
+        _pos = _positioning_line()
+        if _pos:
+            lines.append(_pos)
         prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
         _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
                     "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
@@ -222,6 +234,9 @@ def send_signal(sig: dict) -> None:
     _lat = _latency_line()
     if _lat:
         lines.append(_lat)
+    _pos = _positioning_line()
+    if _pos:
+        lines.append(_pos)
 
     prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     payload = {
@@ -325,6 +340,20 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
             desc += "\n**ATM 0DTE C:** " + "  ·  ".join(calls)
         if puts:
             desc += "\n**ATM 0DTE P:** " + "  ·  ".join(puts)
+
+    # Overnight positioning (Fresh-OI heat-map): where institutions placed NEW risk since
+    # the prior session. Context only — the battlefield, not a trade trigger.
+    pos = s.get('positioning')
+    if pos and pos.get('fresh_count'):
+        side = pos.get('dominant_side')
+        icon = '🟢' if side == 'CALL' else '🔴' if side == 'PUT' else '⚪'
+        score = pos['bull_score'] if side == 'CALL' else pos['bear_score'] if side == 'PUT' else max(pos['bull_score'], pos['bear_score'])
+        clus = (f" @ {_fmt_level(pos['cluster_low'])}-{_fmt_level(pos['cluster_high'])}"
+                if pos.get('cluster_low') is not None else "")
+        net = pos.get('net_notional') or 0
+        net_s = f"${net/1e6:.1f}M" if net >= 1e6 else f"${net/1e3:.0f}k"
+        desc += (f"\n**Fresh OI:** {icon} {side} {score:.1f}/10 · {pos.get('concentration','').replace('_',' ').title()} conc"
+                 f" · {net_s} fresh{clus}")
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),

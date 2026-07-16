@@ -1157,6 +1157,63 @@ def save_atm_0dte(symbol: str, snap_date: date, snap_time, spot, atm: dict) -> N
         _put(conn)
 
 
+def save_positioning(symbol: str, snap_date: date, snap_time, hm: dict) -> None:
+    """Upsert the morning Fresh-OI positioning heat-map for one symbol. No-op if empty."""
+    if not hm:
+        return
+    from psycopg2.extras import Json
+    sql = """
+        INSERT INTO positioning_snapshots
+            (symbol, snap_date, snap_time, spot, dominant_side, bull_score, bear_score,
+             net_notional, call_notional, put_notional, concentration, cluster_low,
+             cluster_high, weighted_distance_pct, fresh_count, top_strikes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s)
+        ON CONFLICT (symbol, snap_date) DO UPDATE SET
+            snap_time = EXCLUDED.snap_time, spot = EXCLUDED.spot,
+            dominant_side = EXCLUDED.dominant_side, bull_score = EXCLUDED.bull_score,
+            bear_score = EXCLUDED.bear_score, net_notional = EXCLUDED.net_notional,
+            call_notional = EXCLUDED.call_notional, put_notional = EXCLUDED.put_notional,
+            concentration = EXCLUDED.concentration, cluster_low = EXCLUDED.cluster_low,
+            cluster_high = EXCLUDED.cluster_high,
+            weighted_distance_pct = EXCLUDED.weighted_distance_pct,
+            fresh_count = EXCLUDED.fresh_count, top_strikes = EXCLUDED.top_strikes
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                symbol, snap_date, snap_time, hm.get('spot'), hm.get('dominant_side'),
+                hm.get('bull_score'), hm.get('bear_score'), hm.get('net_notional'),
+                hm.get('call_notional'), hm.get('put_notional'), hm.get('concentration'),
+                hm.get('cluster_low'), hm.get('cluster_high'), hm.get('weighted_distance_pct'),
+                hm.get('fresh_count'), Json(hm.get('top_strikes', [])),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def get_positioning(symbol: str, snap_date: date) -> Optional[dict]:
+    """The morning Fresh-OI positioning heat-map for a symbol/day, or None."""
+    sql = """
+        SELECT spot, dominant_side, bull_score, bear_score, net_notional, call_notional,
+               put_notional, concentration, cluster_low, cluster_high, weighted_distance_pct,
+               fresh_count, top_strikes
+        FROM positioning_snapshots WHERE symbol = %s AND snap_date = %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (symbol, snap_date))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        logger.warning("get_positioning failed for %s %s", symbol, snap_date, exc_info=True)
+        return None
+    finally:
+        _put(conn)
+
+
 def save_relative_strength(rows: list, *, scope: str, bench_symbol: str,
                            bench_pct, bench_spot, session_date: date, ts) -> None:
     """Bulk-insert relative-strength rows (MORNING or INTRADAY). `rows` are
