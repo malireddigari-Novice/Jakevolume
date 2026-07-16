@@ -39,6 +39,7 @@ from analysis.open_positions import collect_open_positions
 from analysis import gold_mode
 from analysis import relative_strength as rs
 from analysis import chandelier
+from analysis import chain_leadership
 from analysis.intent_gate import IntentGate
 from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
@@ -625,9 +626,17 @@ def intraday_check(
                 elif dbc:
                     expiry = dbc.get_nearest_expiry(symbol)
                 if data_src and expiry:
-                    # n=3 so a genuine ATM + in-the-money strike pair is available
+                    # n=3 (ATM±1) by default. Adaptive window (V2): widen the nearest-N
+                    # strikes per side so coordinated OTM chain leadership is visible —
+                    # per underlying, wider for next-day flow. Gated; unchanged when off.
+                    n_watch = 3
+                    if config.ADAPTIVE_WINDOW_ENABLED or config.CHAIN_LEADERSHIP_ENABLED:
+                        n_watch = chain_leadership.window_n(
+                            symbol, bool(expiry and expiry > today),
+                            config.CHAIN_WINDOW_N, config.CHAIN_WINDOW_N['default'],
+                            config.CHAIN_WINDOW_NEXTDAY_BONUS)
                     option_quotes = data_src.get_watched_contracts(
-                        symbol, expiry, underlying_price, n=3
+                        symbol, expiry, underlying_price, n=n_watch
                     )
                     logger.debug(
                         "%s: watched contracts near %.2f — %d quotes (expiry %s)",
