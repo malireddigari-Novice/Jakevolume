@@ -1157,6 +1157,27 @@ def save_atm_0dte(symbol: str, snap_date: date, snap_time, spot, atm: dict) -> N
         _put(conn)
 
 
+def save_session_classification(symbol: str, session_date: date, ts, v: dict) -> None:
+    """Insert one session-type transition row (A/B/C timeline)."""
+    if not v:
+        return
+    sql = """
+        INSERT INTO session_classification
+            (symbol, session_date, ts, session_type, range_pct, net_pct,
+             directionality, lead_strength, lead_side)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, session_date, ts, v.get('type'), v.get('range_pct'),
+                              v.get('net_pct'), v.get('directionality'),
+                              v.get('lead_strength'), v.get('lead_side')))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_positioning(symbol: str, snap_date: date, snap_time, hm: dict) -> None:
     """Upsert the morning Fresh-OI positioning heat-map for one symbol. No-op if empty."""
     if not hm:

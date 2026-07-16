@@ -41,6 +41,7 @@ from analysis import relative_strength as rs
 from analysis import chandelier
 from analysis import chain_leadership
 from analysis import positioning
+from analysis.session_classifier import SessionClassifier
 from analysis.intent_gate import IntentGate
 from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
@@ -713,6 +714,10 @@ def intraday_check(
                 except Exception:
                     logger.warning("%s: volume leadership scoring failed", symbol, exc_info=True)
 
+            # Session classification (A/B/C) — infer the session from this poll's flow.
+            _classify_session(symbol, session_bars, underlying_price,
+                              bars[-1]['bar_time'], poll_leadership, today)
+
             # §4 merge primary+chain into one signal (only when Gold-mode is on;
             # the one-per-direction dedup already prevents same-side duplicates).
             if config.GOLD_ONLY_PRODUCTION_MODE:
@@ -902,6 +907,47 @@ def _collect_hourly_option_bars(symbol, levels, expiry, snap_date, adata) -> Non
 # ── Desktop notification ──────────────────────────────────────────────────────
 
 _positioning_cache: dict = {}
+_session_state: dict = {}          # symbol -> current session type (for stamping signals)
+_session_classifier: Optional[SessionClassifier] = None
+
+
+def _classify_session(symbol, session_bars, spot, bar_time, poll_leadership, today):
+    """Update + record the A/B/C session type for a symbol from this poll's flow. Context
+    only — stashes the current type in _session_state for signal stamping."""
+    global _session_classifier
+    if not (config.SESSION_CLASSIFIER_ENABLED and session_bars and poll_leadership is not None):
+        return
+    if _session_classifier is None:
+        _session_classifier = SessionClassifier(
+            warmup_min=config.SESSION_WARMUP_MIN,
+            expansion_range_pct=config.SESSION_EXPANSION_RANGE_PCT,
+            directionality_min=config.SESSION_DIRECTIONALITY_MIN,
+            balance_range_pct=config.SESSION_BALANCE_RANGE_PCT,
+            chop_max=config.SESSION_CHOP_MAX, leadership_min=config.SESSION_LEADERSHIP_MIN)
+    try:
+        highs = [b.get('high', b.get('close')) for b in session_bars if b.get('close')]
+        lows  = [b.get('low',  b.get('close')) for b in session_bars if b.get('close')]
+        open_px = session_bars[0].get('close')
+        if not highs or not lows or not open_px:
+            return
+        cl = (poll_leadership or {}).get('call_leadership', 0.0) or 0.0
+        pl = (poll_leadership or {}).get('put_leadership', 0.0) or 0.0
+        mins = (bar_time - session_bars[0]['bar_time']).total_seconds() / 60.0
+        v = _session_classifier.observe(
+            symbol, open_price=float(open_px), spot=float(spot),
+            session_high=max(highs), session_low=min(lows), minutes_elapsed=mins,
+            lead_strength=max(cl, pl), lead_side=('CALL' if cl >= pl else 'PUT'))
+        _session_state[symbol] = v['type']
+        if v['changed']:
+            logger.info("SESSION %s → %s  range=%.2f%% dir=%.2f lead=%.2f %s",
+                        symbol, v['type'], v['range_pct'] * 100, v['directionality'],
+                        v['lead_strength'], v['lead_side'] or '')
+            try:
+                db.save_session_classification(symbol, today, bar_time, v)
+            except Exception:
+                logger.warning("%s: session classification save failed", symbol, exc_info=True)
+    except Exception:
+        logger.warning("%s: session classification failed", symbol, exc_info=True)
 
 
 def _apply_positioning_confidence(sig: dict) -> None:
@@ -935,6 +981,7 @@ def _apply_positioning_confidence(sig: dict) -> None:
 
 def _persist_signal(sig: dict, sheets: SheetsLogger) -> int:
     """Persist a signal (emergent FK + DB + Sheets + logged flag); return its id."""
+    sig['session_type'] = _session_state.get(sig.get('symbol'))   # A/B/C context (not a column)
     _apply_positioning_confidence(sig)
     emergent = sig.pop('emergent', None)
     if emergent is not None:

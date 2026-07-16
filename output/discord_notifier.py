@@ -152,6 +152,13 @@ def send_signal(sig: dict) -> None:
         d = sig.get('positioning_delta', 0)
         return f"Fresh-OI: {icon} {sig.get('positioning_note', al)} (conf {d:+d})"
 
+    def _session_line():
+        """A/B/C session context; None when undetermined/absent."""
+        stype = sig.get('session_type')
+        label = {'A_EXPANSION': 'A · Intraday Expansion', 'B_POSITIONING': 'B · Positioning Day',
+                 'C_TRANSITION': 'C · Transition'}.get(stype)
+        return f"Session: {label}" if label else None
+
     # Gold-mode classification line (only surfaced while the mode is active, so the
     # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
     if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
@@ -189,6 +196,9 @@ def send_signal(sig: dict) -> None:
         _pos = _positioning_line()
         if _pos:
             lines.append(_pos)
+        _ses = _session_line()
+        if _ses:
+            lines.append(_ses)
         prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
         _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
                     "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
@@ -237,6 +247,9 @@ def send_signal(sig: dict) -> None:
     _pos = _positioning_line()
     if _pos:
         lines.append(_pos)
+    _ses = _session_line()
+    if _ses:
+        lines.append(_ses)
 
     prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
     payload = {
@@ -301,8 +314,20 @@ def _level_lines(levels: list, prefix: str) -> str:
     return "\n".join(lines)
 
 
+def _expansion_zone(supports, resistances, spot):
+    """Nearest support–resistance band around spot — where the day's action is expected."""
+    if spot is None:
+        return None
+    sup = [float(l['strike']) for l in (supports or []) if l.get('strike') is not None]
+    res = [float(l['strike']) for l in (resistances or []) if l.get('strike') is not None]
+    lo = max([x for x in sup if x <= spot], default=(min(sup) if sup else None))
+    hi = min([x for x in res if x >= spot], default=(max(res) if res else None))
+    return (lo, hi) if (lo is not None and hi is not None) else None
+
+
 def _build_symbol_embed(r: dict, footer: dict) -> dict:
-    """One mobile-first embed per symbol: bias-colored border, stacked S/R fields."""
+    """One mobile-first embed per symbol — Morning Structure: bias-colored border, expected
+    expansion zone, stacked S/R fields; flow/positioning lead, P/C ratio is context only."""
     s    = r['sentiment']
     bias = s.get('bias', 'NEUTRAL')
     prev = r.get('prev_close')
@@ -311,9 +336,11 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
     pc_str   = f"{pc:.3f}" if pc is not None else 'n/a'
     desc = (
         f"**Previous Close:** {prev_str}\n"
-        f"**Expiry:** {_fmt_expiry(r.get('expiry'))}\n"
-        f"**Put/Call OI:** {pc_str}"
+        f"**Expiry:** {_fmt_expiry(r.get('expiry'))}"
     )
+    _zone = _expansion_zone(r.get('supports'), r.get('resistances'), r.get('pm_price'))
+    if _zone:
+        desc += f"\n**Expected Expansion Zone:** {_fmt_level(_zone[0])} – {_fmt_level(_zone[1])}"
     # Relative strength vs QQQ (only when computed). Flags names moving independent
     # of the index: 🟢 relatively strong, 🔴 relatively weak, · in-line.
     rs_val = s.get('rs')
@@ -354,6 +381,10 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
         net_s = f"${net/1e6:.1f}M" if net >= 1e6 else f"${net/1e3:.0f}k"
         desc += (f"\n**Fresh OI:** {icon} {side} {score:.1f}/10 · {pos.get('concentration','').replace('_',' ').title()} conc"
                  f" · {net_s} fresh{clus}")
+
+    # P/C ratio — Tier-3, context only (it drives no decision). Demoted to a small trailing
+    # line so the brief leads with structure + flow, not yesterday's static OI ratio.
+    desc += f"\n_P/C OI (context): {pc_str}_"
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),

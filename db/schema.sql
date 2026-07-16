@@ -683,6 +683,23 @@ CREATE TABLE IF NOT EXISTS positioning_snapshots (
     UNIQUE (symbol, snap_date)
 );
 CREATE INDEX IF NOT EXISTS idx_positioning_date ON positioning_snapshots (symbol, snap_date);
+
+-- ── Session classification timeline (A/B/C, a row per transition) ─────────────
+CREATE TABLE IF NOT EXISTS session_classification (
+    id             BIGSERIAL   PRIMARY KEY,
+    symbol         VARCHAR(10) NOT NULL,
+    session_date   DATE        NOT NULL,
+    ts             TIMESTAMPTZ NOT NULL,
+    session_type   VARCHAR(16) NOT NULL,   -- A_EXPANSION | B_POSITIONING | C_TRANSITION | UNDETERMINED
+    range_pct      NUMERIC(8,5),
+    net_pct        NUMERIC(8,5),
+    directionality NUMERIC(6,3),
+    lead_strength  NUMERIC(6,3),
+    lead_side      VARCHAR(4),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_session_class_date ON session_classification (symbol, session_date);
+
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.
