@@ -325,6 +325,20 @@ def _build_symbol_embed(r: dict, footer: dict) -> dict:
             desc += "\n**ATM 0DTE C:** " + "  ·  ".join(calls)
         if puts:
             desc += "\n**ATM 0DTE P:** " + "  ·  ".join(puts)
+
+    # Overnight positioning (Fresh-OI heat-map): where institutions placed NEW risk since
+    # the prior session. Context only — the battlefield, not a trade trigger.
+    pos = s.get('positioning')
+    if pos and pos.get('fresh_count'):
+        side = pos.get('dominant_side')
+        icon = '🟢' if side == 'CALL' else '🔴' if side == 'PUT' else '⚪'
+        score = pos['bull_score'] if side == 'CALL' else pos['bear_score'] if side == 'PUT' else max(pos['bull_score'], pos['bear_score'])
+        clus = (f" @ {_fmt_level(pos['cluster_low'])}-{_fmt_level(pos['cluster_high'])}"
+                if pos.get('cluster_low') is not None else "")
+        net = pos.get('net_notional') or 0
+        net_s = f"${net/1e6:.1f}M" if net >= 1e6 else f"${net/1e3:.0f}k"
+        desc += (f"\n**Fresh OI:** {icon} {side} {score:.1f}/10 · {pos.get('concentration','').replace('_',' ').title()} conc"
+                 f" · {net_s} fresh{clus}")
     return {
         'title': f"{r['symbol']} — {bias}",
         'color': _bias_color(bias),

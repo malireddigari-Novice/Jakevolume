@@ -54,6 +54,17 @@ CHAIN_LEADERSHIP_MIN_CONFIDENCE = int(os.getenv('CHAIN_LEADERSHIP_MIN_CONFIDENCE
 # + breadth + notional carry the entry.
 CHAIN_LEADERSHIP_MIN_PREMIUM    = float(os.getenv('CHAIN_LEADERSHIP_MIN_PREMIUM', '0.20'))
 
+# ── Fresh-OI positioning engine (Engine 2 — overnight context, NEVER a trigger) ──
+# Where institutions placed meaningful NEW risk since the prior session. Context/confidence
+# only, so safe to default ON (it adds a briefing section + record; it never fires a trade).
+POSITIONING_ENABLED          = os.getenv('POSITIONING_ENABLED', 'true').lower() == 'true'
+POSITIONING_NEAR_BAND_PCT    = float(os.getenv('POSITIONING_NEAR_BAND_PCT', '0.05'))   # strikes within ±5% weighted
+POSITIONING_TARGET_NOTIONAL  = int(os.getenv('POSITIONING_TARGET_NOTIONAL', '500000')) # fresh notional that saturates 'size'
+POSITIONING_BUILD_MIN        = int(os.getenv('POSITIONING_BUILD_MIN', '250'))          # fresh OI = a BUILD
+POSITIONING_UNWIND_MIN       = int(os.getenv('POSITIONING_UNWIND_MIN', '250'))         # OI drop = an UNWIND
+POSITIONING_ROTATION_VOL_MIN = int(os.getenv('POSITIONING_ROTATION_VOL_MIN', '1000'))  # flat-OI + this vol = ROTATION
+POSITIONING_FLAT_OI_MAX      = int(os.getenv('POSITIONING_FLAT_OI_MAX', '100'))
+
 # ── Session timezone ──────────────────────────────────────────────────────────
 SESSION_TZ = 'America/Chicago'
 

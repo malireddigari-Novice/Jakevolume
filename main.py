@@ -40,6 +40,7 @@ from analysis import gold_mode
 from analysis import relative_strength as rs
 from analysis import chandelier
 from analysis import chain_leadership
+from analysis import positioning
 from analysis.intent_gate import IntentGate
 from analysis.paper_fill import price_moved_from_event
 from output.discord_notifier import send_reversal_alert
@@ -269,6 +270,24 @@ def morning_snapshot(schwab: SchwabClient, sheets: SheetsLogger, adata=None) -> 
                     if (row['watchlist_tier'] == 'OI_BUILDUP'
                             and (row.get('oi_change') or 0) > 0):
                         all_oi_buildup.append({'symbol': symbol, **row})
+
+                # Fresh-OI positioning heat-map (Engine 2 — overnight context only).
+                if config.POSITIONING_ENABLED:
+                    hm = positioning.heatmap(
+                        symbol, chain.get('all', []), oi_changes, pm_price,
+                        near_band_pct=config.POSITIONING_NEAR_BAND_PCT,
+                        target_notional=config.POSITIONING_TARGET_NOTIONAL,
+                        build_min=config.POSITIONING_BUILD_MIN,
+                        unwind_min=config.POSITIONING_UNWIND_MIN,
+                        rotation_vol_min=config.POSITIONING_ROTATION_VOL_MIN,
+                        flat_oi_max=config.POSITIONING_FLAT_OI_MAX)
+                    sentiment['positioning'] = hm
+                    db.save_positioning(symbol, today, now, hm)
+                    if hm.get('fresh_count'):
+                        logger.info("POSITIONING %s: %s bull=%.1f bear=%.1f conc=%s "
+                                    "net=$%d cluster=%s-%s", symbol, hm['dominant_side'],
+                                    hm['bull_score'], hm['bear_score'], hm['concentration'],
+                                    hm['net_notional'], hm['cluster_low'], hm['cluster_high'])
             except Exception:
                 logger.warning("%s: secondary OI watchlist failed", symbol, exc_info=True)
 
