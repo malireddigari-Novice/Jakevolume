@@ -47,6 +47,8 @@ from analysis import breakout as _breakout
 from analysis.route_b import route_b_qualifies
 from analysis import chain_leadership as _chain_lead
 from analysis.gold_mode import contract_low_region
+from analysis import premium_discovery as _premium_discovery
+from analysis import alert_taxonomy as _taxonomy
 from analysis.paper_fill import executable_fill as _executable_fill
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
@@ -287,6 +289,10 @@ class SignalDetector:
         # Fallback when no live multi-day history exists (Schwab serves no option
         # price-history): the contract's previous-session (low, high) from the DB.
         self._prev_range_fn = None
+        # §13b Premium Discovery Score: the contract's premium/volume history
+        # (list of {low,high,close,volume}) per OCC, fetched once per contract/day.
+        self._opt_premium_hist: dict[str, list] = {}
+        self._premium_hist_fn = None
         # §7-8 completed 1-min bar volume provider + per-contract/minute cache,
         # plus the pending-volume-confirmation set (near-miss partial-bar candidates).
         self._completed_bar_fn = None
@@ -301,6 +307,8 @@ class SignalDetector:
         # §73 per-poll candidate-evaluation log (every level, blocked or passed) — the
         # caller persists `last_candidates` to signal_candidates after each check().
         self.last_candidates: list[dict] = []
+        self.last_leadership_shadow: list[dict] = []
+        self._leadership_shadow_fired: dict = {}
         # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
         self._event_reg = EventRegistry()
         self._rvol: dict[_OptKey, RollingVolume] = {}
@@ -321,6 +329,7 @@ class SignalDetector:
         fired_today_fn=None,
         prev_range_fn=None,
         completed_bar_fn=None,
+        premium_hist_fn=None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -334,8 +343,13 @@ class SignalDetector:
                         §13 historical range: the contract's FULL stored-history (low, high)
                         from the DB, used when hist_range_fn yields nothing (no live option
                         price-history). Backs the "at/near historical low" requirement.
+        premium_hist_fn: callable(symbol, strike, opt_type, before_date) -> [ {low,high,
+                        close,volume}, … ] for the §13b Premium Discovery Score — the
+                        contract's premium/volume distribution over prior sessions. None
+                        (or empty) → PDS is skipped/unknown (non-blocking unless strict).
         """
         self.last_candidates = []          # §73 — reset per poll
+        self.last_leadership_shadow = []   # V2 shadow leadership signals — main reads post-check()
         if not bars:
             return []
 
@@ -346,6 +360,7 @@ class SignalDetector:
         self._hist_range_fn = hist_range_fn
         self._prev_range_fn = prev_range_fn
         self._completed_bar_fn = completed_bar_fn
+        self._premium_hist_fn = premium_hist_fn
 
         # Keep 1DTE expiry handling (target-strike pricing); roles stay frozen.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -355,11 +370,13 @@ class SignalDetector:
         if self._history_date != today:
             self._history_date    = today
             self._fired_today     = {}
+            self._leadership_shadow_fired = {}   # V2 shadow one-per-direction-per-day
             self._prev_opt_vol    = {}
             self._opt_vol_hist    = defaultdict(lambda: deque(maxlen=self._hist_maxlen))
             self._opt_mark_low    = {}
             self._opt_last_bar    = {}
             self._opt_hist_range  = {}
+            self._opt_premium_hist = {}
             self._major_events    = defaultdict(list)
             self._completed_bar_cache = {}
             self._pending_candidates  = {}
@@ -592,6 +609,15 @@ class SignalDetector:
                                low=atm_low, hv=hv_pctile)
                 continue
 
+            # ── §13b Premium Discovery Score — fresh footprint vs recycled ─────
+            # Distinguishes a first institutional footprint (still cheap, little
+            # prior participation) from a spike in a contract whose premium was
+            # already discovered. Annotate-only here; the Gold gate enforces
+            # eligibility. Stamped onto the signal below for gate_audit + research.
+            pds = self._premium_discovery(
+                symbol, traded_strike, confirm_type, expiry, trade_data,
+                event_volume=atm.get('trigger_volume'))
+
             # ── §14 short-cover risk (on the volume-bearing ATM contract) ──────
             atm_mark = atm_data.get('mark') or 0.0
             if self._short_cover_risk(symbol, atm_key[0], confirm_type, expiry,
@@ -629,6 +655,13 @@ class SignalDetector:
                 trade_data=trade_data, traded_strike=traded_strike, target_level=target_level,
             )
 
+            # §13b — attach Premium Discovery class + metrics for the Gold gate
+            # (gold_mode.classify/production_allowed) and §73 research logging.
+            if pds is not None:
+                signal['pds_class']    = pds.get('pds_class')
+                signal['pds_eligible'] = pds.get('eligible')
+                signal['pds']          = pds
+
             # ── §8-12 Countertrend reversal-conviction gate ───────────────────
             # A candidate that passed every normal gate but OPPOSES a strong, still-
             # working, leadership-confirmed move must clear stricter evidence, else it
@@ -648,6 +681,14 @@ class SignalDetector:
                 signal['signal_shape'] = signal['flow_shape'] = 'COUNTERTREND_REVERSAL'
 
             signal['level_action'] = level_action          # P-BD: bounce/rejection/breakout/breakdown
+
+            # Alert taxonomy — Market State × Leadership Type × Direction (+ reasons).
+            # Stamped LAST so it reads the final signal_context/flow_shape (the
+            # countertrend gate above may have relabeled it REVERSAL) and level_action.
+            _taxonomy.classify(
+                signal, bars=bars, quotes=option_quotes,
+                trend_dir=self._trend.active_direction(symbol),
+                trend_working=self._trend.still_working(symbol))
             candidates.append(signal)
             self._record_candidate(symbol, label, strike, close_price, confirm_type,
                                    reason='PASSED', dist=dist, atm=atm, low=atm_low)
@@ -737,22 +778,25 @@ class SignalDetector:
                     logger.info("OPENING-PROD %s %s $%.2f → %s  (story=%s)",
                                 symbol, side, c['strike'], oreason, story)
 
-        # ── V2 chain-leadership (default-off) — did one side seize the chain? ──────
+        # ── V2 chain-leadership — did one side seize the chain? ───────────────────
         # Measures COORDINATED cross-strike control over the wide watched window (not a
-        # single-strike threshold), then trades the recommended convexity contract. This
-        # is what catches a "one event spread across five strikes" move (GOOGL 357.5-365C)
-        # that the ATM±1 window + per-strike floors never saw.
-        if config.CHAIN_LEADERSHIP_ENABLED and opt_data_map:
+        # single-strike threshold), then trades (or SHADOW-records) the recommended
+        # convexity contract. Catches a "one event spread across five strikes" move
+        # (GOOGL 357.5-365C) the ATM±1 window + per-strike floors never saw. Shadow mode
+        # runs the same scan/entry but records the would-be signal instead of firing it.
+        if (config.CHAIN_LEADERSHIP_ENABLED or config.CHAIN_LEADERSHIP_SHADOW) and opt_data_map:
+            production = config.CHAIN_LEADERSHIP_ENABLED
             verdict = self._chain_leadership_scan(symbol, opt_data_map, vol_deltas,
                                                   close_price, bar_time, expiry)
             side = verdict['controlling_side']
             if side and verdict['confidence'] >= config.CHAIN_LEADERSHIP_MIN_CONFIDENCE:
                 st = 'BULLISH' if side == 'CALL' else 'BEARISH'
-                if not self._fired_today.get((symbol, st)):
+                dedup = self._fired_today if production else self._leadership_shadow_fired
+                if not dedup.get((symbol, st)):
                     lsig, lreason = self._chain_leadership_entry(
                         symbol, verdict, opt_data_map, vol_deltas, levels, close_price,
                         expiry, bars, bar_time, bar_time, next_day_mode, pc_ratio)
-                    if lsig is not None:
+                    if lsig is not None and production:
                         self._fired_today[(symbol, st)] = True
                         fired.append(lsig)
                         logger.info("CHAIN-LEADERSHIP fired %s %s  leader=%s rec=%s breadth=%d "
@@ -760,8 +804,19 @@ class SignalDetector:
                                     verdict['leader_strike'], verdict['recommended_strike'],
                                     verdict['breadth'], verdict['combined_notional'],
                                     verdict['confidence'], verdict['supporting_strikes'])
+                    elif lsig is not None:                 # shadow: record, do not fire
+                        self._leadership_shadow_fired[(symbol, st)] = True
+                        lsig['shadow'] = True
+                        lsig['leadership_spot'] = close_price
+                        self.last_leadership_shadow.append(lsig)
+                        logger.info("CHAIN-LEADERSHIP SHADOW %s %s  rec=%s @$%s breadth=%d "
+                                    "notional=$%d conf=%d  chain=%s", symbol, side,
+                                    verdict['recommended_strike'], lsig.get('price_to_enter'),
+                                    verdict['breadth'], verdict['combined_notional'],
+                                    verdict['confidence'], verdict['supporting_strikes'])
                     elif lreason:
-                        logger.info("CHAIN-LEADERSHIP %s %s → %s", symbol, side, lreason)
+                        logger.info("CHAIN-LEADERSHIP%s %s %s → %s",
+                                    "" if production else " SHADOW", symbol, side, lreason)
             elif side:
                 logger.debug("CHAIN-LEADERSHIP %s %s conf=%d < %d (breadth=%d)",
                              symbol, side, verdict['confidence'],
@@ -1017,6 +1072,41 @@ class SignalDetector:
         if span <= 0:
             span = 0.01
         return round((mark - low) / span, 4)
+
+    # ── §13b Premium Discovery Score ──────────────────────────────────────────
+
+    def _premium_discovery(
+        self, symbol: str, strike: float, opt_type: str,
+        expiry: Optional[date], data: dict, *, event_volume,
+    ) -> Optional[dict]:
+        """
+        Classify the contract's premium-discovery state (fresh vs recycled) from its
+        historical premium/volume distribution. Returns premium_discovery.score()'s
+        dict, or None when not evaluable (gate off, no fn, no mark). The per-contract
+        history is fetched once per day and cached, mirroring the §13 range cache.
+        """
+        if not config.PREMIUM_DISCOVERY_GATE_ENABLED:
+            return None
+        if self._premium_hist_fn is None:
+            return None
+        mark = data.get('mark')
+        if not mark or mark <= 0:
+            return None
+        occ = occ_symbol(symbol, expiry, strike, opt_type)
+        if occ not in self._opt_premium_hist:
+            bars = []
+            try:
+                bars = self._premium_hist_fn(
+                    symbol, strike, opt_type, self._history_date) or []
+            except Exception as exc:
+                logger.warning("premium_hist_fn failed for %s: %s", occ, exc)
+            self._opt_premium_hist[occ] = bars
+        bars = self._opt_premium_hist.get(occ) or []
+        try:
+            return _premium_discovery.score(bars, mark, event_volume)
+        except Exception as exc:
+            logger.warning("premium_discovery.score failed for %s: %s", occ, exc)
+            return None
 
     # ── §14 short-cover risk ──────────────────────────────────────────────────
 
@@ -1346,6 +1436,24 @@ class SignalDetector:
         sig['chain_strikes'] = [x['strike'] for x in chain]
         sig['chain_combined_3m'] = c3
         sig['emergent_spot'] = emergent_spot
+
+        # §13b — Premium Discovery on the SELECTED chain contract, so the Gold gate
+        # applies the same fresh-vs-recycled requirement to emergent entries. Event
+        # volume is the selected strike's concentrated event volume.
+        pds = self._premium_discovery(
+            symbol, float(sel_key[0]), confirm_type, expiry, sel_quote,
+            event_volume=selected['event_vol'])
+        if pds is not None:
+            sig['pds_class']    = pds.get('pds_class')
+            sig['pds_eligible'] = pds.get('eligible')
+            sig['pds']          = pds
+
+        # Alert taxonomy — chain-led emergent entries carry CHAIN_LED context/shape,
+        # so leadership resolves to Chain Leader; market state from bars + trend.
+        _taxonomy.classify(
+            sig, bars=bars, quotes=opt_data_map,
+            trend_dir=self._trend.active_direction(symbol),
+            trend_working=self._trend.still_working(symbol))
         return sig, None
 
     def _chain_leadership_scan(self, symbol, opt_data_map, vol_deltas, close_price,

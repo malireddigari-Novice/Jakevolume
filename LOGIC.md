@@ -68,9 +68,21 @@ Primary OI levels are no longer the **only** way to a valid intraday location. A
 
 1. **Three signal contexts** (`signal_context` on every signal): `PRIMARY_LEVEL_CONTINUATION` (existing), `CHAIN_LED_EMERGENT_ENTRY` (new), `PRIMARY_LEVEL_COUNTERTREND_REVERSAL` (Phase 2, not yet built).
 
-2. **Chain-led emergent entry** (§D7, `_chain_led_entry`): when coordinated **ATM + adjacent-strike** volume builds a new emergent support/resistance **before** spot reaches a morning level, a CALL/PUT can fire without level proximity. Requires (all): multi-strike confirmation (ATM + ≥1 adjacent) · combined 1m/3m/5m floors (1000/1500/2000) · individual ATM (≥500/1000) + adjacent (≥350/700) · combined notional ≥$100k & ATM ≥$50k · ATM near low (≤1.50) & ≥1 adjacent (≤1.75) · concentration (≥2 strikes EventShare≥0.35 OR combined≥0.45) · ATM not persistent background · call/put **leadership** ≥0.75 with ≥0.20 margin · selected contract not chased (≤1.75). It picks ATM by default, or **1-OTM** when independently strong + near-low (AMZN example trades **240C**). The emergent spot (= underlying close ~5 bars back) becomes the entry-location reference (`emergent_locations` table); targets use the existing price-ordered ladder with original OI names stored (`target1/2_oi_name`). Dedup is context-aware: a chain-led call isn't blocked by a primary call. Block reasons: `CHAIN_CONFIRMATION_MISSING / CHAIN_VOLUME_INSUFFICIENT / CHAIN_NOTIONAL_INSUFFICIENT / CHAIN_LEADERSHIP_INSUFFICIENT / EMERGENT_ENTRY_CHASED`. Reuses `compute_leadership_scores` + `volume_event` + the canonical `_eval_volume` metrics. Discord shows a **CHAIN-LED** card (emergent support/resistance + chain strikes + combined 3m vol + notional + price targets) vs the **PRIMARY LEVEL** card.
+2. **Chain-led emergent entry** (§D7, `_chain_led_entry`): when coordinated **ATM + adjacent-strike** volume builds a new emergent support/resistance **before** spot reaches a morning level, a CALL/PUT can fire without level proximity. Requires (all): multi-strike confirmation (ATM + ≥1 adjacent) · combined 1m/3m/5m floors (1000/1500/2000) · individual ATM (≥500/1000) + adjacent (≥350/700) · combined notional ≥$100k & ATM ≥$50k · ATM near low (≤1.50) & ≥1 adjacent (≤1.75) · concentration (≥2 strikes EventShare≥0.35 OR combined≥0.45) · ATM not persistent background · call/put **leadership** ≥0.75 with ≥0.20 margin · selected contract not chased (≤1.75). It picks ATM by default, or **1-OTM** when independently strong + near-low (AMZN example trades **240C**). The emergent spot (= underlying close ~5 bars back) becomes the entry-location reference (`emergent_locations` table); targets use the existing price-ordered ladder with original OI names stored (`target1/2_oi_name`). Dedup is context-aware: a chain-led call isn't blocked by a primary call. Block reasons: `CHAIN_CONFIRMATION_MISSING / CHAIN_VOLUME_INSUFFICIENT / CHAIN_NOTIONAL_INSUFFICIENT / CHAIN_LEADERSHIP_INSUFFICIENT / EMERGENT_ENTRY_CHASED`. Reuses `compute_leadership_scores` + `volume_event` + the canonical `_eval_volume` metrics. <span style="color:#1a7f37">🔵 **[superseded Jul-2026]** chain-led and primary-level entries no longer render as two different Discord cards — both go through the single **unified taxonomy card** (§J/§J1); a chain-led entry simply resolves to leadership type **Chain Leader**.</span>
 
 3. **Countertrend reversal-conviction gate** (Phase 2, §8-14, `_countertrend_gate` + `analysis/trend.py`). A lightweight per-symbol **intraday trend tracker** marks a move "active" only with **both** an established move (`|spot−open|/open ≥ 1%`) **and** a session leadership peak ≥0.75 on the move side (so isolated option volume can't fabricate a trend). When a candidate that passed every normal gate **opposes** a still-working active trend, it must clear a **stricter** gate: per-symbol countertrend floors (single/3m/5m 1000/1750/2500, NVDA·TSLA 1250/2250/3000) · chain confirmation (ATM+adjacent OR one exceptional ≥1.5× print) · opposite-side leadership ≥0.80 with ≥0.25 margin · a thesis condition (same-side **fading** = leadership ≤50% of its session peak with no fresh conviction in 10 min, OR the trend stops making new highs/lows). Pass → fires as `PRIMARY_LEVEL_COUNTERTREND_REVERSAL` ("Trigger: Countertrend Reversal Confirmed"). Fail → `COUNTERTREND_WATCH` (in-memory, 30 min) — **no alert, does not consume the day's allowance**; the per-poll re-evaluation promotes it to a reversal automatically when conviction appears. So a weak early put (AMZN 242.5P @ 575 vs a ripping bull move) is held, while the late ~2,170 conviction put fires. NVDA-210P-style setups with no opposing established trend are unaffected. Block reasons: `COUNTERTREND_VOLUME_INSUFFICIENT / _CHAIN_CONFIRMATION_MISSING / _LEADERSHIP_INSUFFICIENT / ACTIVE_TREND_NOT_FADING`. Trend thresholds (`ESTABLISHED_MOVE_PCT` 0.01, `LEADERSHIP_FADE_RATIO` 0.50, `FRESH_CONVICTION_LOOKBACK_MIN` 10, `TREND_PROGRESS_LOOKBACK_BARS` 5) are all configurable.
+
+### 🔵 July 2026 — unified alert taxonomy + single Discord card (live)
+
+The alerts had drifted into two visually different cards (chain-led vs primary-level), one carrying a `⭐` and a `Gold: {subtype} [{grade}]` tier line, and signal names that mixed market *state*, *trigger*, and *quality* (Chain-Led, Primary Bounce, Gold, Transition, Reversal…). Simplified to a single deterministic scheme:
+
+1. **No tiers on Discord.** No stars, badges, confidence scores, or Gold/grade lines. If the state machine fires, the alert already represents the highest-conviction opportunity the engine can identify — the quality decision was made upstream by the gates + the Gold chokepoint. Discord only explains *what* fired and *why* (§J).
+
+2. **Every alert = Market State × Leadership Type × Direction** (`analysis/alert_taxonomy.py`, §J1). Three orthogonal axes replace the old overlapping names: state ∈ {Compression, Transition, Trend Expansion, Reversal, Breakout}; leadership ∈ {Chain Leader, Primary Level, Gamma Leader, Volume Leader}; direction ∈ {CALL, PUT}. Derived deterministically in the engine from bars + trend + level interaction + leadership + greeks; drives the card only, never trade gating.
+
+3. **Gamma leadership is new.** A *gamma ramp* (accelerating directional bar-range expansion into a near-peak-gamma strike, using the `gamma` Greek already on the Alpaca feed) is now a first-class leadership type. Selective by construction (requires acceleration); toggle `GAMMA_LEADERSHIP_ENABLED`.
+
+4. **One card for every signal type** (`send_signal`, §J): header → Market State / Leadership / Direction → Why It Triggered → Market Context → Option Metrics → Trade Plan → System. Chain-led, primary-level, breakout, and reversal entries all render identically.
 
 ---
 
@@ -158,6 +170,12 @@ For **each symbol**:
 47. No valid volume → block `NO_VALID_VOLUME_SIGNAL`.
 48. <span style="color:#1a7f37">**[CHANGED] §13 Historical value percentile** — on the contract you'd buy: `pctile = (mark − HistLow)/(HistHigh − HistLow)`. 🔵 **[Jun-17]** over the **full stored history** (all prior sessions), `pctile > 0.33` → block `HISTORICAL_VALUE_TOO_HIGH` (require the contract in the **bottom third** of its range). 0DTE has no live history → uses the DB fallback below. <span style="color:#d1242f">~~(Old: `mark/hist_low ≤ 1.25`, and a failure only downgraded to WATCH; pctile cap was 0.60 over a 10-day window.)~~</span></span>
     - 🔵 **[Jun-16 NEW, broadened Jun-17] Full stored-history fallback** — when no live multi-day history exists (Schwab serves no option price-history, so the gate was a silent no-op), the detector falls back to the contract's **`(low, high)` over its entire stored history** in `option_level_bars` (`db.get_option_hist_range`), so the gate can still evaluate. Matched by strike + type (not expiry), so a 0DTE contract inherits its **same-strike** history across expiries. Cached per contract/day.
+48b. <span style="color:#1a7f37">🔵 **[Jul-2026 NEW] §13b Premium Discovery Score (PDS)** — a Gold filter that asks **not** "is this option cheap?" but "**has this premium already been discovered?**" A large volume spike near a contract's historical premium **lows** after little prior participation is a first institutional footprint; the same spike in a contract whose premium was already traded heavily at richer levels is ambiguous (profit-taking / closing / rolling / dealer inventory all look identical on tape) and must **not** earn a Gold alert even at high volume. This inverts the naive §13 read: a contract that traded heavily at $4–6 and now prints at $3.55 scores `pctile ≈ 0` (max-cheap) to the §13 min/max range, so §13 **passes it enthusiastically** — PDS instead sees that ~all historical volume traded *above* $3.55 and rejects it. The heavy prior participation is exactly the information a min/max range throws away.</span>
+    - **Inputs** (`analysis/premium_discovery.score`, pure): the contract's premium/volume distribution over prior sessions — one `{low,high,close,volume}` per bar — plus the current mark and the event's trigger volume. Source is `option_hourly_bars` (the morning Alpaca pull, matched by **strike + type** across expiries via `db.get_option_premium_history`), which — unlike `option_level_bars` — carries per-bar **volume**, so a volume-by-premium histogram can be built. Fetched once per contract/day and cached, like §13.
+    - **Metrics**: `price_pctile = (mark − HistLow)/(HistHigh − HistLow)` (cheap = low); `vol_at_current` = share of historical volume within ±`PDS_BAND_PCT` of the mark; `vol_above` = share that traded above `mark × (1+PDS_ABOVE_MARGIN)` (the recycled-risk signal); `event_share = event_vol / (cum_vol + event_vol)` (how much of the contract's all-time volume is happening now); plus `cum_vol` and `time_at_current`.
+    - **Classes** (first match wins): **VIRGIN_DISCOVERY** (`cum_vol ≤ PDS_VIRGIN_MAX_HIST_VOL` — near-zero prior participation) → **EXHAUSTED** (`price_pctile ≥ PDS_EXHAUSTED_PCTILE` — mark above the historical range) → **REPRICED_RECYCLED** (`vol_above ≥ PDS_RECYCLED_ABOVE_SHARE` — already discovered richer) → **ACCEPTED_VALUE** (`vol_at_current ≥ PDS_ACCEPTED_SHARE` — frequently-traded region) → **FRESH_ACCUMULATION** (`price_pctile ≤ PDS_FRESH_MAX_PCTILE` **AND** `event_share ≥ PDS_FRESH_MIN_EVENT_SHARE` — cheap and this event dominates lifetime volume) → else **ACCEPTED_VALUE**. Only **VIRGIN_DISCOVERY** and **FRESH_ACCUMULATION** are Gold-eligible.
+    - **Where it gates**: annotate-only in the detector — it stamps `pds_class` / `pds` on the signal (both the primary-level path and the **chain-led** emergent path, scored on the selected contract) for `signal_candidates` research. Enforcement lives in the Gold chokepoint (`gold_mode.production_allowed` / `gate_audit`, gate name `PDS`): it **blocks** a non-eligible class only when `GOLD_ONLY_PRODUCTION_MODE` **and** `PREMIUM_DISCOVERY_GATE_ENABLED` are both on. Reversals are exempt (they carry their own activation proof).
+    - **Staging & no-data policy**: default **OFF** (`PREMIUM_DISCOVERY_GATE_ENABLED=false`), rolled out like the other Gold hooks — annotate first, enable after a shadow run. A contract with no usable history (or a path that didn't score it) is **UNKNOWN → non-blocking** so sparse-history 0DTE strikes are not silently zeroed out; set `PDS_REQUIRE_HISTORY=true` to make missing history a hard reject instead. Coverage caveat: history exists only for contracts the morning pull populated in `option_hourly_bars` (the 6 S/R level contracts per symbol).
 49. <span style="color:#1a7f37">**[NEW] §14 Short-cover risk** — store prior *major* volume events per contract. If the current major event has `VolumeSimilarity ∈ [0.70, 1.50]` vs a prior event **and** `CurrentPrice/PriorPrice ≤ 0.50` (similar size, much cheaper now → shorts covering), block `SHORT_COVER_RISK`.</span>
 50. **§19 Already alerted** this direction today → block `ALREADY_ALERTED_TODAY`.
 
@@ -219,18 +237,39 @@ For **each symbol**:
 
 ## J. Discord card (§20)
 
-69. <span style="color:#1a7f37">**[CHANGED] Simplified card:**</span>
+69. <span style="color:#1a7f37">🔵 **[Jul-2026 REWRITTEN] Unified alert card — one layout for every signal.**</span> The quality decision belongs **inside** the engine, never on Discord. If the state machine fires, the alert already **is** the highest-conviction opportunity the engine can identify — so there are **no tiers, stars, badges, confidence scores, or "Gold/grade" lines**. Discord only explains *what* fired and *why*. This replaces the old split where chain-led and primary-level signals rendered as two different cards (one with a `⭐` and a `Gold: {subtype} [{grade}]` line, one without). Every entry alert — chain-led, primary-level, breakout, reversal — now renders through the **same** template (`output.discord_notifier.send_signal`):
     ```
-    AAPL 315P @ 1.40
-    Spot: 315.20
-    Level: R1 315
-    Volume: 497
-    Ratio: 12.4x
-    ContractLowDistance: 1.18
-    Exit 1/2 @ 265
-    Exit rest @ 262.50
+    📈 AAPL 315C 6/9 @ $1.40
+
+    Market State
+    Transition
+    Leadership
+    Primary Level
+    Direction
+    CALL
+
+    Why It Triggered
+    • Calls led at primary level S1
+    • Spot reclaimed support S1
+    • Volume expanded
+    • Premium exceeded threshold
+    • Leadership transitioned sides
+    • Entered near contract value low
+
+    Market Context      Spot / Relative Strength / Session / Support-Resistance / Fresh-OI
+    Option Metrics      Entry / Premium Notional / Trigger Vol / 3-Min Vol / ATM Vol / Chain / Dist-from-Value-Low
+    Trade Plan          Entry / Target 1 / Target 2 / Exit Conditions (stop −50% · EOD)
+    System              Latency / Algorithm Version / Timestamp
     ```
-    <span style="color:#d1242f">~~No volume-shape label, spread, or target-room shown.~~</span> <span style="color:#1a7f37">(The volume *kind* — single / cluster / stair-step — is computed internally but never surfaced.)</span>
+    (Green/red border + 📈/📉 are **direction** cues only, not quality.)
+
+### J1. 🔵 **[Jul-2026 NEW] Alert taxonomy — Market State × Leadership Type × Direction**
+Old signal names (Chain-Led, Primary Bounce, Gold, Transition, Reversal, …) mixed three different concepts — market *state*, *trigger*, and *quality*. They are now separated into three orthogonal axes, each stamped on the signal in the engine (`analysis.alert_taxonomy.classify`, called at both detector build sites) and surfaced verbatim on the card. Derivation is deterministic and read-only over fields the detector already sets plus the poll's bars / trend / option quotes — it drives the card only, **never trade gating**.
+
+- **Market State** (one per alert, first match wins): **REVERSAL** (signal is a confirmed flow/countertrend reversal) → **BREAKOUT** (`level_action` = breakout/breakdown — price accepted beyond a primary level) → **TREND_EXPANSION** (bar-range widening `≥ MARKET_STATE_EXPANSION_MULT` **and** price moving in the signal direction, or a leadership-confirmed still-working trend on the same side) → **COMPRESSION** (bar-range contracted `≤ MARKET_STATE_COMPRESSION_MULT` — a coil) → **TRANSITION** (default: something changed but isn't yet any of the above). Range windows use `MARKET_STATE_RANGE_WINDOW` bars; all bar access is defensive (missing OHLC → "unknown", never a crash).
+- **Leadership Type** (one per alert, first match wins): **GAMMA_LEADER** (a *gamma ramp* — each of the last `GAMMA_RAMP_ACCEL_BARS` bar ranges larger than the previous **and** directional, into a strike carrying `≥ GAMMA_PEAK_RATIO ×` the peak same-side gamma; requires acceleration so it stays selective and doesn't tag every ATM entry) → **CHAIN_LEADER** (`CHAIN_LED` context/shape — cross-strike coordinated build) → **PRIMARY_LEVEL** (fired at a named OI rank R1..S3) → **VOLUME_LEADER** (default — single-strike volume dominance). Gamma is a genuinely new signal; it reads the `gamma` Greek already on the Alpaca quote feed. Toggle with `GAMMA_LEADERSHIP_ENABLED`.
+- **Direction**: CALL / PUT (already on the signal as `option_type`).
+- **Why It Triggered**: a plain reason list assembled from the signal's own fields (which side took leadership, the level interaction, volume expansion, premium threshold, the state-transition context, fresh premium discovery §13b, near-value-low entry) — so every card answers *what changed, why the engine fired, why this contract, what the plan is* without rating the alert.
 
 ---
 
@@ -269,6 +308,12 @@ For **each symbol**:
 | <span style="color:#1a7f37">`MINIMUM_PREMIUM_NOTIONAL_0DTE` / `_NEXT_EXPIRY`</span> | <span style="color:#1a7f37">50000 / 75000</span> | <span style="color:#1a7f37">Premium notional floor = vol×mark×100 (§D4/§11)</span> |
 | <span style="color:#1a7f37">`PENDING_VOLUME_TOLERANCE_PCT`</span> | <span style="color:#1a7f37">0.20</span> | <span style="color:#1a7f37">Hold partial-bar near-miss for completed-bar re-eval (§7-8)</span> |
 | <span style="color:#1a7f37">`HIST_VALUE_PCTILE_MAX`</span> | <span style="color:#1a7f37">0.33</span> | <span style="color:#1a7f37">Block unless value in bottom third of full-history range (§13)</span> |
+| <span style="color:#1a7f37">`PREMIUM_DISCOVERY_GATE_ENABLED` / `PDS_REQUIRE_HISTORY`</span> | <span style="color:#1a7f37">false / false</span> | <span style="color:#1a7f37">Enable §13b PDS gate (staged) / make missing history a hard reject</span> |
+| <span style="color:#1a7f37">`PDS_BAND_PCT` / `PDS_ABOVE_MARGIN`</span> | <span style="color:#1a7f37">0.10 / 0.15</span> | <span style="color:#1a7f37">"At current premium" band / margin above = "richer" (§13b)</span> |
+| <span style="color:#1a7f37">`PDS_VIRGIN_MAX_HIST_VOL` / `PDS_EXHAUSTED_PCTILE`</span> | <span style="color:#1a7f37">500 / 0.85</span> | <span style="color:#1a7f37">Virgin cum-vol ceiling / mark-above-range percentile (§13b)</span> |
+| <span style="color:#1a7f37">`PDS_RECYCLED_ABOVE_SHARE` / `PDS_ACCEPTED_SHARE`</span> | <span style="color:#1a7f37">0.40 / 0.35</span> | <span style="color:#1a7f37">Vol-above → recycled / vol-at-current → accepted (§13b)</span> |
+| <span style="color:#1a7f37">`PDS_FRESH_MAX_PCTILE` / `PDS_FRESH_MIN_EVENT_SHARE`</span> | <span style="color:#1a7f37">0.35 / 0.50</span> | <span style="color:#1a7f37">Fresh: mark this cheap AND event ≥ half all-time vol (§13b)</span> |
+| <span style="color:#1a7f37">`PDS_LOOKBACK_DAYS`</span> | <span style="color:#1a7f37">10</span> | <span style="color:#1a7f37">Days of hourly history for the premium distribution (§13b)</span> |
 | <span style="color:#1a7f37">`SHORT_COVER_FILTER` / `_SIM_LOW/HIGH` / `_REPRICE_MAX`</span> | <span style="color:#1a7f37">true · 0.70/1.50 · 0.50</span> | <span style="color:#1a7f37">Short-cover risk filter (§14)</span> |
 | <span style="color:#1a7f37">`OPENING_RANGE_MINUTES` / `_VOL_MULT` / `_CLUSTER_RATIO` / `_EXCITATION_MIN`</span> | <span style="color:#1a7f37">15 · 1.5 · 4.0 · 0.80</span> | <span style="color:#1a7f37">Opening-range raised thresholds (§15)</span> |
 | <span style="color:#1a7f37">`EXIT_MIN_ROOM_PCT`</span> | <span style="color:#1a7f37">0.0025</span> | <span style="color:#1a7f37">Min room after the exit-target shift</span> |

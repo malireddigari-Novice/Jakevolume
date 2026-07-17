@@ -16,18 +16,19 @@ from typing import Optional
 import requests
 
 import config
+from analysis import alert_taxonomy as taxonomy
 
 logger = logging.getLogger(__name__)
 
-_GREEN  = 0x00C851   # BULLISH signals
+_SESSION_LABEL = {
+    'A_EXPANSION':   'A · Intraday Expansion',
+    'B_POSITIONING': 'B · Positioning Day',
+    'C_TRANSITION':  'C · Transition',
+}
+
+_GREEN  = 0x00C851   # BULLISH signals (direction cue only — not a quality rating)
 _RED    = 0xFF4444   # BEARISH signals
 _BLUE   = 0x4A90D9   # morning briefing
-
-_CONVICTION_EMOJI = {
-    'WITH_BIAS':    '✅',
-    'NEUTRAL':      '⚪',
-    'AGAINST_BIAS': '⚠️',
-}
 
 
 # ── Low-level post ────────────────────────────────────────────────────────────
@@ -69,17 +70,14 @@ def _fmt_stop(entry: Optional[float]) -> str:
 
 def send_signal(sig: dict) -> None:
     """
-    Send a Simplified V1 entry alert (§20) — a single compact card:
+    Send an entry alert as ONE unified card — identical layout for every signal type.
 
-        AAPL 315P 6/9 @ 1.40
-        Spot: 315.20
-        Level: R1 315
-        Expiry: 6/9
-        Volume: 497
-        Ratio: 12.4x
-        ContractLowDistance: 1.18
-
-    No volume-shape label, spread, target room, or exit/stop lines (§1).
+    There are no tiers, stars, badges, or confidence/quality lines: if the state
+    machine fired, the alert already represents the highest-conviction opportunity
+    the engine can identify. The card only explains WHAT fired and WHY, along three
+    orthogonal axes (Market State × Leadership Type × Direction) plus context, option
+    metrics, and the trade plan. Chain-led, primary-level, reversal, and breakout
+    entries all render through this single path.
     """
     url = config.DISCORD_WEBHOOK_URL
     if not url:
@@ -90,178 +88,129 @@ def send_signal(sig: dict) -> None:
     colour      = _GREEN if signal_type == 'BULLISH' else _RED
     arrow       = '📈' if signal_type == 'BULLISH' else '📉'
 
-    price_to_enter = sig.get('price_to_enter')
-    enter_str  = f"{price_to_enter:.2f}" if price_to_enter else 'n/a'
-
     opt_type   = sig.get('option_type', '')
     side_char  = 'C' if opt_type == 'CALL' else 'P' if opt_type == 'PUT' else ''
-    # The headline strike is the contract we'd actually buy (traded_strike). In
-    # next-day mode this is the OTM target strike, which differs from the detection
-    # level (level_price) — the price_to_enter belongs to THIS strike, so the card
-    # must label it as such (a 420-level BEARISH signal trading the 410 put shows
-    # "410P @ 2.57", with "Level: R1 420" below).
+    price_to_enter = sig.get('price_to_enter')
+    enter_str  = f"${price_to_enter:.2f}" if price_to_enter else 'n/a'
+
+    # Headline strike = the contract we'd actually buy (traded_strike).
     level_strike = sig.get('level_price')
     trade_strike = sig.get('traded_strike') or level_strike
     strike_str   = f"{_fmt_level(trade_strike)}{side_char}" if trade_strike else ''
+    expiry       = sig.get('expiry')
+    expiry_s     = f"{expiry.month}/{expiry.day}" if expiry else ''
 
-    expiry    = sig.get('expiry')
-    expiry_s  = f"{expiry.month}/{expiry.day}" if expiry else ''
+    # Axes — derived in the engine (analysis.alert_taxonomy), never rated here.
+    market_state = taxonomy.state_label(sig.get('market_state'))
+    leadership   = taxonomy.leadership_label(sig.get('leadership_type'))
+    direction    = opt_type or ('CALL' if signal_type == 'BULLISH' else 'PUT')
+    reasons      = sig.get('trigger_reasons') or []
 
-    spot      = sig.get('trigger_price')
-    label     = sig.get('level_label', '')
-    # §13 — the production gate's trigger: prefer the completed 1-min bar, show the
-    # observed partial when it differed, and the trigger shape (1-min vs multi-min).
-    tv_type   = sig.get('trigger_volume_type')
-    trig_vol  = sig.get('trigger_volume')
-    trig_ratio = sig.get('trigger_ratio')
+    # Trigger volume — prefer the completed 1-min bar; fall back to the ATM 1-min.
+    trig_vol   = sig.get('trigger_volume')
     if trig_vol is None:
-        trig_vol, trig_ratio, tv_type = sig.get('atm_vol_1m'), sig.get('atm_spike_ratio'), 'SINGLE_BAR'
-    trig_type_label = ("1-Minute Print" if tv_type == 'SINGLE_BAR'
-                       else "Multi-Minute Window" if tv_type == 'MULTI_MIN_WINDOW'
-                       else "Volume")
-    observed   = sig.get('observed_vol')
+        trig_vol = sig.get('atm_vol_1m')
     bar_status = sig.get('bar_status')
-    peak1m     = sig.get('peak_1m')
     vol3m      = sig.get('vol3m_window') or sig.get('vol_3m_window')
+    atm_vol    = sig.get('atm_vol_1m')
     low_dist   = sig.get('low_dist')
-    gold       = sig.get('gold_standard')
+    notional   = sig.get('premium_notional')
+    chain      = sig.get('chain_strikes') or []
+    spot       = sig.get('trigger_price')
+    lvl_label  = (sig.get('level_label') or '').strip()
 
     sig_time = sig.get('signal_time')
     ts = sig_time.isoformat() if isinstance(sig_time, datetime) else None
 
-    context = sig.get('signal_context')
+    def kv(k, v):
+        return f"{k}: {v}"
+
     head = f"{symbol} {strike_str}" + (f" {expiry_s}" if expiry_s else "") + f" @ {enter_str}"
-    lines = [f"{arrow} **{head}**" + ("  ⭐" if gold else "")]
+    L = [f"{arrow} **{head}**", ""]
 
-    def _latency_line():
-        """§17 flow-event → alert latency, one compact line; None when no profile."""
-        lat = sig.get('latency') or {}
-        total = lat.get('total_latency_secs')
-        if total is None:
-            return None
-        bar_wait = lat.get('bar_wait_secs')
-        seg = f" (bar {bar_wait:.0f}s)" if bar_wait is not None else ""
-        return f"Latency: {total:.0f}s event→alert{seg}"
+    L += [f"**Market State**\n{market_state}", ""]
+    L += [f"**Leadership**\n{leadership}", ""]
+    L += [f"**Direction**\n{direction}", ""]
 
-    def _positioning_line():
-        """Layer-3 fresh-OI alignment for this signal; None when not evaluated."""
-        al = sig.get('positioning_alignment')
-        if not al or al in ('NONE', 'NEUTRAL'):
-            return None
-        icon = '🟢' if al == 'ALIGNED' else '🔴'
-        d = sig.get('positioning_delta', 0)
-        return f"Fresh-OI: {icon} {sig.get('positioning_note', al)} (conf {d:+d})"
+    if reasons:
+        L.append("**Why It Triggered**")
+        L += [f"• {r}" for r in reasons]
+        L.append("")
 
-    def _session_line():
-        """A/B/C session context; None when undetermined/absent."""
-        stype = sig.get('session_type')
-        label = {'A_EXPANSION': 'A · Intraday Expansion', 'B_POSITIONING': 'B · Positioning Day',
-                 'C_TRANSITION': 'C · Transition'}.get(stype)
-        return f"Session: {label}" if label else None
-
-    # Gold-mode classification line (only surfaced while the mode is active, so the
-    # card is unchanged when GOLD_ONLY_PRODUCTION_MODE is off).
-    if config.GOLD_ONLY_PRODUCTION_MODE and sig.get('gold_grade'):
-        _vr = sig.get('value_region')
-        lines.append(f"Gold: {sig.get('gold_subtype')} [{sig.get('gold_grade')}]"
-                     + (f" · {_vr}" if _vr else ""))
-
-    # ── §18 Chain-led emergent card ──
-    if context == 'CHAIN_LED_EMERGENT_ENTRY':
-        emergent_spot = sig.get('emergent_spot')
-        chain_strikes = sig.get('chain_strikes') or []
-        comb3m = sig.get('chain_combined_3m')
-        notional = sig.get('premium_notional')
-        side_word = 'CALL' if opt_type == 'CALL' else 'PUT'
-        loc_label = 'Emergent Support' if opt_type == 'CALL' else 'Emergent Resistance'
-        lines.append(f"Signal: CHAIN-LED {side_word}")
-        if emergent_spot is not None:
-            lines.append(f"{loc_label}: {emergent_spot:.2f}")
-        if chain_strikes:
-            lines.append("Chain: " + " + ".join(f"{_fmt_level(s)}{side_char}" for s in chain_strikes))
-        if comb3m:
-            lines.append(f"Combined 3m Vol: {int(comb3m):,}")
-        if trig_vol is not None:
-            lines.append(f"ATM Volume: {int(trig_vol):,}")
-        if notional:
-            lines.append(f"Premium Notional: ${int(notional):,}")
-        if low_dist is not None:
-            lines.append(f"Contract Low Distance: {low_dist:.2f}")
-        t1, t2 = sig.get('exit1_price'), sig.get('exit2_price')
-        if t1 is not None:
-            lines.append(f"Targets: 1/2 @ {_fmt_level(t1)}" + (f"  Rest @ {_fmt_level(t2)}" if t2 else ""))
-        _lat = _latency_line()
-        if _lat:
-            lines.append(_lat)
-        _pos = _positioning_line()
-        if _pos:
-            lines.append(_pos)
-        _ses = _session_line()
-        if _ses:
-            lines.append(_ses)
-        prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
-        _post(url, {"embeds": [{"description": prefix + "\n".join(lines), "color": colour,
-                    "footer": {"text": "Jakevolume V1 — CHAIN-LED"},
-                    **({"timestamp": ts} if ts else {})}]})
-        logger.info("Discord: CHAIN-LED %s signal sent  %s", side_word, symbol)
-        return
-
-    # ── Primary-level card ──
-    if context == 'PRIMARY_LEVEL_COUNTERTREND_REVERSAL':
-        side_word = 'PUT' if opt_type == 'PUT' else 'CALL'
-        lines.append(f"Signal: PRIMARY LEVEL {side_word}")
-        lines.append("Trigger: Countertrend Reversal Confirmed")
-    else:
-        lines.append("Signal: PRIMARY LEVEL")
+    # Market Context.
+    ctx = ["**Market Context**"]
     if spot is not None:
-        lines.append(f"Spot: {spot:.2f}")
-    lines.append(f"Level: {label} {_fmt_level(level_strike)}".rstrip())
-    if expiry_s:
-        lines.append(f"Expiry: {expiry_s}")
+        ctx.append(kv("Spot", f"{spot:.2f}"))
+    rs_val = sig.get('rs')
+    if rs_val is not None:
+        cls  = sig.get('rs_class', 'IN_LINE')
+        icon = '🟢' if cls == 'RELATIVELY_STRONG' else '🔴' if cls == 'RELATIVELY_WEAK' else '·'
+        ctx.append(kv("Relative Strength", f"{icon} {rs_val:+.2f}%"))
+    sess = _SESSION_LABEL.get(sig.get('session_type'))
+    if sess:
+        ctx.append(kv("Session", sess))
+    if lvl_label or level_strike is not None:
+        ctx.append(kv("Support/Resistance", f"{lvl_label} {_fmt_level(level_strike)}".strip()))
+    al = sig.get('positioning_alignment')
+    if al and al not in ('NONE', 'NEUTRAL'):
+        picon = '🟢' if al == 'ALIGNED' else '🔴'
+        ctx.append(kv("Fresh-OI", f"{picon} {sig.get('positioning_note', al)}"))
+    L += ctx + [""]
+
+    # Option Metrics.
+    om = ["**Option Metrics**", kv("Entry Price", enter_str)]
+    if notional:
+        om.append(kv("Premium Notional", f"${int(notional):,}"))
     if trig_vol is not None:
-        lines.append(f"Trigger: {trig_type_label}")
         bar_tag = f" ({bar_status.lower()})" if bar_status else ""
-        lines.append(f"Trigger Volume: {int(trig_vol):,}{bar_tag}")
-        if observed is not None and int(observed) != int(trig_vol):
-            lines.append(f"Observed at Alert: {int(observed):,}")
-        if peak1m is not None and int(peak1m) != int(trig_vol):
-            lines.append(f"Peak 1m Volume: {int(peak1m):,}")
-        if vol3m:
-            lines.append(f"3m Volume: {int(vol3m):,}")
-    if trig_ratio:
-        lines.append(f"Ratio: {trig_ratio:.1f}x")
+        om.append(kv("Trigger Volume", f"{int(trig_vol):,}{bar_tag}"))
+    if vol3m:
+        om.append(kv("3-Minute Volume", f"{int(vol3m):,}"))
+    if atm_vol is not None:
+        om.append(kv("ATM Volume", f"{int(atm_vol):,}"))
+    if chain:
+        om.append(kv("Chain", " + ".join(f"{_fmt_level(s)}{side_char}" for s in chain)))
     if low_dist is not None:
-        lines.append(f"Contract Low Distance: {low_dist:.2f}")
+        om.append(kv("Contract Distance from Value Low", f"{low_dist:.2f}×"))
+    L += om + [""]
 
-    # Shifted exit targets (skip the too-close nearest level).
-    exit1 = sig.get('exit1_price')
-    exit2 = sig.get('exit2_price')
+    # Trade Plan.
+    exit1, exit2 = sig.get('exit1_price'), sig.get('exit2_price')
+    tp = ["**Trade Plan**", kv("Entry", enter_str)]
     if exit1 is not None:
-        lines.append(f"Exit 1/2 @ {_fmt_level(exit1)}")
+        tp.append(kv("Target 1", _fmt_level(exit1)))
     if exit2 is not None:
-        lines.append(f"Exit rest @ {_fmt_level(exit2)}")
+        tp.append(kv("Target 2", _fmt_level(exit2)))
+    tp.append(kv("Exit Conditions", f"stop {_fmt_stop(price_to_enter)} (−50%) · EOD close"))
+    L += tp + [""]
 
-    _lat = _latency_line()
-    if _lat:
-        lines.append(_lat)
-    _pos = _positioning_line()
-    if _pos:
-        lines.append(_pos)
-    _ses = _session_line()
-    if _ses:
-        lines.append(_ses)
+    # System.
+    sysm = ["**System**"]
+    lat = sig.get('latency') or {}
+    total = lat.get('total_latency_secs')
+    if total is not None:
+        bw = lat.get('bar_wait_secs')
+        seg = f" (bar {bw:.0f}s)" if bw is not None else ""
+        sysm.append(kv("Latency", f"{total:.0f}s event→alert{seg}"))
+    sysm.append(kv("Algorithm Version", config.ALGORITHM_VERSION))
+    if isinstance(sig_time, datetime):
+        sysm.append(kv("Timestamp", sig_time.strftime('%Y-%m-%d %H:%M:%S CST')))
+    L += sysm
 
-    prefix = "[SAMPLE] " if config.SAMPLE_MODE else ""
+    prefix = "**[SAMPLE]** " if config.SAMPLE_MODE else ""
     payload = {
         "embeds": [{
-            "description": prefix + "\n".join(lines),
+            "description": prefix + "\n".join(L),
             "color":  colour,
-            "footer": {"text": "Jakevolume V1" + (" — SAMPLE ONLY" if config.SAMPLE_MODE else "")},
+            "footer": {"text": f"Jakevolume {config.ALGORITHM_VERSION}"
+                               + (" — SAMPLE ONLY" if config.SAMPLE_MODE else "")},
             **({"timestamp": ts} if ts else {}),
         }]
     }
     _post(url, payload)
-    logger.info("Discord: signal sent  %s %s  enter=%s", symbol, signal_type, enter_str)
+    logger.info("Discord: alert sent  %s %s · %s · %s · %s  enter=%s",
+                symbol, direction, sig.get('market_state'), sig.get('leadership_type'),
+                signal_type, enter_str)
 
 
 # ── Morning briefing ──────────────────────────────────────────────────────────
@@ -598,6 +547,27 @@ def send_morning_briefing(
         _post(url, payload)
 
     logger.info("Discord: morning briefing sent (%d symbols, embed format)", len(results))
+
+
+def send_shadow_leadership(sig: dict) -> None:
+    """Shadow chain-leadership note — a would-be signal, recorded not traded (gated, off)."""
+    url = config.DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    ld = sig.get('leadership') or {}
+    side = sig.get('option_type', '')
+    icon = '🟢' if sig.get('signal_type') == 'BULLISH' else '🔴'
+    _post(url, {"embeds": [{
+        "description": (f"👁️ **SHADOW** {icon} {sig.get('symbol')} {side} "
+                        f"{_fmt_level(sig.get('traded_strike'))} @ ${sig.get('price_to_enter')}\n"
+                        f"Leadership: breadth {ld.get('breadth')} · "
+                        f"${(ld.get('combined_notional') or 0):,} · conf {ld.get('confidence')}\n"
+                        f"Chain: {ld.get('supporting_strikes')}  ·  "
+                        f"gold={sig.get('gold_grade')} would-trade={sig.get('production_allowed')}"),
+        "color": 0x9B59B6,
+        "footer": {"text": "Jakevolume · CHAIN-LEADERSHIP SHADOW (not traded)"},
+    }]})
+    logger.info("Discord: shadow leadership %s %s", sig.get('symbol'), sig.get('signal_type'))
 
 
 def send_rs_divergence_alert(symbol: str, rs_val: float, own_pct: float,

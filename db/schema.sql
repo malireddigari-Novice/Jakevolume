@@ -700,6 +700,30 @@ CREATE TABLE IF NOT EXISTS session_classification (
 );
 CREATE INDEX IF NOT EXISTS idx_session_class_date ON session_classification (symbol, session_date);
 
+-- ── Chain-leadership SHADOW (would-be leadership signals, recorded not traded) ──
+CREATE TABLE IF NOT EXISTS chain_leadership_shadow (
+    id                    BIGSERIAL   PRIMARY KEY,
+    symbol                VARCHAR(10) NOT NULL,
+    session_date          DATE        NOT NULL,
+    ts                    TIMESTAMPTZ NOT NULL,
+    signal_type           VARCHAR(10),
+    controlling_side      VARCHAR(4),
+    leader_strike         NUMERIC(12,4),
+    recommended_strike    NUMERIC(12,4),
+    traded_strike         NUMERIC(12,4),
+    entry_price           NUMERIC(12,4),
+    breadth               INT,
+    combined_notional     BIGINT,
+    confidence            INT,
+    supporting_strikes    JSONB,
+    spot                  NUMERIC(12,4),
+    gold_grade            VARCHAR(10),    -- would it have graded Gold?
+    production_allowed    BOOLEAN,        -- would the Gold gate have let it trade?
+    session_type          VARCHAR(16),
+    positioning_alignment VARCHAR(10),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cl_shadow_date ON chain_leadership_shadow (symbol, session_date);
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.

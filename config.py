@@ -53,6 +53,12 @@ CHAIN_LEADERSHIP_MIN_CONFIDENCE = int(os.getenv('CHAIN_LEADERSHIP_MIN_CONFIDENCE
 # guard is an absolute premium floor (avoid dead sub-floor pennies); leadership confidence
 # + breadth + notional carry the entry.
 CHAIN_LEADERSHIP_MIN_PREMIUM    = float(os.getenv('CHAIN_LEADERSHIP_MIN_PREMIUM', '0.20'))
+# Shadow mode: run the leadership scan + build the would-be signal but RECORD it (no Discord,
+# no trade) for validation before enabling live trading. Non-trading, so default ON — but it
+# does widen the watched-contract window (more option snapshots/poll). Ignored/superseded when
+# CHAIN_LEADERSHIP_ENABLED is on (that fires for real).
+CHAIN_LEADERSHIP_SHADOW         = os.getenv('CHAIN_LEADERSHIP_SHADOW', 'true').lower() == 'true'
+CHAIN_LEADERSHIP_SHADOW_DISCORD = os.getenv('CHAIN_LEADERSHIP_SHADOW_DISCORD', 'false').lower() == 'true'
 
 # ── Fresh-OI positioning engine (Engine 2 — overnight context, NEVER a trigger) ──
 # Where institutions placed meaningful NEW risk since the prior session. Context/confidence
@@ -381,6 +387,46 @@ HIST_LOW_ENTRY_GATE    = os.getenv('HIST_LOW_ENTRY_GATE', 'true').lower() == 'tr
 OPT_HIST_LOOKBACK_DAYS = int(os.getenv('OPT_HIST_LOOKBACK_DAYS', '10'))
 # Actionable entry requires mark / historical_low <= this ratio (≤25% above low).
 HIST_LOW_NEAR_RATIO    = float(os.getenv('HIST_LOW_NEAR_RATIO', '1.25'))
+
+# ── Alert taxonomy — every alert = Market State × Leadership Type × Direction ──
+# The quality decision lives inside the engine; Discord never rates an alert. Each
+# fired alert is labeled with ONE market state and ONE leadership type, derived
+# deterministically from the detection context (bars, trend, level interaction,
+# leadership, greeks). These drive the unified Discord card only — not trade gating.
+ALGORITHM_VERSION             = os.getenv('ALGORITHM_VERSION', 'V1')
+MARKET_STATE_RANGE_WINDOW     = int(os.getenv('MARKET_STATE_RANGE_WINDOW', '5'))     # bars per range window
+MARKET_STATE_EXPANSION_MULT   = float(os.getenv('MARKET_STATE_EXPANSION_MULT', '1.30'))   # recent/prior range ≥ → expanding
+MARKET_STATE_COMPRESSION_MULT = float(os.getenv('MARKET_STATE_COMPRESSION_MULT', '0.70')) # recent/prior range ≤ → coiling
+GAMMA_LEADERSHIP_ENABLED      = os.getenv('GAMMA_LEADERSHIP_ENABLED', 'true').lower() == 'true'
+GAMMA_RAMP_ACCEL_BARS         = int(os.getenv('GAMMA_RAMP_ACCEL_BARS', '3'))         # consecutive expanding+directional bars
+GAMMA_PEAK_RATIO              = float(os.getenv('GAMMA_PEAK_RATIO', '0.90'))         # traded strike gamma ≥ this × peak gamma
+
+# ── §13b Premium Discovery Score (PDS) — Gold filter ──────────────────────────
+# Distinguishes a FIRST institutional footprint (fresh accumulation while premium
+# is still cheap) from a spike in a contract whose premium was already discovered
+# (recycled/closing/rolling). Only VIRGIN_DISCOVERY / FRESH_ACCUMULATION are Gold-
+# eligible. Staged like the other Gold hooks: default OFF (annotate-only). It only
+# ever BLOCKS production when GOLD_ONLY_PRODUCTION_MODE is also on; otherwise the
+# class + metrics are stamped for research and nothing is rejected.
+PREMIUM_DISCOVERY_GATE_ENABLED = os.getenv('PREMIUM_DISCOVERY_GATE_ENABLED', 'false').lower() == 'true'
+# When True, a contract with NO usable premium history is REJECTED (strict). When
+# False (default), missing history is non-blocking so sparse-history 0DTE strikes
+# are not silently zeroed out — the other §12/§13 gates still apply.
+PDS_REQUIRE_HISTORY      = os.getenv('PDS_REQUIRE_HISTORY', 'false').lower() == 'true'
+# Look-back window for the premium/volume distribution. Kept in step with the
+# hourly pull (OPT_HOURLY_LOOKBACK_DAYS, defined later in this file) — same default.
+PDS_LOOKBACK_DAYS        = int(os.getenv('PDS_LOOKBACK_DAYS', '10'))
+# Band (±fraction of mark) counted as "at the current premium"; margin above which
+# historical volume counts as "richer / already discovered".
+PDS_BAND_PCT             = float(os.getenv('PDS_BAND_PCT',   '0.10'))
+PDS_ABOVE_MARGIN         = float(os.getenv('PDS_ABOVE_MARGIN', '0.15'))
+# Classification thresholds.
+PDS_VIRGIN_MAX_HIST_VOL  = int(os.getenv('PDS_VIRGIN_MAX_HIST_VOL', '500'))   # ≤ this cum vol → virgin
+PDS_EXHAUSTED_PCTILE     = float(os.getenv('PDS_EXHAUSTED_PCTILE', '0.85'))   # mark near/above hist high
+PDS_RECYCLED_ABOVE_SHARE = float(os.getenv('PDS_RECYCLED_ABOVE_SHARE', '0.40'))  # ≥ this vol traded richer → recycled
+PDS_ACCEPTED_SHARE       = float(os.getenv('PDS_ACCEPTED_SHARE', '0.35'))     # ≥ this vol at current band → accepted
+PDS_FRESH_MAX_PCTILE     = float(os.getenv('PDS_FRESH_MAX_PCTILE', '0.35'))   # mark must be this cheap for fresh
+PDS_FRESH_MIN_EVENT_SHARE = float(os.getenv('PDS_FRESH_MIN_EVENT_SHARE', '0.50'))  # event ≥ half of all-time vol
 
 
 # ══════════════════════════════════════════════════════════════════════════════
