@@ -1540,6 +1540,47 @@ def get_option_hist_range(symbol: str, strike, option_type: str, before_date):
         _put(conn)
 
 
+def save_option_candidate_bars(rows: list) -> None:
+    """
+    Bulk-upsert 1-min OHLCV for backfilled candidate (non-level) contracts.
+
+    Each row dict must carry: symbol, session_date, strike, option_type, expiry,
+    occ_symbol, bar_time, open, high, low, close, volume. ON CONFLICT (occ_symbol,
+    bar_time) refreshes the candle so a re-run settles each bar to its final values.
+    Populated by backfill_option_level_bars.py --candidates; read (UNION'd with
+    option_level_bars) by the absorption / PDS outcome tests.
+    """
+    if not rows:
+        return
+    values = [
+        (
+            r['symbol'], r['session_date'], r['strike'], r['option_type'],
+            r['expiry'], r['occ_symbol'], r['bar_time'],
+            r['open'], r['high'], r['low'], r['close'], r['volume'],
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO option_candidate_bars
+            (symbol, session_date, strike, option_type, expiry, occ_symbol,
+             bar_time, open, high, low, close, volume)
+        VALUES %s
+        ON CONFLICT (occ_symbol, bar_time) DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def get_option_premium_history(symbol: str, strike, option_type: str,
                                before_date, lookback_days: int = None) -> list:
     """
