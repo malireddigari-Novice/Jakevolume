@@ -42,8 +42,9 @@ log = logging.getLogger('backfill')
 DATA_URL = 'https://data.alpaca.markets/v1beta1/options/bars'
 HEADERS  = {'APCA-API-KEY-ID': config.ALPACA_API_KEY,
             'APCA-API-SECRET-KEY': config.ALPACA_SECRET_KEY}
-BATCH      = 6      # OCC symbols per request (the 6 levels of one symbol/day)
-PAGE_LIMIT = 10000
+BATCH       = 6      # OCC symbols per request (the 6 levels of one symbol/day)
+FETCH_CHUNK = 40     # candidates mode: OCC symbols per Alpaca request (a day can hold many)
+PAGE_LIMIT  = 10000
 
 
 def _alpaca_bars(occ_syms: list[str], day) -> dict:
@@ -88,6 +89,14 @@ def main():
     ap.add_argument('--signals', action='store_true',
                     help='backfill the contracts that SIGNALS actually traded '
                          '(ATM confirm-side strikes) instead of the 6 S/R level contracts')
+    ap.add_argument('--candidates', action='store_true',
+                    help='backfill NEAR-LOW candidate contracts (non-level strikes) from '
+                         'signal_candidates into option_candidate_bars — so the absorption / '
+                         'PDS outcome tests can price contracts option_level_bars never stored')
+    ap.add_argument('--near-low-max', type=float, default=1.75,
+                    help='candidates mode: max contract_low_distance to include (default 1.75)')
+    ap.add_argument('--min-vol', type=int, default=300,
+                    help='candidates mode: min trigger_volume to include (default 300)')
     args = ap.parse_args()
 
     db.init_pool()
@@ -102,7 +111,23 @@ def main():
     expiry_map = {(s, d): e for s, d, e in cur.fetchall()}
 
     by_day: dict = {}
-    if args.signals:
+    if args.candidates:
+        # Near-low candidate contracts (non-level strikes) the outcome tests can't
+        # price today. One entry per distinct (symbol, session_date, strike, side).
+        where = "AND session_date >= %s" if args.since else ""
+        params = [args.near_low_max, args.min_vol]
+        if args.since:
+            params.append(args.since)
+        cur.execute(f"""SELECT DISTINCT symbol, session_date, strike, candidate_side
+                        FROM signal_candidates
+                        WHERE contract_low_distance <= %s
+                          AND (valid_volume_event OR trigger_volume >= %s)
+                          {where}
+                        ORDER BY session_date, symbol""", tuple(params))
+        for symbol, day, strike, otype in cur.fetchall():
+            by_day.setdefault((symbol, day), []).append(
+                dict(strike=float(strike), option_type=otype))
+    elif args.signals:
         # Contracts the engine actually traded (ATM confirm-side strikes). Tag each
         # with the originating level's type and rank (rank looked up by matching the
         # signal's level_price to oi_levels; the level side is CALL for RESISTANCE,
@@ -133,8 +158,8 @@ def main():
             by_day.setdefault((symbol, day), []).append(
                 dict(level_type=ltype, rank=rank, strike=float(strike), option_type=otype))
 
-    log.info("%d (symbol,day) groups to consider [source=%s]%s", len(by_day),
-             'signals' if args.signals else 'levels',
+    source = 'candidates' if args.candidates else 'signals' if args.signals else 'levels'
+    log.info("%d (symbol,day) groups to consider [source=%s]%s", len(by_day), source,
              f" since {args.since}" if args.since else "")
 
     tot_rows = tot_bars = skipped_present = skipped_noexp = 0
@@ -153,8 +178,17 @@ def main():
         # signals-mode run still fills traded strikes on days whose level
         # contracts are already stored).
         if not args.force:
-            cur.execute("""SELECT DISTINCT occ_symbol FROM option_level_bars
-                           WHERE symbol=%s AND level_date=%s""", (symbol, day))
+            if args.candidates:
+                # Already priceable if stored in EITHER table (level contracts don't
+                # need re-fetching into the candidate table).
+                cur.execute("""SELECT occ_symbol FROM option_candidate_bars
+                               WHERE symbol=%s AND session_date=%s
+                               UNION SELECT occ_symbol FROM option_level_bars
+                               WHERE symbol=%s AND level_date=%s""",
+                            (symbol, day, symbol, day))
+            else:
+                cur.execute("""SELECT DISTINCT occ_symbol FROM option_level_bars
+                               WHERE symbol=%s AND level_date=%s""", (symbol, day))
             present = {r[0] for r in cur.fetchall()}
             for occ in list(occ_to_level):
                 if occ in present:
@@ -170,8 +204,14 @@ def main():
             days_done += 1
             continue
 
+        # A candidate day can carry many strikes — chunk the fetch (levels = 6, one call).
         try:
-            bars_by_occ = _alpaca_bars(occ_syms, day)
+            bars_by_occ = {}
+            for i in range(0, len(occ_syms), FETCH_CHUNK):
+                chunk = occ_syms[i:i + FETCH_CHUNK]
+                bars_by_occ.update(_alpaca_bars(chunk, day))
+                if len(occ_syms) > FETCH_CHUNK:
+                    time.sleep(0.25)
         except Exception as exc:
             log.error("%s %s: Alpaca fetch failed: %s", symbol, day, exc)
             continue
@@ -182,16 +222,29 @@ def main():
             lv = occ_to_level[occ]
             for b in bars:
                 nb += 1
-                rows.append({
-                    'symbol': symbol, 'level_date': day,
-                    'level_type': lv['level_type'], 'rank': lv['rank'],
-                    'strike': lv['strike'], 'option_type': lv['option_type'],
-                    'expiry': expiry, 'occ_symbol': occ,
-                    'bar_time': _to_cst(b['t']),
-                    'open': b['o'], 'high': b['h'], 'low': b['l'],
-                    'close': b['c'], 'volume': b['v'],
-                })
-        db.save_option_level_bars(rows)
+                if args.candidates:
+                    rows.append({
+                        'symbol': symbol, 'session_date': day,
+                        'strike': lv['strike'], 'option_type': lv['option_type'],
+                        'expiry': expiry, 'occ_symbol': occ,
+                        'bar_time': _to_cst(b['t']),
+                        'open': b['o'], 'high': b['h'], 'low': b['l'],
+                        'close': b['c'], 'volume': b['v'],
+                    })
+                else:
+                    rows.append({
+                        'symbol': symbol, 'level_date': day,
+                        'level_type': lv['level_type'], 'rank': lv['rank'],
+                        'strike': lv['strike'], 'option_type': lv['option_type'],
+                        'expiry': expiry, 'occ_symbol': occ,
+                        'bar_time': _to_cst(b['t']),
+                        'open': b['o'], 'high': b['h'], 'low': b['l'],
+                        'close': b['c'], 'volume': b['v'],
+                    })
+        if args.candidates:
+            db.save_option_candidate_bars(rows)
+        else:
+            db.save_option_level_bars(rows)
         tot_rows += len(rows); tot_bars += nb; days_done += 1
         log.info("%s %s exp=%s: %d bars across %d/%d contracts",
                  symbol, day, expiry, nb, sum(1 for o in bars_by_occ if bars_by_occ[o]),

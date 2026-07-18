@@ -22,6 +22,7 @@ import logging
 
 import config
 from analysis.intent_validation import is_directional_demand
+from analysis import premium_discovery
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,19 @@ def _veto_ok(sig) -> bool:
     return not sig.get('opp_veto')
 
 
+def _pds_ok(sig) -> bool:
+    """§13b — require a fresh institutional footprint: only VIRGIN_DISCOVERY /
+    FRESH_ACCUMULATION pass. A premium already discovered richer (recycled), an
+    accepted value region, or an exhausted premium is ambiguous and blocked, even
+    at high volume. Gate off, reversals, and — unless PDS_REQUIRE_HISTORY — an
+    unknown class (no history) all pass."""
+    if not config.PREMIUM_DISCOVERY_GATE_ENABLED:
+        return True
+    if sig.get('gold_subtype') in _REVERSAL_EXEMPT:
+        return True
+    return premium_discovery.is_gold_eligible(sig.get('pds_class'))
+
+
 def production_allowed(sig) -> bool:
     """
     §18 production gate.
@@ -178,7 +192,7 @@ def production_allowed(sig) -> bool:
         return False
     if sig.get('gold_subtype') not in _GOLD_SUBTYPES:
         return False
-    return _intent_ok(sig) and _veto_ok(sig)
+    return _intent_ok(sig) and _veto_ok(sig) and _pds_ok(sig)
 
 
 def gate_audit(sig) -> dict:
@@ -225,6 +239,15 @@ def gate_audit(sig) -> dict:
         veto_ok = not sig.get('opp_veto')
         gates.append({'gate': 'OPP_VETO', 'verdict': 'PASS' if veto_ok else 'FAIL',
                       'detail': f"opp_veto={bool(sig.get('opp_veto'))}"})
+
+    if not config.PREMIUM_DISCOVERY_GATE_ENABLED:
+        gates.append({'gate': 'PDS', 'verdict': 'SKIP', 'detail': 'discovery gate off'})
+    elif reversal:
+        gates.append({'gate': 'PDS', 'verdict': 'SKIP', 'detail': 'reversal exempt'})
+    else:
+        pds_ok = premium_discovery.is_gold_eligible(sig.get('pds_class'))
+        gates.append({'gate': 'PDS', 'verdict': 'PASS' if pds_ok else 'FAIL',
+                      'detail': f"pds_class={sig.get('pds_class')}"})
 
     blocking = next((g['gate'] for g in gates if g['verdict'] == 'FAIL'), None)
     decision = 'PRODUCTION' if blocking is None else 'RESEARCH'

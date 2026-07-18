@@ -1157,6 +1157,36 @@ def save_atm_0dte(symbol: str, snap_date: date, snap_time, spot, atm: dict) -> N
         _put(conn)
 
 
+def save_chain_leadership_shadow(symbol: str, session_date: date, sig: dict) -> None:
+    """Record a would-be chain-leadership signal (shadow mode — not traded)."""
+    if not sig:
+        return
+    from psycopg2.extras import Json
+    ld = sig.get('leadership') or {}
+    sql = """
+        INSERT INTO chain_leadership_shadow
+            (symbol, session_date, ts, signal_type, controlling_side, leader_strike,
+             recommended_strike, traded_strike, entry_price, breadth, combined_notional,
+             confidence, supporting_strikes, spot, gold_grade, production_allowed,
+             session_type, positioning_alignment)
+        VALUES (%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s)
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                symbol, session_date, sig.get('signal_time'), sig.get('signal_type'),
+                ld.get('controlling_side'), ld.get('leader_strike'), ld.get('recommended_strike'),
+                sig.get('traded_strike'), sig.get('price_to_enter'), ld.get('breadth'),
+                ld.get('combined_notional'), ld.get('confidence'), Json(ld.get('supporting_strikes', [])),
+                sig.get('leadership_spot'), sig.get('gold_grade'), sig.get('production_allowed'),
+                sig.get('session_type'), sig.get('positioning_alignment'),
+            ))
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_session_classification(symbol: str, session_date: date, ts, v: dict) -> None:
     """Insert one session-type transition row (A/B/C timeline)."""
     if not v:
@@ -1506,6 +1536,85 @@ def get_option_hist_range(symbol: str, strike, option_type: str, before_date):
         logger.warning("get_option_hist_range(%s %s %s) failed: %s",
                        symbol, strike, option_type, exc)
         return None
+    finally:
+        _put(conn)
+
+
+def save_option_candidate_bars(rows: list) -> None:
+    """
+    Bulk-upsert 1-min OHLCV for backfilled candidate (non-level) contracts.
+
+    Each row dict must carry: symbol, session_date, strike, option_type, expiry,
+    occ_symbol, bar_time, open, high, low, close, volume. ON CONFLICT (occ_symbol,
+    bar_time) refreshes the candle so a re-run settles each bar to its final values.
+    Populated by backfill_option_level_bars.py --candidates; read (UNION'd with
+    option_level_bars) by the absorption / PDS outcome tests.
+    """
+    if not rows:
+        return
+    values = [
+        (
+            r['symbol'], r['session_date'], r['strike'], r['option_type'],
+            r['expiry'], r['occ_symbol'], r['bar_time'],
+            r['open'], r['high'], r['low'], r['close'], r['volume'],
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO option_candidate_bars
+            (symbol, session_date, strike, option_type, expiry, occ_symbol,
+             bar_time, open, high, low, close, volume)
+        VALUES %s
+        ON CONFLICT (occ_symbol, bar_time) DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
+def get_option_premium_history(symbol: str, strike, option_type: str,
+                               before_date, lookback_days: int = None) -> list:
+    """
+    A contract's premium/volume distribution for the §13b Premium Discovery Score.
+
+    Returns one dict per stored hourly bar {low, high, close, volume} for
+    (symbol, strike, option_type) over prior sessions (bar_time's CST date <
+    before_date), newest window bounded by lookback_days. Sourced from
+    option_hourly_bars (the morning Alpaca pull), which — unlike option_level_bars —
+    carries real per-bar VOLUME across multiple days, so a volume-by-premium
+    histogram can be built. Matched by strike + type (not expiry) so a 0DTE strike
+    inherits its same-strike history across expiries, like get_option_hist_range.
+    Returns [] on no history or any error (PDS treats [] as "no participation").
+    """
+    lookback_days = lookback_days or config.PDS_LOOKBACK_DAYS
+    sql = """
+        SELECT low, high, close, volume
+        FROM   option_hourly_bars
+        WHERE  symbol = %s AND strike = %s AND option_type = %s
+          AND  (bar_time AT TIME ZONE 'America/Chicago')::date < %s
+          AND  (bar_time AT TIME ZONE 'America/Chicago')::date >= %s - make_interval(days => %s)
+          AND  low > 0
+        ORDER  BY bar_time
+    """
+    conn = _get()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (symbol, strike, option_type, before_date,
+                              before_date, lookback_days))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("get_option_premium_history(%s %s %s) failed: %s",
+                       symbol, strike, option_type, exc)
+        return []
     finally:
         _put(conn)
 

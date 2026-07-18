@@ -650,7 +650,8 @@ def intraday_check(
                     # strikes per side so coordinated OTM chain leadership is visible —
                     # per underlying, wider for next-day flow. Gated; unchanged when off.
                     n_watch = 3
-                    if config.ADAPTIVE_WINDOW_ENABLED or config.CHAIN_LEADERSHIP_ENABLED:
+                    if (config.ADAPTIVE_WINDOW_ENABLED or config.CHAIN_LEADERSHIP_ENABLED
+                            or config.CHAIN_LEADERSHIP_SHADOW):
                         n_watch = chain_leadership.window_n(
                             symbol, bool(expiry and expiry > today),
                             config.CHAIN_WINDOW_N, config.CHAIN_WINDOW_N['default'],
@@ -694,7 +695,9 @@ def intraday_check(
                                      fired_today_fn=db.get_fired_directions_today,
                                      prev_range_fn=(db.get_option_hist_range
                                                     if config.HIST_LOW_ENTRY_GATE else None),
-                                     completed_bar_fn=completed_bar_fn)
+                                     completed_bar_fn=completed_bar_fn,
+                                     premium_hist_fn=(db.get_option_premium_history
+                                                      if config.PREMIUM_DISCOVERY_GATE_ENABLED else None))
 
             # §73 — persist every candidate evaluation (blocked + passed), not just alerts.
             if detector.last_candidates:
@@ -764,6 +767,29 @@ def intraday_check(
                                     sig.get('clow_region'))
                         continue                      # §19: no Discord, no paper trade
                     _emit_production(sig, sig_id, alpaca, sheets)
+
+            # V2 chain-leadership SHADOW — record would-be signals (no Discord, no trade)
+            # for validation: run them through the Gold gate + context stamps, then persist.
+            for shadow_sig in getattr(detector, 'last_leadership_shadow', None) or []:
+                try:
+                    gold_mode.annotate_and_gate(shadow_sig)          # would it grade/pass?
+                    shadow_sig['session_type'] = _session_state.get(symbol)
+                    _apply_positioning_confidence(shadow_sig)        # would-be confidence context
+                    db.save_chain_leadership_shadow(symbol, today, shadow_sig)
+                    logger.info("SHADOW-LEADERSHIP %s %s rec=%s @$%s conf=%s gold=%s prod=%s sess=%s",
+                                symbol, shadow_sig.get('signal_type'),
+                                shadow_sig.get('traded_strike'), shadow_sig.get('price_to_enter'),
+                                (shadow_sig.get('leadership') or {}).get('confidence'),
+                                shadow_sig.get('gold_grade'), shadow_sig.get('production_allowed'),
+                                shadow_sig.get('session_type'))
+                    if config.CHAIN_LEADERSHIP_SHADOW_DISCORD:
+                        try:
+                            from output.discord_notifier import send_shadow_leadership
+                            send_shadow_leadership(shadow_sig)
+                        except Exception:
+                            logger.warning("shadow leadership Discord failed", exc_info=True)
+                except Exception:
+                    logger.warning("%s: shadow leadership record failed", symbol, exc_info=True)
 
             # §41 Per-minute call/put leadership scores (stored for all symbols every poll).
             if poll_leadership:

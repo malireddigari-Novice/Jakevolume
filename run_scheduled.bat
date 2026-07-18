@@ -4,6 +4,9 @@ REM trading hours. Checks every 5 minutes until 15:15 local time, then exits.
 
 cd /d "C:\Users\malir\Projects\Python\Jakevolume"
 set SAMPLE_MODE=false
+REM Force UTF-8 for all Python I/O so log lines with non-cp1252 glyphs (e.g. the
+REM "->" arrow) don't raise UnicodeEncodeError on the Windows console/log stream.
+set PYTHONUTF8=1
 
 REM ── Gold-only production mode — ALL layers active ─────────────────────────
 REM Full Gold pipeline: structural + value/contract-low gate, deferred directional-

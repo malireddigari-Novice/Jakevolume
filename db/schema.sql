@@ -143,6 +143,34 @@ CREATE TABLE IF NOT EXISTS option_hourly_bars (
 
 CREATE INDEX IF NOT EXISTS idx_ohb_symbol_snap
     ON option_hourly_bars (symbol, snap_date);
+
+-- ── 1-minute OHLCV for BACKFILLED candidate contracts (non-level strikes) ──────
+-- option_level_bars only covers the 6 S/R level contracts per symbol, so most
+-- signal_candidates contracts (near-low non-level strikes) have no forward price
+-- data — which makes the absorption/PDS outcome tests impossible to power. This
+-- table holds Alpaca 1-min OHLCV for those contracts, backfilled on demand
+-- (backfill_option_level_bars.py --candidates). Deliberately carries no
+-- level_type/rank (these aren't levels); keyed like option_level_bars otherwise so
+-- outcome queries can UNION the two. One row per minute per contract.
+CREATE TABLE IF NOT EXISTS option_candidate_bars (
+    id           BIGSERIAL     PRIMARY KEY,
+    symbol       VARCHAR(10)   NOT NULL,
+    session_date DATE          NOT NULL,
+    strike       NUMERIC(12,4) NOT NULL,
+    option_type  VARCHAR(4)    NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    expiry       DATE          NOT NULL,
+    occ_symbol   VARCHAR(30)   NOT NULL,
+    bar_time     TIMESTAMPTZ   NOT NULL,
+    open         NUMERIC(12,4) NOT NULL,
+    high         NUMERIC(12,4) NOT NULL,
+    low          NUMERIC(12,4) NOT NULL,
+    close        NUMERIC(12,4) NOT NULL,
+    volume       BIGINT        NOT NULL,
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (occ_symbol, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_ocb_symbol_date
+    ON option_candidate_bars (symbol, session_date, strike, option_type);
 CREATE INDEX IF NOT EXISTS idx_ohb_occ_time
     ON option_hourly_bars (occ_symbol, bar_time DESC);
 
@@ -700,6 +728,30 @@ CREATE TABLE IF NOT EXISTS session_classification (
 );
 CREATE INDEX IF NOT EXISTS idx_session_class_date ON session_classification (symbol, session_date);
 
+-- ── Chain-leadership SHADOW (would-be leadership signals, recorded not traded) ──
+CREATE TABLE IF NOT EXISTS chain_leadership_shadow (
+    id                    BIGSERIAL   PRIMARY KEY,
+    symbol                VARCHAR(10) NOT NULL,
+    session_date          DATE        NOT NULL,
+    ts                    TIMESTAMPTZ NOT NULL,
+    signal_type           VARCHAR(10),
+    controlling_side      VARCHAR(4),
+    leader_strike         NUMERIC(12,4),
+    recommended_strike    NUMERIC(12,4),
+    traded_strike         NUMERIC(12,4),
+    entry_price           NUMERIC(12,4),
+    breadth               INT,
+    combined_notional     BIGINT,
+    confidence            INT,
+    supporting_strikes    JSONB,
+    spot                  NUMERIC(12,4),
+    gold_grade            VARCHAR(10),    -- would it have graded Gold?
+    production_allowed    BOOLEAN,        -- would the Gold gate have let it trade?
+    session_type          VARCHAR(16),
+    positioning_alignment VARCHAR(10),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cl_shadow_date ON chain_leadership_shadow (symbol, session_date);
 -- ── Phase 4: Signal volume analytics (§26-§29, §31 — post-session per signal) ─
 -- Multi-timeframe aggregation, shape classification, entropy, chain breakdown,
 -- and migration direction for the option-volume window at each alert.
