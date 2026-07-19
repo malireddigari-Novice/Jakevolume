@@ -1398,8 +1398,19 @@ def check_exits(
         # ── Flow-leadership reversal (spec §19) — opposite side took control? ─
         if config.FLOW_REVERSAL_ENABLED and option_quotes and trade.get('option_type'):
             pos_type = trade['option_type']
+            # Monitor only ATM ± REVERSAL_MONITOR_STRIKES per side (default ATM±1): the
+            # strike nearest spot plus N adjacent above/below, so far-window flow can't
+            # trip an exit. Strikes are shared across call/put, so index the ATM once.
+            _strikes = sorted({s for (s, _ot) in option_quotes})
+            _monitored = set()
+            if _strikes:
+                _i = min(range(len(_strikes)), key=lambda j: abs(_strikes[j] - underlying_price))
+                _n = config.REVERSAL_MONITOR_STRIKES
+                _monitored = set(_strikes[max(0, _i - _n): _i + _n + 1])
             same_events, opp_events = [], []
             for (k, ot), q in option_quotes.items():
+                if k not in _monitored:
+                    continue
                 item = {
                     'strike': k,
                     'ev': volume_event(list(detector._opt_vol_hist.get((symbol, k, ot), []))),

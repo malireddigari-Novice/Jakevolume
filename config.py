@@ -549,6 +549,9 @@ REVERSAL_DOMINANT_BURST = float(os.getenv('REVERSAL_DOMINANT_BURST', '5.0'))
 REVERSAL_DOMINANT_SHARE = float(os.getenv('REVERSAL_DOMINANT_SHARE', '0.60'))
 REVERSAL_LEADERSHIP_MIN = float(os.getenv('REVERSAL_LEADERSHIP_MIN', '0.75'))  # opp leadership floor
 REVERSAL_LEADERSHIP_DIFF= float(os.getenv('REVERSAL_LEADERSHIP_DIFF', '0.20')) # opp - same
+# Strikes each side of ATM the reversal engine monitors (per side). 1 = ATM ± 1
+# (ATM, one above, one below) — the narrow window; raise to watch a wider band.
+REVERSAL_MONITOR_STRIKES = int(os.getenv('REVERSAL_MONITOR_STRIKES', '1'))
 # V2 control-exit confirmation layers (§ ownership change). These bind the reversal-
 # confirmed exit ONLY when FLOW_REVERSAL_ENABLED is on, and are the fix for why the
 # engine flipped into penny options: flow alone declared a reversal with nothing checking
