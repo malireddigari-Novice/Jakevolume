@@ -3,6 +3,10 @@
 End-to-end logic of the <span style="color:#1a7f37">**Simplified V1**</span> Mag-7 call/put alert engine,
 broken into small sequential steps. Times are CST.
 
+> 📖 **For a readable top-to-bottom overview of the whole system as it stands today**, see
+> [`JAKEVOLUME_OVERVIEW.md`](JAKEVOLUME_OVERVIEW.md). This file is the detailed, dated,
+> section-by-section spec.
+
 > **Legend:** <span style="color:#1a7f37">green = added / changed in V1</span> ·
 > <span style="color:#d1242f">~~red strikethrough = removed in V1~~</span> · black = unchanged ·
 > 🔵 **[Jun-2026]** = post-V1 change (see summary).
@@ -83,6 +87,20 @@ The alerts had drifted into two visually different cards (chain-led vs primary-l
 3. **Gamma leadership is new.** A *gamma ramp* (accelerating directional bar-range expansion into a near-peak-gamma strike, using the `gamma` Greek already on the Alpaca feed) is now a first-class leadership type. Selective by construction (requires acceleration); toggle `GAMMA_LEADERSHIP_ENABLED`.
 
 4. **One card for every signal type** (`send_signal`, §J): header → Market State / Leadership / Direction → Why It Triggered → Market Context → Option Metrics → Trade Plan → System. Chain-led, primary-level, breakout, and reversal entries all render identically.
+
+### 🔵 July 2026 — Premium Discovery + decision-audit instrumentation
+
+The focus shifted from adding filters to making every decision auditable, after a series of "missed winner" investigations (MSFT 395C, META 635C, NVDA 200C) showed the open question was usually *coverage* or *which gate rejected it*, not signal logic.
+
+1. **§13b Premium Discovery Score (PDS)** (`analysis/premium_discovery.py`) — a staged Gold filter that classifies a contract's premium-discovery state (virgin / fresh vs recycled / accepted / exhausted) from its volume-by-premium history, rejecting spikes into an already-discovered premium. **Default OFF** (`PREMIUM_DISCOVERY_GATE_ENABLED`) pending threshold validation. See §13b.
+
+2. **Candidate-coverage log (§73b)** (`candidate_coverage`) — records every *watched* contract with a ≥`COVERAGE_MIN_VOL` 1-min print, its distance to the nearest morning level, and the poll outcome (`FIRED` / blocked_reason / `OFF_LEVEL_NO_ALERT`). `signal_candidates` only logged the 6 level strikes; this captures the off-level misses that previously left no record. Instrumentation only.
+
+3. **Candidate-bar backfill** (`option_candidate_bars`, `backfill_option_level_bars.py --candidates`) — `option_level_bars` only stored the 6 level contracts, so near-low non-level strikes had no forward price data (outcome tests were impossible to power). Backfills 1-min Alpaca bars for them; near-low-moderate coverage went 6% → 100%.
+
+4. **Forensic tool** (`candidate_forensics.py`) — `python candidate_forensics.py NVDA 200 CALL 2026-07-09` reconstructs the per-minute gate trace (base gates + Gold-layer `signal_gate_audit` + `volume_leadership` + off-level fallback) and prints the exact gate that rejected a contract with the values at the time. "Why no alert?" becomes one command.
+
+5. **Research findings (honest state):** the near-low "value absorption" thesis tested **flat** on realized returns (48% win, ~0%, n=83) — not the edge hand-picked winners suggested. The §13 threshold (0.33 vs 0.40) **cannot be tuned on current data** (n=3 per band; only >0.40 is clearly toxic). The bottleneck is data quantity and a modest edge, not one mis-set gate — the instrumentation exists so these questions become answerable as data accumulates.
 
 ---
 
@@ -276,6 +294,7 @@ Old signal names (Chain-Led, Primary Bounce, Gold, Transition, Reversal, …) mi
 ## K. What's stored (Postgres)
 
 70. `price_bars`, `option_level_bars`, `option_chain_snapshots`, `oi_levels`, `morning_sentiment`, `signals`, `trades`, `volume_clusters`.
+    - 🔵 **[Jul-2026 added]** `option_hourly_bars` (PDS input), `option_candidate_bars` (backfilled 1-min bars for near-low non-level strikes), `signal_candidates` (§73 per-candidate evaluations), `candidate_coverage` (§73b watched-universe coverage log), `signal_gate_audit` (per-signal Gold-layer verdict), `volume_leadership` (per-minute call/put leadership), `session_classification` (A/B/C).
 
 ---
 
