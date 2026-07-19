@@ -1540,6 +1540,39 @@ def get_option_hist_range(symbol: str, strike, option_type: str, before_date):
         _put(conn)
 
 
+def save_candidate_coverage(rows: list) -> None:
+    """
+    Bulk-insert the per-poll candidate-coverage log (§73b). Each row is a dict from
+    SignalDetector.last_coverage carrying its own ts/session_date. ON CONFLICT keeps
+    the row idempotent per (symbol, ts, strike, option_type).
+    """
+    if not rows:
+        return
+    values = [
+        (
+            r['ts'], r['session_date'], r['symbol'], r['strike'], r['option_type'],
+            r.get('spot'), r.get('vol_1m'), r.get('cum_vol'), r.get('mark'),
+            r.get('low_dist'), r.get('nearest_level_dist_pct'),
+            r.get('evaluated_primary'), r.get('fired', False), r.get('outcome'),
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO candidate_coverage
+            (ts, session_date, symbol, strike, option_type, spot, vol_1m, cum_vol,
+             mark, low_dist, nearest_level_dist_pct, evaluated_primary, fired, outcome)
+        VALUES %s
+        ON CONFLICT (symbol, ts, strike, option_type) DO NOTHING
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values)
+        conn.commit()
+    finally:
+        _put(conn)
+
+
 def save_option_candidate_bars(rows: list) -> None:
     """
     Bulk-upsert 1-min OHLCV for backfilled candidate (non-level) contracts.

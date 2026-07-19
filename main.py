@@ -706,6 +706,14 @@ def intraday_check(
                 except Exception:
                     logger.warning("%s: candidate logging failed", symbol, exc_info=True)
 
+            # §73b — persist the coverage log (every watched contract with a volume event,
+            # level or not) so off-level high-volume misses are recorded, not guessed.
+            if detector.last_coverage:
+                try:
+                    db.save_candidate_coverage(detector.last_coverage)
+                except Exception:
+                    logger.warning("%s: coverage logging failed", symbol, exc_info=True)
+
             # Per-minute call/put leadership snapshot — computed once, reused for the
             # intent observations (below) and the §41 stored series.
             poll_leadership = None

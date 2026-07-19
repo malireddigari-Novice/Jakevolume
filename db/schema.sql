@@ -171,6 +171,35 @@ CREATE TABLE IF NOT EXISTS option_candidate_bars (
 );
 CREATE INDEX IF NOT EXISTS idx_ocb_symbol_date
     ON option_candidate_bars (symbol, session_date, strike, option_type);
+
+-- ── Candidate-coverage log (§73b) — every WATCHED contract with a volume event ──
+-- signal_candidates records only the primary-level path (level strikes), so a
+-- high-volume OFF-LEVEL print near spot leaves no trace. This table logs every
+-- watched contract carrying a ≥ COVERAGE_MIN_VOL 1-min print, with its distance to
+-- the nearest morning level and the poll outcome, so "did we even evaluate this
+-- strike?" is a lookup. outcome ∈ FIRED / <blocked_reason> / OFF_LEVEL_NO_ALERT.
+CREATE TABLE IF NOT EXISTS candidate_coverage (
+    id                     BIGSERIAL     PRIMARY KEY,
+    ts                     TIMESTAMPTZ   NOT NULL,
+    session_date           DATE          NOT NULL,
+    symbol                 VARCHAR(10)   NOT NULL,
+    strike                 NUMERIC(12,4) NOT NULL,
+    option_type            VARCHAR(4)    NOT NULL CHECK (option_type IN ('CALL','PUT')),
+    spot                   NUMERIC(12,4),
+    vol_1m                 BIGINT,               -- this poll's 1-min volume delta
+    cum_vol                BIGINT,               -- cumulative day volume
+    mark                   NUMERIC(12,4),
+    low_dist               NUMERIC(8,4),         -- contract-low distance (§12)
+    nearest_level_dist_pct NUMERIC(8,4),         -- |strike − nearest morning level| / spot
+    evaluated_primary      BOOLEAN,              -- ran through the level-proximity path
+    fired                  BOOLEAN       NOT NULL DEFAULT FALSE,
+    outcome                VARCHAR(48),
+    created_at             TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (symbol, ts, strike, option_type)
+);
+CREATE INDEX IF NOT EXISTS idx_cc_symbol_date  ON candidate_coverage (symbol, session_date, ts);
+CREATE INDEX IF NOT EXISTS idx_cc_offlevel_vol ON candidate_coverage (session_date, vol_1m DESC)
+    WHERE outcome = 'OFF_LEVEL_NO_ALERT';
 CREATE INDEX IF NOT EXISTS idx_ohb_occ_time
     ON option_hourly_bars (occ_symbol, bar_time DESC);
 

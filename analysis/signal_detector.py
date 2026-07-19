@@ -307,6 +307,9 @@ class SignalDetector:
         # §73 per-poll candidate-evaluation log (every level, blocked or passed) — the
         # caller persists `last_candidates` to signal_candidates after each check().
         self.last_candidates: list[dict] = []
+        # §73b per-poll candidate-COVERAGE log (every watched contract with a volume
+        # event, level or not) — the caller persists it after each check().
+        self.last_coverage: list[dict] = []
         self.last_leadership_shadow: list[dict] = []
         self._leadership_shadow_fired: dict = {}
         # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
@@ -349,6 +352,7 @@ class SignalDetector:
                         (or empty) → PDS is skipped/unknown (non-blocking unless strict).
         """
         self.last_candidates = []          # §73 — reset per poll
+        self.last_coverage = []            # §73b — reset per poll
         self.last_leadership_shadow = []   # V2 shadow leadership signals — main reads post-check()
         if not bars:
             return []
@@ -821,6 +825,11 @@ class SignalDetector:
                 logger.debug("CHAIN-LEADERSHIP %s %s conf=%d < %d (breadth=%d)",
                              symbol, side, verdict['confidence'],
                              config.CHAIN_LEADERSHIP_MIN_CONFIDENCE, verdict['breadth'])
+
+        # §73b — coverage log: every watched contract with a meaningful print, whether
+        # or not it was near a level, so off-level high-volume misses are recorded.
+        self._record_coverage(symbol, opt_data_map, vol_deltas, levels,
+                              close_price, bar_time, today, fired)
         return fired
 
     # ── Per-contract volume evaluation — ENTRY VOLUME GATE FIX (3-rule) ─────────
@@ -1610,6 +1619,53 @@ class SignalDetector:
         )
         self._record_candidate(symbol, label, strike, spot, confirm_type,
                                reason=reason, dist=dist, atm=atm, low=low, hv=hv)
+
+    def _record_coverage(self, symbol, opt_data_map, vol_deltas, levels,
+                         spot, bar_time, session_date, fired) -> None:
+        """
+        §73b — coverage log. One row per WATCHED contract carrying a ≥ COVERAGE_MIN_VOL
+        1-min print this poll, level or not, with its distance to the nearest morning
+        level and the poll outcome. Fills the blind spot where a high-volume OFF-LEVEL
+        strike (the primary path never evaluates non-level strikes; the chain-led path
+        logs nothing) previously left no record at all.
+
+        outcome: 'FIRED' (an alert fired on it) / a level-path blocked_reason (it was
+        evaluated near a level) / 'OFF_LEVEL_NO_ALERT' (had volume, not a morning level,
+        produced no alert — the coverage-gap flag, e.g. META 635C).
+        """
+        if not config.COVERAGE_LOG_ENABLED or not opt_data_map:
+            return
+        level_strikes = [float(l['strike']) for l in (levels or [])]
+        cand_by_key = {(round(float(c['strike']), 4), c['candidate_side']): c
+                       for c in self.last_candidates}
+        fired_keys = {(round(float(s.get('traded_strike') or s.get('level_price') or 0), 4),
+                       s.get('option_type')) for s in (fired or [])}
+        for (s, ot), data in opt_data_map.items():
+            vol = int(vol_deltas.get((s, ot), 0) or 0)
+            if vol < config.COVERAGE_MIN_VOL:
+                continue
+            strike = float(s)
+            nd = min((abs(strike - lk) for lk in level_strikes), default=None)
+            nd_pct = round(nd / spot * 100, 4) if (nd is not None and spot) else None
+            key = (round(strike, 4), ot)
+            cand = cand_by_key.get(key)
+            fired_here = key in fired_keys
+            if fired_here:
+                outcome, evaluated_primary = 'FIRED', cand is not None
+            elif cand is not None:
+                outcome, evaluated_primary = (cand.get('blocked_reason') or 'BLOCKED')[:48], True
+            else:
+                outcome, evaluated_primary = 'OFF_LEVEL_NO_ALERT', False
+            self.last_coverage.append({
+                'ts': bar_time, 'session_date': session_date, 'symbol': symbol,
+                'strike': strike, 'option_type': ot, 'spot': round(float(spot), 4),
+                'vol_1m': vol, 'cum_vol': int(data.get('volume') or 0),
+                'mark': data.get('mark'),
+                'low_dist': self._contract_low_dist((symbol, s, ot), data),
+                'nearest_level_dist_pct': nd_pct,
+                'evaluated_primary': evaluated_primary, 'fired': fired_here,
+                'outcome': outcome,
+            })
 
     def _record_candidate(self, symbol, label, strike, spot, confirm_type, *,
                           reason, dist, atm=None, low=None, hv=None) -> None:
