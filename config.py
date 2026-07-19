@@ -401,6 +401,16 @@ GAMMA_LEADERSHIP_ENABLED      = os.getenv('GAMMA_LEADERSHIP_ENABLED', 'true').lo
 GAMMA_RAMP_ACCEL_BARS         = int(os.getenv('GAMMA_RAMP_ACCEL_BARS', '3'))         # consecutive expanding+directional bars
 GAMMA_PEAK_RATIO              = float(os.getenv('GAMMA_PEAK_RATIO', '0.90'))         # traded strike gamma ≥ this × peak gamma
 
+# ── Candidate-coverage log — prove which strikes the scanner actually evaluated ──
+# signal_candidates only logs the primary-level path (the ~6 morning level strikes),
+# so a high-volume OFF-LEVEL print near spot (e.g. META 635C after a selloff) leaves
+# no record — we can't tell "never evaluated" from "evaluated and rejected". This log
+# records EVERY watched contract that carried a meaningful 1-min volume event, with
+# its distance to the nearest morning level and whether it produced an alert — so
+# coverage gaps become a lookup, not a guess. Instrumentation only; no gating.
+COVERAGE_LOG_ENABLED = os.getenv('COVERAGE_LOG_ENABLED', 'true').lower() == 'true'
+COVERAGE_MIN_VOL     = int(os.getenv('COVERAGE_MIN_VOL', '250'))   # only log contracts with a ≥ this 1-min print
+
 # ── §13b Premium Discovery Score (PDS) — Gold filter ──────────────────────────
 # Distinguishes a FIRST institutional footprint (fresh accumulation while premium
 # is still cheap) from a spike in a contract whose premium was already discovered
