@@ -23,6 +23,14 @@ REM inherits the chain-led live-leadership gate + Gold gate + demand-story filte
 REM will not fire directional entries into two-sided opening flow.
 set OPENING_SCAN_PRODUCTION_ENABLED=true
 
+REM ── Flow-leadership reversal exit ─────────────────────────────────────────
+REM While a position is open, watch the OPPOSITE side of the watched strikes; when it
+REM takes control (concentrated opposite volume) exit the trade and re-watch. Guarded
+REM against the earlier churn ("penny flips"): requires same-side fading + opposite
+REM leadership + opposite-premium EXPANSION (+5% off streak low) + VWAP price confirmation
+REM (both confirm layers default-on). Auto-flip into the opposite trade stays OFF.
+set FLOW_REVERSAL_ENABLED=true
+
 set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
 set TRADE_END_MIN=15
