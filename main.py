@@ -473,6 +473,22 @@ def _last_closed_opt_bar_vol(data_src, occ: str, bar_time) -> Optional[int]:
         return None
 
 
+def _recent_closed_opt_bar_vols(data_src, occ, bar_time, count):
+    """
+    The last `count` CLOSED 1-min OPRA bar volumes for `occ` (oldest→newest), strictly
+    before the current minute. Seeds a newly-watched contract's volume history so an
+    event that occurred while it was outside the rotating window isn't erased (the
+    discontinuity-guard fix). Returns [] on no data / error.
+    """
+    try:
+        cur_min = bar_time.replace(second=0, microsecond=0)
+        bars = data_src.get_option_bars(occ, count=count + 2)
+        closed = [int(b['volume']) for b in bars if b['bar_time'] < cur_min]
+        return closed[-count:]
+    except Exception:
+        return []
+
+
 _rs_diverged_today: set = set()   # (symbol, date) already logged as an intraday divergence
 
 
@@ -656,6 +672,12 @@ def intraday_check(
                             symbol, bool(expiry and expiry > today),
                             config.CHAIN_WINDOW_N, config.CHAIN_WINDOW_N['default'],
                             config.CHAIN_WINDOW_NEXTDAY_BONUS)
+                    # #1-rest persistent universe: keep strikes that already went active
+                    # this session subscribed even as spot moves. get_watched_contracts
+                    # returns the nearest-N around spot; widen N so session-active strikes
+                    # stay in the band (the #1 backfill re-seeds any that briefly dropped).
+                    if config.PERSISTENT_UNIVERSE_ENABLED and detector.active_strikes.get(symbol):
+                        n_watch = max(n_watch, config.PERSISTENT_WIDEN_N)
                     option_quotes = data_src.get_watched_contracts(
                         symbol, expiry, underlying_price, n=n_watch
                     )
@@ -689,15 +711,29 @@ def intraday_check(
             # completed re-evaluation (None when no Alpaca data client is available).
             completed_bar_fn = ((lambda occ, bt: _last_closed_opt_bar_vol(data_src, occ, bt))
                                 if data_src else None)
+            # §13 fallback range: full same-strike stored history, OR (#3, when
+            # HIST_VALUE_NORMALIZED_ENABLED) segmented to the SAME DTE bucket as today's
+            # expiry, falling back to the un-normalized range if that bucket is empty.
+            _dte = (expiry - today).days if expiry else 0
+            if config.HIST_LOW_ENTRY_GATE and config.HIST_VALUE_NORMALIZED_ENABLED:
+                prev_range_fn = (lambda sym, k, ot, bd:
+                                 db.get_option_hist_range_normalized(sym, k, ot, bd, _dte)
+                                 or db.get_option_hist_range(sym, k, ot, bd))
+            elif config.HIST_LOW_ENTRY_GATE:
+                prev_range_fn = db.get_option_hist_range
+            else:
+                prev_range_fn = None
             signals = detector.check(symbol, bars, levels, option_quotes, expiry=expiry,
                                      pc_ratio=pc_ratio,
                                      opening_range=is_opening_range(), hist_range_fn=hist_range_fn,
                                      fired_today_fn=db.get_fired_directions_today,
-                                     prev_range_fn=(db.get_option_hist_range
-                                                    if config.HIST_LOW_ENTRY_GATE else None),
+                                     prev_range_fn=prev_range_fn,
                                      completed_bar_fn=completed_bar_fn,
                                      premium_hist_fn=(db.get_option_premium_history
-                                                      if config.PREMIUM_DISCOVERY_GATE_ENABLED else None))
+                                                      if config.PREMIUM_DISCOVERY_GATE_ENABLED else None),
+                                     recent_bars_fn=((lambda occ, bt: _recent_closed_opt_bar_vols(
+                                                          data_src, occ, bt, config.BACKFILL_BARS_COUNT))
+                                                     if (data_src and config.BACKFILL_NEW_CONTRACT_BARS) else None))
 
             # §73 — persist every candidate evaluation (blocked + passed), not just alerts.
             if detector.last_candidates:

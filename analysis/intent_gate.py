@@ -13,12 +13,28 @@ caller-supplied callback returning the current observation dict for a contract:
 """
 import logging
 
+import config
 from analysis import gold_mode
 from analysis.intent_validation import (
     IntentValidator, opposite_side_veto, is_directional_demand,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_exceptional(sig) -> bool:
+    """#6 — an exceptional COMPLETED-bar event may fire immediately (no 1–3 bar wait):
+    0DTE premium reprices fast, so a proven institutional-scale print shouldn't sit
+    pending. Requires a completed (not partial) bar so we never fire on partial data."""
+    if not config.ACTIVATION_FASTPATH_ENABLED:
+        return False
+    if sig.get('bar_status') not in ('COMPLETED', 'REVISED'):
+        return False
+    sym = sig.get('symbol')
+    vol_min = config.ACTIVATION_EXCEPTIONAL_1M.get(sym, config.ACTIVATION_EXCEPTIONAL_1M['default'])
+    tv = int(sig.get('trigger_volume') or 0)
+    pn = float(sig.get('premium_notional') or 0.0)
+    return tv >= vol_min or pn >= config.ACTIVATION_EXCEPTIONAL_NOTIONAL
 
 
 class IntentGate:
@@ -44,6 +60,21 @@ class IntentGate:
                 research.append(sig)
             elif subtype == gold_mode.COUNTERTREND_REVERSAL:
                 emit.append(sig)
+            elif _is_exceptional(sig):
+                # #6 fast-path — fire on the completed event bar, but still refuse to
+                # fire into two-sided flow (opposite-side veto at the event obs).
+                side   = sig.get('option_type')
+                strike = float(sig.get('traded_strike') or 0)
+                veto = opposite_side_veto(side, obs_fn(side, strike), 0.0)
+                sig['opp_veto'] = veto
+                if veto:
+                    research.append(sig)
+                    logger.info("INTENT fast-path vetoed: %s %s %s@%s", symbol, subtype, side, strike)
+                else:
+                    sig['intent_class'] = 'FAST_PATH_EXCEPTIONAL'
+                    emit.append(sig)
+                    logger.info("INTENT fast-path: %s %s %s@%s exceptional → fire now",
+                                symbol, subtype, side, strike)
             else:
                 side   = sig.get('option_type')
                 strike = float(sig.get('traded_strike') or 0)

@@ -141,7 +141,7 @@ For **each symbol**:
 16. **Staleness guard** — skip the symbol if the newest bar isn't today's or is > `MAX_BAR_AGE_SECONDS` (300 s) old.
 17. `underlying_price` = freshest live quote (fallback: last bar close).
 18. **Load today's 6 levels** from Postgres. If none, skip the symbol.
-19. **Watched option quotes** — Schwab returns the **3 nearest strikes per side** to spot, each with bid/ask/mark/volume/OI/day-high/day-low.
+19. **Watched option quotes** — 🔵 **[corrected]** intraday quotes/volume come from **Alpaca OPRA** (`get_watched_contracts`): the **`n` nearest strikes per side** to spot (default 3; wider under the adaptive/persistent-universe flags), each with bid/ask/mark, cumulative day volume, greeks, day-high/day-low. **Schwab supplies the morning OI snapshot only** (Alpaca exposes no live OI) — it is not the intraday volume/bars source. (Mixing Schwab quote-volume with Alpaca bars would create cumulative-volume/revision inconsistencies; the code uses Alpaca for both.)
 20. **(Tue/Thu only)** fetch the **full chain** so the detector can price a target OTM strike.
 21. **Collect level-option bars** — 1-min OHLCV for the 6 level contracts → `option_level_bars`.
 22. **Run the detector** (Section D) → 0 or 1 signal per direction.

@@ -34,6 +34,16 @@ RS_INTRADAY_DISCORD_ALERT  = os.getenv('RS_INTRADAY_DISCORD_ALERT', 'false').low
 # strikes fetched per poll, per underlying (fast movers reach farther), + a bonus for
 # next-day (1DTE) flow which can position farther OTM. Gated — n=3 when off.
 ADAPTIVE_WINDOW_ENABLED = os.getenv('ADAPTIVE_WINDOW_ENABLED', 'false').lower() == 'true'
+# Discontinuity-guard fix: when a contract rotates INTO the window (first sight) or
+# re-enters after a gap, the detector set delta=0 and cleared its history — erasing
+# any event that occurred while it was outside the rotating window (e.g. META 635C's
+# ~2,060-contract print). Instead, seed its 1-min volume history from the last N
+# COMPLETED OPRA bars (Alpaca get_option_bars), so the event is captured on the poll
+# it first appears. Only fetches when the contract's cumulative day volume already
+# clears a floor (no API call for dead strikes). Default OFF pending paper validation.
+BACKFILL_NEW_CONTRACT_BARS = os.getenv('BACKFILL_NEW_CONTRACT_BARS', 'false').lower() == 'true'
+BACKFILL_BARS_COUNT        = int(os.getenv('BACKFILL_BARS_COUNT', '5'))
+BACKFILL_MIN_CUM_VOL       = int(os.getenv('BACKFILL_MIN_CUM_VOL', '500'))
 CHAIN_WINDOW_N = {'default': 5, 'AAPL': 5, 'MSFT': 5, 'AMZN': 5,
                   'GOOGL': 6, 'META': 6, 'NVDA': 7, 'TSLA': 7}
 CHAIN_WINDOW_NEXTDAY_BONUS = int(os.getenv('CHAIN_WINDOW_NEXTDAY_BONUS', '1'))
@@ -387,6 +397,44 @@ HIST_LOW_ENTRY_GATE    = os.getenv('HIST_LOW_ENTRY_GATE', 'true').lower() == 'tr
 OPT_HIST_LOOKBACK_DAYS = int(os.getenv('OPT_HIST_LOOKBACK_DAYS', '10'))
 # Actionable entry requires mark / historical_low <= this ratio (≤25% above low).
 HIST_LOW_NEAR_RATIO    = float(os.getenv('HIST_LOW_NEAR_RATIO', '1.25'))
+
+# ══ Candidate-generation & contract-history corrections (V2R) — all staged OFF ══
+# The 9-point review found the engine can miss clean single-strike winners (GOOGL
+# 370P, NVDA 200C, META 635C) not from bad thresholds but from candidate generation
+# and contract history. These flags implement the fixes; each ships default-OFF so
+# production is unchanged until deliberately enabled + paper-validated.
+
+# #1-rest — persistent dynamic universe: once a strike becomes active (event / primary
+# OI / chain), keep it subscribed for the rest of the session instead of rotating it
+# out when spot moves. main.py unions these into the per-poll watched set.
+PERSISTENT_UNIVERSE_ENABLED = os.getenv('PERSISTENT_UNIVERSE_ENABLED', 'false').lower() == 'true'
+PERSISTENT_UNIVERSE_MAX     = int(os.getenv('PERSISTENT_UNIVERSE_MAX', '80'))   # cap active strikes tracked/symbol
+PERSISTENT_EVENT_MIN_VOL    = int(os.getenv('PERSISTENT_EVENT_MIN_VOL', '400')) # 1-min print that makes a strike "active"
+PERSISTENT_WIDEN_N          = int(os.getenv('PERSISTENT_WIDEN_N', '8'))         # widen nearest-N fetch once a strike is active
+
+# #2 — VOLUME_LEADER standalone entry: one currently-relevant strike that lights up by
+# itself at a clean premium low, without requiring adjacent-strike chain confirmation.
+VOLUME_LEADER_ENABLED       = os.getenv('VOLUME_LEADER_ENABLED', 'false').lower() == 'true'
+VOLUME_LEADER_1M_MIN        = {'default': 1500, 'NVDA': 2000, 'TSLA': 2000}
+VOLUME_LEADER_NOTIONAL_MIN  = {'default': 200000, 'NVDA': 300000, 'TSLA': 300000}
+VOLUME_LEADER_MONEYNESS     = int(os.getenv('VOLUME_LEADER_MONEYNESS', '1'))     # ATM ± this (1 = ATM/1-ITM/1-OTM)
+VOLUME_LEADER_LOW_DIST_MAX  = float(os.getenv('VOLUME_LEADER_LOW_DIST_MAX', '1.75'))
+VOLUME_LEADER_EVENT_SHARE   = float(os.getenv('VOLUME_LEADER_EVENT_SHARE', '0.45'))
+
+# #3 — DTE/moneyness-normalized historical value: compare a contract's premium only
+# with prior contracts of similar DTE + moneyness bucket, not all same-strike history.
+HIST_VALUE_NORMALIZED_ENABLED = os.getenv('HIST_VALUE_NORMALIZED_ENABLED', 'false').lower() == 'true'
+HIST_VALUE_MONEYNESS_BUCKET   = float(os.getenv('HIST_VALUE_MONEYNESS_BUCKET', '0.02'))  # ±2% of spot = same bucket
+
+# #5 — economically-weighted leadership: fresh event volume × mark × relevance ×
+# concentration, not raw contract count (5,000 @ $0.05 ≠ 1,000 @ $1.00).
+ECONOMIC_LEADERSHIP_ENABLED = os.getenv('ECONOMIC_LEADERSHIP_ENABLED', 'false').lower() == 'true'
+
+# #6 — activation fast-path: an exceptional completed-bar event fires immediately
+# instead of waiting the standard 1–3 confirmation bars (0DTE premium reprices fast).
+ACTIVATION_FASTPATH_ENABLED    = os.getenv('ACTIVATION_FASTPATH_ENABLED', 'false').lower() == 'true'
+ACTIVATION_EXCEPTIONAL_1M      = {'default': 2000, 'NVDA': 2500, 'TSLA': 2500}
+ACTIVATION_EXCEPTIONAL_NOTIONAL = int(os.getenv('ACTIVATION_EXCEPTIONAL_NOTIONAL', '350000'))
 
 # ── Alert taxonomy — every alert = Market State × Leadership Type × Direction ──
 # The quality decision lives inside the engine; Discord never rates an alert. Each

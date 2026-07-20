@@ -49,6 +49,8 @@ from analysis import chain_leadership as _chain_lead
 from analysis.gold_mode import contract_low_region
 from analysis import premium_discovery as _premium_discovery
 from analysis import alert_taxonomy as _taxonomy
+from analysis import economic_flow as _econ
+from analysis import volume_leader as _vol_leader
 from analysis.paper_fill import executable_fill as _executable_fill
 from data.alpaca_client import occ_symbol
 from data.market_utils import CST
@@ -293,6 +295,9 @@ class SignalDetector:
         # (list of {low,high,close,volume}) per OCC, fetched once per contract/day.
         self._opt_premium_hist: dict[str, list] = {}
         self._premium_hist_fn = None
+        # Discontinuity-guard fix: fetch the last N completed 1-min bar volumes for a
+        # contract that just entered the window, to seed history instead of delta=0.
+        self._recent_bars_fn = None
         # §7-8 completed 1-min bar volume provider + per-contract/minute cache,
         # plus the pending-volume-confirmation set (near-miss partial-bar candidates).
         self._completed_bar_fn = None
@@ -310,6 +315,11 @@ class SignalDetector:
         # §73b per-poll candidate-COVERAGE log (every watched contract with a volume
         # event, level or not) — the caller persists it after each check().
         self.last_coverage: list[dict] = []
+        # #1-rest persistent universe: strikes that became "active" (produced a
+        # meaningful 1-min event) this session, per symbol. Once active, a strike
+        # should stay tracked even as spot rotates the nearest-N window (the caller
+        # can re-subscribe from here). Reset daily.
+        self.active_strikes: dict = defaultdict(set)
         self.last_leadership_shadow: list[dict] = []
         self._leadership_shadow_fired: dict = {}
         # P-ET event-time capture (only fed when EVENT_TIME_ELIGIBILITY_ENABLED).
@@ -333,6 +343,7 @@ class SignalDetector:
         prev_range_fn=None,
         completed_bar_fn=None,
         premium_hist_fn=None,
+        recent_bars_fn=None,
     ) -> list[dict]:
         """
         Run the V1 entry pipeline for the latest 1-min bar; return [] or [signal].
@@ -365,6 +376,7 @@ class SignalDetector:
         self._prev_range_fn = prev_range_fn
         self._completed_bar_fn = completed_bar_fn
         self._premium_hist_fn = premium_hist_fn
+        self._recent_bars_fn = recent_bars_fn
 
         # Keep 1DTE expiry handling (target-strike pricing); roles stay frozen.
         next_day_mode = (config.NEXT_DAY_MODE_ENABLED and
@@ -381,6 +393,7 @@ class SignalDetector:
             self._opt_last_bar    = {}
             self._opt_hist_range  = {}
             self._opt_premium_hist = {}
+            self.active_strikes   = defaultdict(set)
             self._major_events    = defaultdict(list)
             self._completed_bar_cache = {}
             self._pending_candidates  = {}
@@ -427,12 +440,36 @@ class SignalDetector:
                 delta = 0
                 if discontinuous:
                     self._opt_vol_hist[opt_key].clear()
+                # Discontinuity-guard fix: a contract that just rotated into the window
+                # (or re-entered after a gap) would otherwise lose any event that
+                # occurred while it was outside — its cumulative volume is discarded as
+                # delta=0. Instead seed history from the last N completed OPRA bars so
+                # the event registers on the poll it first appears. Only when it already
+                # carries real volume (floor), to avoid an API call per dead strike.
+                if (self._recent_bars_fn is not None and expiry is not None
+                        and cur_vol >= config.BACKFILL_MIN_CUM_VOL):
+                    try:
+                        vols = self._recent_bars_fn(
+                            occ_symbol(symbol, expiry, s, ot), bar_time) or []
+                    except Exception as exc:
+                        logger.warning("recent_bars_fn failed for %s %s: %s", symbol, s, exc)
+                        vols = []
+                    if vols:
+                        for v in vols[:-1]:
+                            self._opt_vol_hist[opt_key].append(int(v))
+                        delta = int(vols[-1])   # latest completed bar = this poll's event
             else:
                 prev_vol = self._prev_opt_vol.get(opt_key, cur_vol)
                 delta    = max(0, cur_vol - prev_vol)
             self._prev_opt_vol[opt_key] = cur_vol
             self._opt_last_bar[opt_key] = bar_time
             self._opt_vol_hist[opt_key].append(delta)
+
+            # #1-rest: a meaningful 1-min print makes this strike "active" — keep it in
+            # the persistent universe for the rest of the session (capped per symbol).
+            if (config.PERSISTENT_UNIVERSE_ENABLED and delta >= config.PERSISTENT_EVENT_MIN_VOL
+                    and len(self.active_strikes[symbol]) < config.PERSISTENT_UNIVERSE_MAX):
+                self.active_strikes[symbol].add((s, ot))
 
             # P-ET: feed rolling volume + event-time registry for every subscribed
             # contract (freezes ATM/spot/quotes at watch/threshold cross). Gated.
@@ -1248,6 +1285,40 @@ class SignalDetector:
                     share=share, event_vol=event_vol, persistent_bg=persistent_bg,
                     low_dist=low_dist, mark=mark, notional=notional, delta=int(delta or 0))
 
+    def _volume_leader_ok(self, symbol, confirm_type, atm_m, opt_data_map, vol_deltas,
+                          spot, bar_time, expiry) -> bool:
+        """
+        #2 — qualify a single ATM strike as a VOLUME_LEADER: exceptional completed-bar
+        volume + notional at a clean premium low, fresh, and economically leading the
+        opposite side (dollar-weighted, not contract count). Reuses the chain-led build.
+        """
+        opp = 'PUT' if confirm_type == 'CALL' else 'CALL'
+        same_w = _econ.directional_weight(
+            event_vol=atm_m['event_vol'], mark=atm_m['mark'], spot=spot,
+            strike=atm_m['strike'], event_share=atm_m['share'])
+        opp_w = 0.0
+        opp_strikes = [s for (s, ot) in opt_data_map if ot == opp]
+        if opp_strikes:
+            ok = min(opp_strikes, key=lambda s: abs(s - atm_m['strike']))
+            om = self._strike_metrics(symbol, (ok, opp), opt_data_map[(ok, opp)],
+                                      vol_deltas.get((ok, opp), 0), bar_time, expiry)
+            opp_w = _econ.directional_weight(
+                event_vol=om['event_vol'], mark=om['mark'], spot=spot,
+                strike=om['strike'], event_share=om['share'])
+        res = _vol_leader.qualifies(
+            symbol, confirm_type, moneyness_strikes=0,
+            completed_vol=atm_m['peak1m'], premium_notional=atm_m['notional'],
+            low_dist=atm_m['low_dist'], event_share=atm_m['share'],
+            persistent_bg=atm_m['persistent_bg'], pds_class=None,
+            same_weight=same_w, opp_weight=opp_w)
+        if res['qualifies']:
+            logger.info("VOLUME-LEADER %s %s strike=%s vol=%s notional=$%s same_w=$%.0f opp_w=$%.0f",
+                        symbol, confirm_type, atm_m['strike'], atm_m['peak1m'],
+                        atm_m['notional'], same_w, opp_w)
+        else:
+            logger.debug("volume-leader %s %s blocked at %s", symbol, confirm_type, res['block'])
+        return res['qualifies']
+
     @staticmethod
     def _target_oi_name(price, levels) -> Optional[str]:
         """Map a target price back to its morning OI rank label (R1..S3), §17."""
@@ -1326,7 +1397,14 @@ class SignalDetector:
                 clow_region=contract_low_region(atm_m['low_dist']),
                 concentrated=(atm_m['share'] >= config.CHAIN_EVENT_SHARE_MIN),
                 opposite_dominates=False))
-            if not route_b:
+            # #2 VOLUME_LEADER route: a single currently-relevant strike may qualify on
+            # its own institutional-scale, economically-led evidence — no adjacent
+            # strike required. Independent of Gold mode; gated by VOLUME_LEADER_ENABLED.
+            vol_leader = (not route_b and config.VOLUME_LEADER_ENABLED
+                          and self._volume_leader_ok(symbol, confirm_type, atm_m,
+                                                     opt_data_map, vol_deltas, close_price,
+                                                     bar_time, expiry))
+            if not (route_b or vol_leader):
                 return None, 'CHAIN_CONFIRMATION_MISSING'
 
         # §4C combined absolute volume (ITM+ATM+OTM)

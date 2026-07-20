@@ -31,6 +31,25 @@ REM leadership + opposite-premium EXPANSION (+5% off streak low) + VWAP price co
 REM (both confirm layers default-on). Auto-flip into the opposite trade stays OFF.
 set FLOW_REVERSAL_ENABLED=true
 
+REM ── Candidate-generation V2R corrections (2026-07-19) — enabled for paper validation ──
+REM Fixes the "clean single-strike winner missed" class (GOOGL 370P / NVDA 200C / META 635C):
+REM   BACKFILL   — seed a newly-watched contract's history from real OPRA bars, not delta=0
+REM                (stops events vanishing when a strike rotates into the window).
+REM   PERSISTENT — keep session-active strikes subscribed as spot moves (widens the fetch).
+REM   VOLUME_LEADER — standalone single-strike entry when one strike is economically exceptional.
+REM   HIST_VALUE_NORMALIZED — compare historical value within the same DTE bucket, not across expiries.
+REM   ACTIVATION_FASTPATH — an exceptional COMPLETED-bar event fires now, not after 1-3 bars.
+REM   ECONOMIC_LEADERSHIP — $-weighted flow (built; currently used by VOLUME_LEADER only).
+REM NOTE: PREMIUM_DISCOVERY_GATE_ENABLED is deliberately NOT set — PDS stays shadow-only until
+REM its history coverage is broadened (per the review's point 4); enabling it now would only add
+REM inconsistent blocks. Flip it here if you want it on despite that.
+set BACKFILL_NEW_CONTRACT_BARS=true
+set PERSISTENT_UNIVERSE_ENABLED=true
+set VOLUME_LEADER_ENABLED=true
+set HIST_VALUE_NORMALIZED_ENABLED=true
+set ACTIVATION_FASTPATH_ENABLED=true
+set ECONOMIC_LEADERSHIP_ENABLED=true
+
 set LOG=jakevolume_scheduled.log
 set TRADE_END_HOUR=15
 set TRADE_END_MIN=15

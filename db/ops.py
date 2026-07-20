@@ -1540,6 +1540,42 @@ def get_option_hist_range(symbol: str, strike, option_type: str, before_date):
         _put(conn)
 
 
+def get_option_hist_range_normalized(symbol: str, strike, option_type: str,
+                                     before_date, target_dte: int):
+    """
+    #3 — DTE-segmented historical (low, high) from option_level_bars.
+
+    A 0DTE, 1DTE, and multi-day contract at the same strike are NOT comparable (time
+    value, gamma/theta, event risk differ), so comparing a 0DTE mark against the full
+    same-strike history produces false pass/block. This restricts the history to bars
+    whose OWN DTE bucket matches `target_dte` (0 = same-day expiry, 1 = next-day+),
+    where a bar's DTE = expiry − level_date. Falls back to None (caller then uses the
+    un-normalized range) when the segmented bucket has no history yet.
+    """
+    bucket = 0 if int(target_dte) <= 0 else 1
+    sql = """
+        SELECT MIN(low), MAX(high)
+        FROM   option_level_bars
+        WHERE  symbol = %s AND strike = %s AND option_type = %s
+          AND  level_date < %s AND low > 0
+          AND  (CASE WHEN (expiry - level_date) <= 0 THEN 0 ELSE 1 END) = %s
+    """
+    conn = _get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, strike, option_type, before_date, bucket))
+            row = cur.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None
+        return (float(row[0]), float(row[1]))
+    except Exception as exc:
+        logger.warning("get_option_hist_range_normalized(%s %s %s dte=%s) failed: %s",
+                       symbol, strike, option_type, target_dte, exc)
+        return None
+    finally:
+        _put(conn)
+
+
 def save_candidate_coverage(rows: list) -> None:
     """
     Bulk-insert the per-poll candidate-coverage log (§73b). Each row is a dict from
