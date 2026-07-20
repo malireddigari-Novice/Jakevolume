@@ -757,7 +757,7 @@ def intraday_check(
                 try:
                     poll_leadership = compute_leadership_scores(
                         symbol, option_quotes, detector._opt_vol_hist,
-                        low_dist_fn=detector._contract_low_dist)
+                        low_dist_fn=detector._contract_low_dist, spot=underlying_price)
                 except Exception:
                     logger.warning("%s: volume leadership scoring failed", symbol, exc_info=True)
 

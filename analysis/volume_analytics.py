@@ -13,6 +13,7 @@ import logging
 
 import config
 from analysis.flow_reversal import volume_event, _leadership
+from analysis import economic_flow as _econ
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ def compute_leadership_scores(
     option_quotes: dict,
     opt_vol_hist: dict,
     low_dist_fn=None,
+    spot=None,
 ) -> dict | None:
     """
     Compute per-minute call and put leadership scores from all watched contracts.
@@ -234,7 +236,10 @@ def compute_leadership_scores(
         hist = list(opt_vol_hist.get(hist_key, []))
         ev = volume_event(hist)
         low_dist = low_dist_fn(hist_key, q) if low_dist_fn else None
-        item = {'strike': strike, 'ev': ev, 'low_dist': low_dist}
+        item = {'strike': strike, 'ev': ev, 'low_dist': low_dist, 'side': ot,
+                'mark': q.get('mark'),
+                'event_vol': (ev['event_vol'] if ev else 0),
+                'event_share': (ev['share'] if ev else None)}
         (call_events if ot == 'CALL' else put_events).append(item)
 
     if not call_events and not put_events:
@@ -246,6 +251,21 @@ def compute_leadership_scores(
     call_score = call_ld['score']
     put_score  = put_ld['score']
     diff = round(call_score - put_score, 4)
+
+    # #5 — economically-weighted leadership: replace the structural (volume-metric)
+    # scores with each side's share of $-weighted fresh flow (vol×mark×relevance×
+    # concentration), so pennies / far-OTM inventory don't fabricate leadership. Only
+    # when the total weight is meaningful; otherwise keep the structural scores (a tiny
+    # amount of flow shouldn't read as 100% one-sided). Scores stay on a 0–1 scale, so
+    # downstream thresholds (CHAIN_LEADERSHIP_MIN, margins) still apply.
+    econ = None
+    if config.ECONOMIC_LEADERSHIP_ENABLED:
+        econ = _econ.weighted_leadership(call_events + put_events, spot)
+        if econ['total'] >= config.ECONOMIC_LEADERSHIP_MIN_TOTAL:
+            tot = max(econ['total'], 1)
+            call_score = round(econ['call_weight'] / tot, 4)
+            put_score  = round(econ['put_weight'] / tot, 4)
+            diff = round(call_score - put_score, 4)
 
     def _vol5(events):
         return sum(e['ev']['event_vol'] for e in events

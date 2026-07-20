@@ -429,6 +429,7 @@ HIST_VALUE_MONEYNESS_BUCKET   = float(os.getenv('HIST_VALUE_MONEYNESS_BUCKET', '
 # #5 — economically-weighted leadership: fresh event volume × mark × relevance ×
 # concentration, not raw contract count (5,000 @ $0.05 ≠ 1,000 @ $1.00).
 ECONOMIC_LEADERSHIP_ENABLED = os.getenv('ECONOMIC_LEADERSHIP_ENABLED', 'false').lower() == 'true'
+ECONOMIC_LEADERSHIP_MIN_TOTAL = int(os.getenv('ECONOMIC_LEADERSHIP_MIN_TOTAL', '50000'))  # $ floor below which structural scores are kept
 
 # #6 — activation fast-path: an exceptional completed-bar event fires immediately
 # instead of waiting the standard 1–3 confirmation bars (0DTE premium reprices fast).

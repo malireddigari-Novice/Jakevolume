@@ -499,7 +499,7 @@ class SignalDetector:
 
         # ── §8-14 Per-poll leadership + intraday trend update (computed once) ──
         leadership = (compute_leadership_scores(symbol, opt_data_map, self._opt_vol_hist,
-                                                self._contract_low_dist)
+                                                self._contract_low_dist, spot=close_price)
                       if opt_data_map else None)
         self._trend.update(symbol, close_price, bar_time, leadership)
 
@@ -1452,7 +1452,7 @@ class SignalDetector:
 
         # §4I directional leadership (computed once per poll, passed in)
         ld = leadership if leadership is not None else compute_leadership_scores(
-            symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist)
+            symbol, opt_data_map, self._opt_vol_hist, self._contract_low_dist, spot=close_price)
         call_ld = (ld or {}).get('call_leadership', 0.0)
         put_ld  = (ld or {}).get('put_leadership', 0.0)
         lead, opp = (call_ld, put_ld) if confirm_type == 'CALL' else (put_ld, call_ld)
